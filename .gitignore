@@ -1,0 +1,7 @@
+node_modules/
+dist/
+packages/hub/dist/
+*.tsbuildinfo
+coverage/
+data/
+.omo/

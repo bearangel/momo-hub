@@ -1,0 +1,28 @@
+{
+  "name": "momo-hub",
+  "version": "0.1.0",
+  "description": "momo-hub 中心服务（Fastify + WebSocket + SQLite）",
+  "license": "AGPL-3.0-only",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "bin": { "momo-hub": "dist/index.js" },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --config vitest.config.ts"
+  },
+  "dependencies": {
+    "@fastify/websocket": "^11.0.0",
+    "better-sqlite3": "^12.11.1",
+    "fastify": "^5.2.0",
+    "momo-hub-protocol": "file:../..",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.5.0",
+    "typescript": "^5.4.0",
+    "vitest": "^3.0.0"
+  }
+}

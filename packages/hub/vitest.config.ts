@@ -7,6 +7,6 @@ export default defineConfig({
     include: ['tests/**/*.test.ts'],
     pool: 'forks',
     testTimeout: 15_000,
-    passWithNoTests: true,
+    passWithNoTests: false,
   },
 });

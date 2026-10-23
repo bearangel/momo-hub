@@ -17,6 +17,8 @@ COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages/hub/node_modules ./packages/hub/node_modules
 COPY --from=build /app/packages/hub/dist ./packages/hub/dist
+# 协议包 dist——momo-hub-protocol 经 link:../.. 符号链接解析到仓库根，main 指向 ./dist/index.js，漏拷则启动即崩
+COPY --from=build /app/dist ./dist
 EXPOSE 8787
 VOLUME /data
 CMD ["node", "packages/hub/dist/index.js"]

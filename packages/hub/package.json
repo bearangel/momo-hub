@@ -15,7 +15,7 @@
     "@fastify/websocket": "^11.0.0",
     "better-sqlite3": "^12.11.1",
     "fastify": "^5.2.0",
-    "momo-hub-protocol": "file:../..",
+    "momo-hub-protocol": "link:../..",
     "ws": "^8.18.0"
   },
   "devDependencies": {

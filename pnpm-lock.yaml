@@ -36,8 +36,8 @@ importers:
         specifier: ^5.2.0
         version: 5.12.7
       momo-hub-protocol:
-        specifier: file:../..
-        version: 'file:'
+        specifier: link:../..
+        version: link:../..
       ws:
         specifier: ^8.18.0
         version: 8.22.0
@@ -970,10 +970,6 @@ packages:
 
   mkdirp-classic@0.5.3:
     resolution: {integrity: sha512-gKLcREMhtuZRwRAfqP3RFW+TK4JqApVBtOIftVgjuABpAtpxhPGaDcfvbhNvD0B8iD1oUr/txX35NjcaY6Ns/A==}
-
-  'momo-hub-protocol@file:':
-    resolution: {directory: '', type: directory}
-    engines: {node: '>=24.0.0'}
 
   ms@2.1.3:
     resolution: {integrity: sha512-6FlzubTLZG3J2a/NVCAleEhjzq5oxgHyaCU9yYXvcLsvoVaHJq/s5xXI6/XXP6tz7R9xAOtHnSO/tXtF3WRTlA==}
@@ -2207,8 +2203,6 @@ snapshots:
   minimist@1.2.8: {}
 
   mkdirp-classic@0.5.3: {}
-
-  'momo-hub-protocol@file:': {}
 
   ms@2.1.3: {}
 

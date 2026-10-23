@@ -24,9 +24,9 @@ function enroll(name: string): { nodeId: string; deviceToken: string } {
   throw new Error('enroll 失败');
 }
 
-/** 便捷客户端：自动过 hello，收集全部信封，支持条件等待。 */
+/** 便捷客户端：自动过 hello，收集全部信封（deviceToken/inbox 一并暴露给用例），支持条件等待。 */
 function connect(name: string) {
-  return new Promise<{ ws: WebSocket; nodeId: string; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
+  return new Promise<{ ws: WebSocket; nodeId: string; deviceToken: string; inbox: Envelope[]; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
     const cred = enroll(name);
     const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${cred.deviceToken}` } });
     const inbox: Envelope[] = [];
@@ -44,8 +44,19 @@ function connect(name: string) {
       new Promise((res) => { const hit = inbox.find(match); if (hit) return res(hit); waiters.push({ match, resolve: res }); });
     void next((e) => e.kind === 'res' && e.method === RPC.hello).then((h) => {
       if (h.kind !== 'res' || !h.ok) reject(new Error('hello 失败'));
-      else resolve({ ws, nodeId: cred.nodeId, next });
+      else resolve({ ws, nodeId: cred.nodeId, deviceToken: cred.deviceToken, inbox, next });
     });
+  });
+}
+
+/** 升级裸连接：刻意不发 hello，open 即 close（升级重试放弃的场景）。 */
+function openThenClose(deviceToken: string): Promise<void> {
+  return new Promise((res, reject) => {
+    const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${deviceToken}` } });
+    ws.on('open', () => ws.close());
+    ws.on('close', () => res());
+    ws.on('error', (err: Error) => reject(err));
+    setTimeout(() => reject(new Error('第二条连接未按时关闭')), 5000);
   });
 }
 
@@ -168,6 +179,27 @@ describe('hub ws 服务', () => {
       await s2.close();
       db2.close();
     }
+  });
+
+  it('同 nodeId 第二条连接（未 hello）关闭不误摘在线连接，也不误广播 node.offline', async () => {
+    const watcher = await connect('dup-watcher');
+    const a = await connect('node-dup');
+    // 前置：watcher 在线且确实收到了 A 的 node.online（证明它能收到广播流）
+    await watcher.next((e) => e.kind === 'evt' && e.method === EVT.nodeOnline
+      && (e.payload as { nodeId: string }).nodeId === a.nodeId);
+
+    // 同 token 第二条升级连接：不发 hello 直接关闭（身份不得影响 A 的在线态）
+    await openThenClose(a.deviceToken);
+
+    expect(server.onlineNodes().map((n) => n.nodeId)).toContain(a.nodeId);
+    // 等一拍让 close 事件的广播（若有）落到 watcher 收件箱
+    await new Promise((res) => setTimeout(res, 300));
+    const offlineForA = watcher.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.nodeOffline
+      && (e.payload as { nodeId: string }).nodeId === a.nodeId);
+    expect(offlineForA).toHaveLength(0);
+
+    watcher.ws.close();
+    a.ws.close();
   });
 
   it('hello 超时（注入 200ms）→ 4403', async () => {

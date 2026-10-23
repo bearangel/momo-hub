@@ -10,7 +10,7 @@ import {
 } from 'momo-hub-protocol';
 import type { HubIdentity } from './identity';
 import { enrollNode, verifyDeviceToken } from './auth';
-import { NodeRegistry } from './registry';
+import { NodeRegistry, type NodeConn } from './registry';
 import { logger } from './logger';
 
 export interface HubServer {
@@ -26,7 +26,10 @@ export interface CreateHubServerOpts {
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
 }
 
-interface Session { nodeId: string; nodeName: string; helloDone: boolean }
+// 会话自持有连接：conn 只认本 socket 那一条 NodeConn。
+// 绝不回注册表按 nodeId 反查——同 nodeId 并存两条连接时（重连未摘旧的），
+// 反查拿到的是「最后一条」连接，旧连接的 pong/心跳标记会串到新连接上造成假杀。
+interface Session { nodeId: string; nodeName: string; helloDone: boolean; conn: NodeConn | null }
 
 export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const { db, identity } = opts;
@@ -58,7 +61,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
       const node = token ? verifyDeviceToken(db, token) : null;
       if (!node) { socket.close(4401, 'unauthorized'); return; }
 
-      const session: Session = { nodeId: node.nodeId, nodeName: node.name, helloDone: false };
+      const session: Session = { nodeId: node.nodeId, nodeName: node.name, helloDone: false, conn: null };
       const helloTimer = setTimeout(() => socket.close(4403, 'hello_timeout'), helloTimeoutMs);
 
       const sendRes = (id: string, method: string, ok: boolean, payload: unknown): void => {
@@ -84,7 +87,11 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             }
             clearTimeout(helloTimer);
             session.helloDone = true;
-            registry.add({ nodeId: session.nodeId, nodeName: session.nodeName, ws: socket, alive: true });
+            // 注册表条目与会话持有的是同一个 NodeConn 引用：
+            // ka tick / pong 只经 session.conn 改 alive，不经注册表反查。
+            const conn: NodeConn = { nodeId: session.nodeId, nodeName: session.nodeName, ws: socket, alive: true };
+            registry.add(conn);
+            session.conn = conn;
             sendRes(env.id, RPC.hello, true, {
               hubId: identity.hubId, protoVer: PROTOCOL_VERSION,
               serverTime: Date.now(), onlineNodes: registry.onlineNodes(),
@@ -104,21 +111,24 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
 
       // keepalive：服务端 ping，两周期无 pong → terminate（半开判死 → node.offline）
       const ka = setInterval(() => {
-        if (!session.helloDone) return;
-        const conn = registry.get(session.nodeId);
+        const conn = session.conn;
         if (!conn) return;
         if (!conn.alive) { socket.terminate(); return; }
         conn.alive = false;
         socket.ping();
       }, keepaliveIntervalMs);
       ka.unref?.();
-      socket.on('pong', () => { const c = registry.get(session.nodeId); if (c) c.alive = true; });
+      // pong 只回写本会话自己的连接：同 nodeId 的另一条连接的 ping/pong 与此无关。
+      socket.on('pong', () => { if (session.conn) session.conn.alive = true; });
 
       socket.on('close', () => {
         clearTimeout(helloTimer);
         clearInterval(ka);
-        registry.remove(session.nodeId);
-        if (session.helloDone) {
+        session.conn = null;
+        // 仅当摘掉的注册表条目确实是本连接时才广播 node.offline：
+        // 同 nodeId 的第二条连接（未 hello 的升级重试、旧 socket 迟到的 close）断开时
+        // 在线态未变，注册表与广播流保持一致，不会误报离线。
+        if (registry.remove(session.nodeId, socket)) {
           registry.broadcast(EVT.nodeOffline, { nodeId: session.nodeId, at: Date.now() });
         }
       });

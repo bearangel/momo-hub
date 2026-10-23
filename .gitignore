@@ -5,3 +5,4 @@ packages/hub/dist/
 coverage/
 data/
 .omo/
+.superpowers/

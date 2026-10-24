@@ -95,6 +95,43 @@ export interface MirrorResult { ok: boolean; appliedResources: string[] }
 export interface MirrorDiffSummary { added: number; removed: number; changed: number }
 
 // ────────────────────────────────────────────────────────────────────────────
+// 镜像私有 wire（spec §3.1 两段式裁量 + §5.2/plan T8 目标端语义）——
+// 不进 RPC 目录（ws 控制面公开方法），仅供 hub 与 studio 目标端/leader 端消费。
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 镜像链路私有方法名（信封 method 字段值）。 */
+export const MIRROR_WIRE = {
+  /** hub → 目标节点：应用请求（req 信封，id=mirrorId——id 即对账键）。 */
+  apply: 'mirror.apply',
+  /** 目标节点 → hub：应用回执（res 信封，id=mirrorId；成功载荷 MirrorReceiptOk，
+   *  conflict 失败载荷 = RpcErrorPayload + diffSummary 超集）。 */
+  receipt: 'mirror.receipt',
+  /** hub → leader：两段式第二段结果（res 信封，id=mirrorId，定向投递）。 */
+  result: 'mirror.result',
+} as const;
+
+/** mirror.apply 请求信封载荷（目标节点据此应用：快照经 HTTP 数据面取，配置整体替换）。 */
+export interface MirrorApplyPayload {
+  mirrorId: string;
+  snapshotId: string;
+  workspaceName: string;
+  strategy: MirrorStrategy;
+  /** 两段式确认（§5.2）：目标工作空间已存在且未 confirm → 回执 conflict + 差异摘要。 */
+  confirm?: boolean;
+}
+
+/** workspace.mirror 第一段响应（hub 收到即返——异步两段式的受理回执）。 */
+export interface MirrorAcceptRes { accepted: boolean; mirrorId: string }
+
+/** mirror.receipt 成功回执载荷（目标节点已应用完毕）。 */
+export interface MirrorReceiptOk { appliedResources: string[] }
+
+/** mirror.result 第二段载荷：成功 / 失败（conflict 时附差异摘要；code 复用 RpcErrorCode）。 */
+export type MirrorResultPayload =
+  | { mirrorId: string; appliedResources: string[] }
+  | { mirrorId: string; code: string; message: string; diffSummary?: MirrorDiffSummary };
+
+// ────────────────────────────────────────────────────────────────────────────
 // 快照 manifest（上传的 manifest part；payload part 为 tar.gz ≤200MB）
 // ────────────────────────────────────────────────────────────────────────────
 

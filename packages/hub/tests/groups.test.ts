@@ -102,37 +102,60 @@ describe('迁移 v3 组三表', () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
-// NodeRegistry.sendTo（定向投递原语——RPC 层 node_offline 语义的源头）
+// NodeRegistry.sendTo（定向投递原语——RPC 层 node_offline 语义的源头；
+// M2c 收口裁定 ①：ws.send 回调判定——CLOSING 态同步不抛、静默丢弃，必须靠 cb(err) 判出）
 // ────────────────────────────────────────────────────────────────────────────
 
+/** 仿真 ws 8 send 语义：回调经 nextTick 回报；CLOSING 态同步不抛、cb 带 err。 */
 class FakeWs extends EventEmitter {
   sent: string[] = [];
   failSend = false;
-  send(data: string): void {
+  closing = false;
+  send(data: string, cb?: (err?: Error) => void): void {
     if (this.failSend) throw new Error('send failed (dead socket)');
+    if (this.closing) {
+      process.nextTick(() => cb?.(new Error('WebSocket is not open: readyState 2 (CLOSING)')));
+      return;
+    }
     this.sent.push(data);
+    process.nextTick(() => cb?.());
   }
 }
 
 describe('NodeRegistry.sendTo', () => {
-  it('在线 → sent 且信封精确投递到目标连接', () => {
+  it('在线 → sent 且信封精确投递到目标连接', async () => {
     const registry = new NodeRegistry();
     const ws = new FakeWs();
     registry.add({ nodeId: 'n1', nodeName: 'a', ws, alive: true });
     const evt: EventEnvelope = { v: 1, kind: 'evt', method: EVT.groupChanged, payload: { groupId: 'g', kind: 'joined', nodeId: 'n1' } };
-    expect(registry.sendTo('n1', evt)).toBe('sent');
+    await expect(registry.sendTo('n1', evt)).resolves.toBe('sent');
     expect(ws.sent).toHaveLength(1);
     expect(parseEnvelope(ws.sent[0]!)).toEqual(evt);
   });
 
-  it('未注册节点 / 发送抛错 → offline（RPC 层据此映射 node_offline，不留静默积压）', () => {
+  it('未注册节点 / 发送抛错 / CLOSING 静默丢弃（收口核心）→ offline（RPC 层据此映射 node_offline，不留静默积压）', async () => {
     const registry = new NodeRegistry();
     const evt: EventEnvelope = { v: 1, kind: 'evt', method: EVT.groupChanged, payload: {} };
-    expect(registry.sendTo('ghost', evt)).toBe('offline');
+    await expect(registry.sendTo('ghost', evt)).resolves.toBe('offline');
+    const dead = new FakeWs();
+    dead.failSend = true;
+    registry.add({ nodeId: 'n2', nodeName: 'b', ws: dead, alive: true });
+    await expect(registry.sendTo('n2', evt)).resolves.toBe('offline');
+    // 收口裁定 ① 的靶点：CLOSING 态 send 不抛也不投递——只有回调形态能判出
+    const closing = new FakeWs();
+    closing.closing = true;
+    registry.add({ nodeId: 'n3', nodeName: 'c', ws: closing, alive: true });
+    await expect(registry.sendTo('n3', evt)).resolves.toBe('offline');
+    expect(closing.sent).toHaveLength(0);
+  });
+
+  it('req/res 形态信封同样可投递（镜像链路 mirror.apply / mirror.result 走此口）', async () => {
+    const registry = new NodeRegistry();
     const ws = new FakeWs();
-    ws.failSend = true;
-    registry.add({ nodeId: 'n2', nodeName: 'b', ws, alive: true });
-    expect(registry.sendTo('n2', evt)).toBe('offline');
+    registry.add({ nodeId: 'n1', nodeName: 'a', ws, alive: true });
+    const req = { v: 1, kind: 'req', id: 'm-1', method: 'mirror.apply', payload: { mirrorId: 'm-1' } } as const;
+    await expect(registry.sendTo('n1', req)).resolves.toBe('sent');
+    expect(parseEnvelope(ws.sent[0]!)).toEqual(req);
   });
 });
 
@@ -358,12 +381,14 @@ type Connected = Awaited<ReturnType<typeof connect>>;
     a.ws.close();
   });
 
-  it('未注册的 leader-only 方法（mirror/task.*/view.*）照旧 unknown_method', async () => {
+  it('未注册的 leader-only 方法（task.*/view.*）照旧 unknown_method；mirror 已注册（M2c）空载荷 → bad_request', async () => {
     const a = await connect('un-a');
-    for (const method of [RPC.workspace.mirror, RPC.task.delegate, RPC.task.cancel, RPC.view.workspace, RPC.view.subscribe]) {
+    for (const method of [RPC.task.delegate, RPC.task.cancel, RPC.view.workspace, RPC.view.subscribe]) {
       const res = await callRpc(a, method, {});
       expect(errCode(res)).toBe('unknown_method');
     }
+    const mirror = await callRpc(a, RPC.workspace.mirror, {});
+    expect(errCode(mirror)).toBe('bad_request');
     a.ws.close();
   });
 

@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   EVT,
+  MIRROR_WIRE,
   PROTOCOL_VERSION,
   RPC,
   isCompatible,
@@ -14,8 +15,12 @@ import {
   type GroupChangedEvent,
   type GroupInfo,
   type InviteInfo,
+  type MirrorAcceptRes,
+  type MirrorApplyPayload,
+  type MirrorReceiptOk,
   type MirrorRequest,
   type MirrorResult,
+  type MirrorResultPayload,
   type RpcErrorCode,
   type RpcErrorPayload,
   type SnapshotManifest,
@@ -534,5 +539,40 @@ describe('validateSnapshotManifest 坏矩阵：config 配置段', () => {
     expect(bad({ nil: null })).toBeNull();
     expect(bad({ nan: Number.NaN })).toBeNull();
     expect(bad({ num: 1, str: 's', bool: true })).not.toBeNull();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 镜像私有 wire（M2c T6：MIRROR_WIRE 方法名 + 两段式载荷形状）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('镜像私有 wire', () => {
+  it('MIRROR_WIRE 方法名常量锁定（hub 与 studio 双端消费的单源）', () => {
+    expect(MIRROR_WIRE).toEqual({
+      apply: 'mirror.apply',
+      receipt: 'mirror.receipt',
+      result: 'mirror.result',
+    });
+  });
+
+  it('MirrorApplyPayload / MirrorAcceptRes / MirrorResultPayload 形状 round-trip', () => {
+    const apply: MirrorApplyPayload = { mirrorId: 'm1', snapshotId: 's1', workspaceName: 'ws', strategy: 'replace', confirm: true };
+    expect(JSON.parse(JSON.stringify(apply))).toEqual(apply);
+    const applyNoConfirm: MirrorApplyPayload = { mirrorId: 'm2', snapshotId: 's1', workspaceName: 'ws', strategy: 'replace' };
+    expect('confirm' in applyNoConfirm).toBe(false); // confirm 缺省不携带（wire 精确性）
+
+    const accept: MirrorAcceptRes = { accepted: true, mirrorId: 'm1' };
+    expect(accept.accepted).toBe(true);
+
+    const okPayload: MirrorResultPayload = { mirrorId: 'm1', appliedResources: ['coder-pro', 'mcp-fetch'] };
+    const errPayload: MirrorResultPayload = {
+      mirrorId: 'm2', code: 'conflict', message: '目标工作空间已存在',
+      diffSummary: { added: 1, removed: 2, changed: 3 },
+    };
+    expect(JSON.parse(JSON.stringify(okPayload))).toEqual(okPayload);
+    expect(JSON.parse(JSON.stringify(errPayload))).toEqual(errPayload);
+
+    const receiptOk: MirrorReceiptOk = { appliedResources: ['coder-pro'] };
+    expect(receiptOk.appliedResources).toEqual(['coder-pro']);
   });
 });

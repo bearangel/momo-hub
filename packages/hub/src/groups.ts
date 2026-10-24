@@ -19,7 +19,9 @@ export interface GroupHandlerContext {
   nodeId: string;
 }
 
-type GroupHandler = (ctx: GroupHandlerContext, payload: unknown) => RpcOutcome;
+/** ws RPC handler 签名：同步或异步皆可（异步首例 = M2c workspace.mirror——
+ *  定向 sendTo 走 ws 回调判定后才受理）。 */
+export type GroupHandler = (ctx: GroupHandlerContext, payload: unknown) => RpcOutcome | Promise<RpcOutcome>;
 
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
 
@@ -51,7 +53,7 @@ function isMember(db: Database.Database, groupId: string, nodeId: string): boole
 
 /**
  * group.changed 组内广播（§3.2）：状态变迁落库成功后调用；逐成员定向投递，
- * 离线成员静默跳过（sendTo 返 'offline'）——事件是通知面不是账本，不积压不重放。
+ * 离线成员静默跳过（sendTo 判 'offline'）——事件是通知面不是账本，不积压不重放。
  */
 function broadcastGroupChanged(
   ctx: GroupHandlerContext,
@@ -65,7 +67,7 @@ function broadcastGroupChanged(
   };
   const members = ctx.db.prepare('SELECT node_id FROM group_members WHERE group_id = ?')
     .all(groupId) as Array<{ node_id: string }>;
-  for (const m of members) ctx.registry.sendTo(m.node_id, evt);
+  for (const m of members) void ctx.registry.sendTo(m.node_id, evt);
 }
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -16,9 +16,10 @@ import type { HubIdentity } from './identity';
 import { enrollNode, verifyDeviceToken } from './auth';
 import { normalizePublicOrigin } from './config';
 import { NodeRegistry, type NodeConn } from './registry';
-import { GROUP_HANDLERS, checkGroupRole } from './groups';
+import { GROUP_HANDLERS, checkGroupRole, type GroupHandler } from './groups';
 import { registerResourceRoutes } from './resources';
 import { handleWorkspaceSnapshots, registerSnapshotRoutes } from './snapshots';
+import { MirrorRouter } from './mirror';
 import { logger } from './logger';
 
 export interface HubServer {
@@ -65,13 +66,16 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   // 公网 origin 归一 + 校验：非法即启动报错（拼错的 origin 会让 downloadUrl 指向错主机）
   const publicOrigin = opts.publicOrigin === undefined ? undefined : normalizePublicOrigin(opts.publicOrigin);
   const registry = new NodeRegistry();
+  // 镜像路由器（两段式 pending 登记/回执对账——server 生命周期单例，随连接清理）
+  const mirrorRouter = new MirrorRouter(db, registry);
   const app = fastify({ logger: false });
   void app.register(websocket);
-  // ws RPC 分发表 = 组管理六方法 + M2c 快照列表（workspace.snapshots 无组校验——
-  // 不进 LEADER_ONLY_METHODS，守卫直通；镜像 mirror 随 T6 注册）。
-  const RPC_HANDLERS: typeof GROUP_HANDLERS = {
+  // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法（workspace.snapshots 无组校验
+  // 不进 LEADER_ONLY_METHODS 守卫直通；workspace.mirror leader-only 由守卫层校验）。
+  const RPC_HANDLERS: Record<string, GroupHandler> = {
     ...GROUP_HANDLERS,
     [RPC.workspace.snapshots]: handleWorkspaceSnapshots,
+    [RPC.workspace.mirror]: (ctx, payload) => mirrorRouter.handleMirror(ctx, payload),
   };
   // 路由必须挂在 websocket 插件之后的 register 里：fastify 5.12 的 onRoute 钩子在 .get()
   // 调用时同步跑，而 register() 的插件加载推迟到 ready()——直接紧跟 register(websocket)
@@ -114,7 +118,13 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
       socket.on('message', (raw: unknown) => {
         const env = parseEnvelope(typeof raw === 'string' ? raw : String(raw));
         if (!env) { socket.close(4400, 'bad_envelope'); return; }
-        if (env.kind !== 'req') return; // M0：客户端 res/evt 忽略
+        if (env.kind === 'evt') return; // 上行 evt 忽略（M0 语义不变）
+        if (env.kind === 'res') {
+          // M2c：目标节点的镜像回执（唯一合法上行 res）——MirrorRouter 按 id 对账；
+          // 未匹配（迟到/重复/伪造）静默忽略。hello 前的 res 不可能有对账项，一并忽略。
+          if (session.helloDone) mirrorRouter.acceptReceipt(session.nodeId, env);
+          return;
+        }
         if (!session.helloDone && env.method !== RPC.hello) {
           sendRes(env.id, env.method, false, errPayload('unauthorized', '必须先完成 hello'));
           return;
@@ -149,6 +159,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
           default: {
             // RPC 分发（M2b 起多域方法）——leader-only 校验层为 dispatcher 外围守卫：
             // 先查分发表（未注册方法 unknown_method），命中后先过组角色守卫再进 handler。
+            // handler 可为异步（mirror 需 await sendTo 的 ws 回调判定）——同 socket 的
+            // 响应顺序不保证，res 按 id 关联（wire 契约本就如此）。
             const handler = RPC_HANDLERS[env.method];
             if (!handler) {
               sendRes(env.id, env.method, false, errPayload('unknown_method', env.method));
@@ -159,8 +171,15 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
               sendRes(env.id, env.method, false, guard.error);
               return;
             }
-            const out = handler({ db, registry, nodeId: session.nodeId }, env.payload);
-            sendRes(env.id, env.method, out.ok, out.ok ? out.payload : out.error);
+            void (async () => {
+              try {
+                const out = await handler({ db, registry, nodeId: session.nodeId }, env.payload);
+                sendRes(env.id, env.method, out.ok, out.ok ? out.payload : out.error);
+              } catch (err) {
+                logger.warn('RPC 处理异常', { method: env.method, err });
+                sendRes(env.id, env.method, false, errPayload('internal', '内部错误'));
+              }
+            })();
             return;
           }
         }
@@ -186,6 +205,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         // 同 nodeId 的第二条连接（未 hello 的升级重试、旧 socket 迟到的 close）断开时
         // 在线态未变，注册表与广播流保持一致，不会误报离线。
         if (registry.remove(session.nodeId, socket)) {
+          // M2c：受理后断连的目标节点——镜像 pending 逐个结算（登记释放 + 告知 leader）
+          mirrorRouter.onNodeOffline(session.nodeId);
           registry.broadcast(EVT.nodeOffline, { nodeId: session.nodeId, at: Date.now() });
         }
       });

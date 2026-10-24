@@ -15,6 +15,28 @@ const MIGRATIONS: readonly string[] = [
      enrolled_at INTEGER NOT NULL,
      last_seen_at INTEGER NOT NULL
    )`,
+  // v2（M1 资源分发，spec 2026-10-24 §4 SQL 逐字）
+  `CREATE TABLE IF NOT EXISTS resources (
+     slug TEXT PRIMARY KEY,
+     type TEXT NOT NULL,            -- 'agent'|'mcp'|'skill'|'plugin'
+     name TEXT NOT NULL,
+     author TEXT NOT NULL,
+     description TEXT NOT NULL DEFAULT '',
+     readme TEXT NOT NULL DEFAULT '',
+     tags_json TEXT NOT NULL DEFAULT '[]',
+     category TEXT NOT NULL DEFAULT '',
+     icon_emoji TEXT NOT NULL DEFAULT '',
+     latest_version TEXT NOT NULL
+   )`,
+  `CREATE TABLE IF NOT EXISTS resource_versions (
+     slug TEXT NOT NULL,
+     version TEXT NOT NULL,
+     checksum TEXT NOT NULL,        -- sha256 hex（服务端自算，C6）
+     size_bytes INTEGER NOT NULL,
+     published_by TEXT NOT NULL,    -- 节点名
+     published_at INTEGER NOT NULL,
+     PRIMARY KEY (slug, version)
+   )`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

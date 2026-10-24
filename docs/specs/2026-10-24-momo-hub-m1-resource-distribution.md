@@ -178,3 +178,4 @@ studio：HubManager onEvent 新增 `resource.published` 分支 → `webContents.
 - url 形态 mcp 发布（凭证红线）
 - 插件依赖解析/node_modules 打包
 - 发布审批流（any-node-trusted 已裁定）
+- 内容真实性/防篡改（T15a 补记）：http hub 上 checksum 仅防传输损坏、不防篡改——catalog 与包走同一信道，能篡改包者同样能改 catalog 里的 checksum。公网暴露场景应使用 TLS 反代终结 + `MOMO_HUB_PUBLIC_ORIGIN` 指向 https origin，而非依赖校验和

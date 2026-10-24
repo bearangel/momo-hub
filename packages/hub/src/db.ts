@@ -48,6 +48,14 @@ const MIGRATIONS: readonly string[] = [
    CREATE TABLE IF NOT EXISTS group_invites (
      code TEXT PRIMARY KEY, group_id TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
    )`,
+  // v4（M2c 快照表——spec §4 SQL 逐字 + UNIQUE(workspace_name, version)：
+  // 同 workspaceName+version 不可变（C4 同款双层 409 的库层兜底）。
+  // 迁移不可变纪律：不改写已应用的 v3 串，只追加新条目（delegations 随 M2d 再追加）。
+  `CREATE TABLE IF NOT EXISTS workspace_snapshots_meta (
+     snapshot_id TEXT PRIMARY KEY, workspace_name TEXT NOT NULL, version TEXT NOT NULL,
+     by_node TEXT NOT NULL, checksum TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL,
+     UNIQUE (workspace_name, version)
+   )`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

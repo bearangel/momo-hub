@@ -171,8 +171,11 @@ function isBoundedStr(x: unknown, max: number): x is string {
 
 const textEncoder = new TextEncoder();
 
+/** strList 逐项长度上限（DoS 下限：防单条超长字符串灌入清单位）。 */
+const STR_LIST_ITEM_MAX = 128;
+
 function strListFrom(x: unknown, max: number): string[] | null {
-  if (!Array.isArray(x) || x.length > max || !x.every((s) => isStr(s))) return null;
+  if (!Array.isArray(x) || x.length > max || !x.every((s) => isStr(s) && s.length <= STR_LIST_ITEM_MAX)) return null;
   return [...x];
 }
 

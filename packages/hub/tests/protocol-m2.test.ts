@@ -494,6 +494,21 @@ describe('validateSnapshotManifest 坏矩阵：config 配置段', () => {
     expect(validateSnapshotManifest({ ...base, config: { ...base.config, skills: [1] } })).toBeNull();
   });
 
+  // strListFrom 项长上限（M2c T2 携带票）：mcpEnabled/skills/team members 等字符串清单
+  // 逐项 ≤128 字符——防单条超长字符串灌入（DoS 下限与 S1 纪律同源）。
+  it('strList 项长 >128 → null（mcpEnabled / skills / team members）；边界 128 合法', () => {
+    const base = validManifest();
+    const bad = (patch: Record<string, unknown>): unknown =>
+      validateSnapshotManifest({ ...base, config: { ...base.config, ...patch } });
+    expect(bad({ mcpEnabled: ['x'.repeat(129)] })).toBeNull();
+    expect(bad({ skills: ['x'.repeat(129)] })).toBeNull();
+    expect(bad({ teams: [{ name: 't', leader: 'l', members: ['ok', 'x'.repeat(129)] }] })).toBeNull();
+    // 边界：恰好 128 合法
+    expect(bad({ mcpEnabled: ['x'.repeat(128)] })).not.toBeNull();
+    expect(bad({ skills: ['x'.repeat(128)] })).not.toBeNull();
+    expect(bad({ teams: [{ name: 't', leader: 'l', members: ['x'.repeat(128)] }] })).not.toBeNull();
+  });
+
   it('pluginsEnabled 项缺 pluginId/slug → null', () => {
     const base = validManifest();
     const bad = (patch: Record<string, unknown>): unknown =>

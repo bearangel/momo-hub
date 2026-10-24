@@ -15,20 +15,23 @@ export class BlobTooLargeError extends Error {
   }
 }
 
-/** blob 最终路径合成（存在性由调用方查）；checksum 必须过 S1——目录逃逸防线。 */
-export function openBlob(dataDir: string, checksum: string): string {
+/** blob 最终路径合成（存在性由调用方查）；checksum 必须过 S1——目录逃逸防线。
+ *  subdir：内容寻址子目录（默认 'blobs'=M1 资源仓；M2c 快照用 'ws-snapshots'）。 */
+export function openBlob(dataDir: string, checksum: string, subdir = 'blobs'): string {
   if (!SHA256_HEX_PATTERN.test(checksum)) throw new Error(`invalid checksum: ${checksum}`);
-  return path.join(dataDir, 'blobs', `${checksum}.tar.gz`);
+  return path.join(dataDir, subdir, `${checksum}.tar.gz`);
 }
 
 /** 流式落盘：边收边算 sha256，全部收完且 ≤maxBytes 才 rename 转正（C6）；
- *  已存在同 checksum blob（内容寻址即同内容）则删临时件幂等返回。 */
+ *  已存在同 checksum blob（内容寻址即同内容）则删临时件幂等返回；
+ *  subdir 同 openBlob（各用途互不混目录）。 */
 export async function saveBlobStream(
   source: NodeJS.ReadableStream,
   maxBytes: number,
   dataDir: string,
+  subdir = 'blobs',
 ): Promise<{ checksum: string; sizeBytes: number }> {
-  const blobsDir = path.join(dataDir, 'blobs');
+  const blobsDir = path.join(dataDir, subdir);
   mkdirSync(blobsDir, { recursive: true });
   const tmpPath = path.join(blobsDir, `.tmp-${randomUUID()}`);
   const hash = createHash('sha256');
@@ -52,7 +55,7 @@ export async function saveBlobStream(
       out,
     );
     const checksum = hash.digest('hex');
-    const finalPath = openBlob(dataDir, checksum);
+    const finalPath = openBlob(dataDir, checksum, subdir);
     if (existsSync(finalPath)) {
       unlinkSync(tmpPath); // 内容寻址：同名即同内容，幂等去重
     } else {

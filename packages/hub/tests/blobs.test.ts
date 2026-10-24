@@ -84,8 +84,9 @@ describe('迁移 v2（spec M1 §4 两表，逐字 SQL）', () => {
   it('resources / resource_versions 两表可用且 schema_version 推进；重开幂等', () => {
     const dir = tmpDir();
     const db = openHubDatabase(dir);
-    // v1 即两条语句（hub_meta/nodes），追加 v2 两表后 4 条；M2b v3 组三表（单条多语句）后 5 条
-    expect(db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '5' });
+    // v1 即两条语句（hub_meta/nodes），追加 v2 两表后 4 条；M2b v3 组三表（单条多语句）
+    // 后 5 条；M2c 快照表后 6 条
+    expect(db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '6' });
     db.prepare(
       "INSERT INTO resources (slug, type, name, author, latest_version) VALUES ('coder-pro', 'agent', 'Coder Pro', 'ws-1', '1.2.3')",
     ).run();
@@ -95,9 +96,28 @@ describe('迁移 v2（spec M1 §4 两表，逐字 SQL）', () => {
     db.close();
 
     const db2 = openHubDatabase(dir); // 迁移幂等：重开不重复执行、不丢数据
-    expect(db2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '5' });
+    expect(db2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '6' });
     expect(db2.prepare('SELECT COUNT(*) AS n FROM resources').get()).toEqual({ n: 1 });
     expect(db2.prepare('SELECT COUNT(*) AS n FROM resource_versions').get()).toEqual({ n: 1 });
     db2.close();
+  });
+});
+
+describe('子目录参数（M2c 快照：ws-snapshots 与 M1 blobs 隔离）', () => {
+  it('saveBlobStream 落指定子目录；同内容跨子目录各存一份（互不去重）', async () => {
+    const dir = tmpDir();
+    const content = Buffer.from('ws snapshot bytes', 'utf8');
+    const r = await saveBlobStream(Readable.from([content]), 1024, dir, 'ws-snapshots');
+    expect(existsSync(join(dir, 'ws-snapshots', `${r.checksum}.tar.gz`))).toBe(true);
+    expect(existsSync(join(dir, 'blobs'))).toBe(false); // 未动默认目录
+    // 同内容再存默认目录：各目录各一份（隔离语义）
+    await saveBlobStream(Readable.from([content]), 1024, dir);
+    expect(existsSync(join(dir, 'blobs', `${r.checksum}.tar.gz`))).toBe(true);
+  });
+
+  it('openBlob 支持子目录且 checksum 防线同款', () => {
+    const c = 'b'.repeat(64);
+    expect(openBlob('/data', c, 'ws-snapshots')).toBe(join('/data', 'ws-snapshots', `${c}.tar.gz`));
+    expect(() => openBlob('/data', '../evil', 'ws-snapshots')).toThrow();
   });
 });

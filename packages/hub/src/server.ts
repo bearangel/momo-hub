@@ -18,6 +18,7 @@ import { normalizePublicOrigin } from './config';
 import { NodeRegistry, type NodeConn } from './registry';
 import { GROUP_HANDLERS, checkGroupRole } from './groups';
 import { registerResourceRoutes } from './resources';
+import { handleWorkspaceSnapshots, registerSnapshotRoutes } from './snapshots';
 import { logger } from './logger';
 
 export interface HubServer {
@@ -31,6 +32,7 @@ export interface CreateHubServerOpts {
   identity: HubIdentity;
   dataDir?: string;            // blob 存储根目录；缺省从 db 文件路径推导
   resourceMaxBytes?: number;   // publish 上限（默认 200MB；测试注入小值走同一代码路径）
+  snapshotMaxBytes?: number;   // 工作空间快照上限（默认 200MB；测试注入小值走同一代码路径）
   helloTimeoutMs?: number;      // 默认 5000
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
   /** 公网 origin（RM1-11）：设置后 catalog 的 downloadUrl 独占使用该 origin；
@@ -65,6 +67,12 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const registry = new NodeRegistry();
   const app = fastify({ logger: false });
   void app.register(websocket);
+  // ws RPC 分发表 = 组管理六方法 + M2c 快照列表（workspace.snapshots 无组校验——
+  // 不进 LEADER_ONLY_METHODS，守卫直通；镜像 mirror 随 T6 注册）。
+  const RPC_HANDLERS: typeof GROUP_HANDLERS = {
+    ...GROUP_HANDLERS,
+    [RPC.workspace.snapshots]: handleWorkspaceSnapshots,
+  };
   // 路由必须挂在 websocket 插件之后的 register 里：fastify 5.12 的 onRoute 钩子在 .get()
   // 调用时同步跑，而 register() 的插件加载推迟到 ready()——直接紧跟 register(websocket)
   // 写路由会让 /ws 用未改写的 handler（socket 实为 request，表现为升级 500 / close 1006）。
@@ -83,7 +91,11 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     });
 
     // 资源发布端点（spec M1 §3.1）——multipart 流式收包 + 校验矩阵 + 版本不可变 409。
+    // multipart 插件在此注册（fastify-plugin 无封装边界）——后续快照路由共用其装饰与 limits。
     registerResourceRoutes(instance, { db, dataDir, registry, maxBytes: opts.resourceMaxBytes, publicOrigin });
+
+    // 工作空间快照存档端点（M2c spec §3.1）——C6/C4 纪律复用，落 ws-snapshots/。
+    registerSnapshotRoutes(instance, { db, dataDir, maxBytes: opts.snapshotMaxBytes });
 
     instance.get('/ws', { websocket: true }, (socket, req) => {
       const auth = req.headers.authorization ?? '';
@@ -135,10 +147,9 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             return;
           }
           default: {
-            // 组管理 RPC（M2b）——leader-only 校验层为 dispatcher 外围守卫：
-            // 先查分发表（未注册方法照旧 unknown_method——mirror/task.*/view.*
-            // 的映射已建全，注册后守卫自动生效），命中后先过组角色守卫再进 handler。
-            const handler = GROUP_HANDLERS[env.method];
+            // RPC 分发（M2b 起多域方法）——leader-only 校验层为 dispatcher 外围守卫：
+            // 先查分发表（未注册方法 unknown_method），命中后先过组角色守卫再进 handler。
+            const handler = RPC_HANDLERS[env.method];
             if (!handler) {
               sendRes(env.id, env.method, false, errPayload('unknown_method', env.method));
               return;

@@ -21,7 +21,7 @@
 | C4 | **同 slug+version 重复发布 → 409 拒绝**；版本只增不改（无覆盖/无删除——删除 M1 不做，YAGNI） | 资源仓不可变性 = 其他节点安装可复现 | 发布错版本只能升版本号绕过 |
 | C5 | **大小上限 200MB/包**（沿用 MAX_DOWNLOAD_BYTES）；总配额不做（个人多设备） | 与 marketplace 一致 | 无 |
 | C6 | **hub 侧发布即校验即算校验和**：客户端只传内容，服务端流式落盘后自算 sha256 写入 resource_versions——不信客户端自报 | 信任根在 hub | 无 |
-| C7 | 协议 **PROTOCOL_VERSION → 1.1.0**（新增 resource.published 事件与 HTTP 端点，均向后兼容——envelope 未知 method 容忍 + 事件分发 fall-through 已验证）；git tag **v0.2.0**；studio pin 升至 `#v0.2.0` | minor 递增纪律 | 无 |
+| C7 | 协议 **PROTOCOL_VERSION → 1.1.0**（新增 resource.published 事件与 HTTP 端点，均向后兼容——envelope 未知 method 容忍 + 事件分发 fall-through 已验证；major 兼容门只看主版本号）；git tag 与包版本 **v0.1.1**（用户裁定：M1 维持 0.1.x 线）；studio pin 升至 `#v0.1.1` | wire 语义 minor 递增；包版本按用户裁定走 patch | 无 |
 
 ## 3. Wire 协议（momo-hub `src/`，协议单源）
 
@@ -158,7 +158,7 @@ studio：HubManager onEvent 新增 `resource.published` 分支 → `webContents.
 ## 8. 里程碑拆分（每块独立可验收）
 
 - **M1a M0 补丁包**（§7 全部，studio+hub 小改；独立交付）
-- **M1b hub 资源仓**（§3/§4：迁移 v2 + 三端点 + S1 服务端 + 事件 + 协议 1.1.0 + tag v0.2.0；hub 侧集成测试可独立验收）
+- **M1b hub 资源仓**（§3/§4：迁移 v2 + 三端点 + S1 服务端 + 事件 + 协议 1.1.0 + tag v0.1.1；hub 侧集成测试可独立验收）
 - **M1c studio hub 源**（§6.1/6.2/6.3：第五 source + 安装链复用〔https 白名单〕+ degraded；agent/skill/mcp 三类端到端）
 - **M1d plugin 面**（§6.4：发布打包 + 安装注册链；**备选：若实施中发现插件注册链耦合超预期，独立成 M1.5 推后，不阻塞其余三类验收**）
 - **M1e 发布面 + 更新角标**（§6.5 + §5 事件链 + 验收形态全走查 + 版本账本 alpha.29 + 真机验收）

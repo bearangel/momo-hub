@@ -224,7 +224,14 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
           continue;
         }
         if (part.fieldname === 'package' && packagePart === null) {
-          if (manifest === null) { manifestError = 'invalid_manifest'; break; }
+          if (manifest === null) {
+            // package 先于 manifest（或压根没有 manifest）→ 400。
+            // 当前 part 已被迭代器交出但未消费——必须在这里排干：否则 busboy 停在当前
+            // part → 请求体读不完 → 连接悬挂（与 409 预查早答路径同构）。
+            if (part.type === 'file') void discardPartFile(part.file);
+            manifestError = 'invalid_manifest';
+            break;
+          }
           packagePart = part;
           break; // 交给 saveBlobStream 流式收包
         }

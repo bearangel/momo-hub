@@ -118,6 +118,13 @@ function rawMultipartBody(manifestText: string, payload: Buffer, trailing = ''):
   ]);
 }
 
+/** 裸 multipart 体：只有 package 文件 part（无 manifest）——触发「package 先行/缺 manifest」早退。 */
+function rawPackageOnlyBody(payload: Buffer): Buffer {
+  const head = `--${RAW_BOUNDARY}\r\nContent-Disposition: form-data; name="package"; filename="package.tar.gz"\r\nContent-Type: application/gzip\r\n\r\n`;
+  const tail = `\r\n--${RAW_BOUNDARY}--\r\n`;
+  return Buffer.concat([Buffer.from(head, 'utf8'), payload, Buffer.from(tail, 'utf8')]);
+}
+
 /** 裸 TCP 发布客户端：同一 keep-alive 连接上顺序发多个请求，响应按到达顺序消费。 */
 class RawPublisher {
   private buf = Buffer.alloc(0);
@@ -144,17 +151,23 @@ class RawPublisher {
     }
   }
 
-  /** 发一个发布请求：body 分块慢速上传（客户端仍在传的背压现场）。 */
-  async publish(
-    port: number, token: string, manifestText: string, payload: Buffer, trailing = '',
+  /** 发一个请求：body 分块慢速上传（客户端仍在传的背压现场）。 */
+  async sendRaw(
+    port: number, token: string, body: Buffer, label = '第一个请求',
   ): Promise<RawResponse> {
-    const body = rawMultipartBody(manifestText, payload, trailing);
     this.sock.write(rawRequestHead(port, token, body.length));
     for (let off = 0; off < body.length; off += 8 * 1024) {
       this.sock.write(body.subarray(off, Math.min(off + 8 * 1024, body.length)));
       await new Promise((r) => setTimeout(r, 1));
     }
-    return this.next(5000, '第一个请求');
+    return this.next(5000, label);
+  }
+
+  /** 发一个发布请求（manifest + package）。 */
+  async publish(
+    port: number, token: string, manifestText: string, payload: Buffer, trailing = '',
+  ): Promise<RawResponse> {
+    return this.sendRaw(port, token, rawMultipartBody(manifestText, payload, trailing));
   }
 
   /** 下一个响应；超时即抛（socket 悬挂时表现为拿不到任何响应）。 */
@@ -191,6 +204,7 @@ async function rawHub(resourceMaxBytes?: number): Promise<{
   if ('error' in cred) throw new Error('enroll 失败');
   const port = Number(new URL(url).port);
   const sock = net.connect(port, '127.0.0.1');
+  sock.on('error', () => { /* 连接异常（ECONNRESET 等）：断言走超时路径，不让未处理 error 拖垮整个测试文件 */ });
   await new Promise<void>((resolve) => sock.once('connect', () => resolve()));
   return {
     port,
@@ -594,6 +608,32 @@ describe('publish 早答排干（请求体悬挂）', () => {
         hub.port, hub.token,
         JSON.stringify(manifestOf({ slug: 'after-trail-raw', version: '1.0.0' })),
         Buffer.from('after trailing payload'),
+      );
+      expect(r2.status).toBe(201);
+    } finally {
+      await hub.close();
+    }
+  }, 30_000);
+
+  it('只发 package 文件 part（缺 manifest）→ 400 invalid_manifest，同连接第二个请求仍 201，close 5s 内收口', async () => {
+    const hub = await rawHub();
+    try {
+      // package 先于 manifest（或压根没有 manifest）→ 400：
+      // 该 file part 已被迭代器交出但未消费，早退时必须排干，否则 busboy 停在当前 part
+      // → 请求体读不完 → 连接悬挂（与 409 预查早答路径同构）。
+      const r1 = await hub.client.sendRaw(
+        hub.port, hub.token,
+        rawPackageOnlyBody(Buffer.alloc(2 * 1024 * 1024, 0x43)),
+        '缺 manifest 请求',
+      );
+      expect(r1.status).toBe(400);
+      expect(JSON.parse(r1.body)).toEqual({ error: 'invalid_manifest' });
+      expect(hub.db.prepare('SELECT COUNT(*) AS n FROM resources').get()).toEqual({ n: 0 });
+
+      const r2 = await hub.client.publish(
+        hub.port, hub.token,
+        JSON.stringify(manifestOf({ slug: 'after-no-manifest-raw', version: '1.0.0' })),
+        Buffer.from('after no manifest payload'),
       );
       expect(r2.status).toBe(201);
     } finally {

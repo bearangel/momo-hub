@@ -28,6 +28,9 @@ export interface GroupCreateReq { groupName: string }
 /** 创建者即 leader；nodeId 回调用者自身。 */
 export interface GroupCreateRes { groupId: string; nodeId: string }
 
+/** 空请求载荷（spec §3.1「—」）——调用方发 `{}` 占位。 */
+export type GroupListReq = Record<string, never>;
+
 export interface GroupListRes { groups: GroupInfo[] }
 
 export interface GroupInfo {

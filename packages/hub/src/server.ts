@@ -16,6 +16,7 @@ import type { HubIdentity } from './identity';
 import { enrollNode, verifyDeviceToken } from './auth';
 import { normalizePublicOrigin } from './config';
 import { NodeRegistry, type NodeConn } from './registry';
+import { GROUP_HANDLERS, checkGroupRole } from './groups';
 import { registerResourceRoutes } from './resources';
 import { logger } from './logger';
 
@@ -133,8 +134,24 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             sendRes(env.id, RPC.ping, true, { ts, serverTime: Date.now() });
             return;
           }
-          default:
-            sendRes(env.id, env.method, false, errPayload('unknown_method', env.method));
+          default: {
+            // 组管理 RPC（M2b）——leader-only 校验层为 dispatcher 外围守卫：
+            // 先查分发表（未注册方法照旧 unknown_method——mirror/task.*/view.*
+            // 的映射已建全，注册后守卫自动生效），命中后先过组角色守卫再进 handler。
+            const handler = GROUP_HANDLERS[env.method];
+            if (!handler) {
+              sendRes(env.id, env.method, false, errPayload('unknown_method', env.method));
+              return;
+            }
+            const guard = checkGroupRole(db, session.nodeId, env.method, env.payload);
+            if (!guard.ok) {
+              sendRes(env.id, env.method, false, guard.error);
+              return;
+            }
+            const out = handler({ db, registry, nodeId: session.nodeId }, env.payload);
+            sendRes(env.id, env.method, out.ok, out.ok ? out.payload : out.error);
+            return;
+          }
         }
       });
 

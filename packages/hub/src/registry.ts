@@ -35,4 +35,19 @@ export class NodeRegistry {
       }
     }
   }
+
+  /**
+   * 定向投递（M2 spec §3.1）：目标不在线或发送失败一律返回 'offline'——
+   * 调用方（RPC 层）据此映射 RpcErrorCode 'node_offline'，不留静默积压。
+   */
+  sendTo(nodeId: string, env: EventEnvelope): 'sent' | 'offline' {
+    const c = this.byId.get(nodeId);
+    if (!c) return 'offline';
+    try {
+      c.ws.send(encodeEnvelope(env));
+      return 'sent';
+    } catch {
+      return 'offline';
+    }
+  }
 }

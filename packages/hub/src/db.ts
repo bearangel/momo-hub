@@ -37,6 +37,17 @@ const MIGRATIONS: readonly string[] = [
      published_at INTEGER NOT NULL,
      PRIMARY KEY (slug, version)
    )`,
+  // v3（M2 工作组三表，spec 2026-10-24 §4 SQL 逐字；快照/委派表随 M2c/d 追加）
+  `CREATE TABLE IF NOT EXISTS groups (
+     id TEXT PRIMARY KEY, name TEXT NOT NULL, leader_node_id TEXT NOT NULL, created_at INTEGER NOT NULL
+   );
+   CREATE TABLE IF NOT EXISTS group_members (
+     group_id TEXT NOT NULL, node_id TEXT NOT NULL, joined_at INTEGER NOT NULL,
+     PRIMARY KEY (group_id, node_id)
+   );
+   CREATE TABLE IF NOT EXISTS group_invites (
+     code TEXT PRIMARY KEY, group_id TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

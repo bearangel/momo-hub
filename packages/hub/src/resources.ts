@@ -42,8 +42,11 @@ export type PublishManifestResult =
 export interface ResourceRouteOpts {
   db: Database.Database;
   dataDir: string;
-  /** 在线节点注册表——T7 发布事件广播用（本任务注入不消费）。 */
+  /** 在线节点注册表——发布事件广播用。 */
   registry: NodeRegistry;
+  /** 公网 origin（RM1-11）：设置后 catalog 的 downloadUrl 独占使用该 origin；
+   *  未设置则用请求自身的协议 + Host 头。 */
+  publicOrigin?: string;
   /** 发布体上限（默认 PUBLISH_MAX_BYTES；测试注入小值走同一代码路径）。 */
   maxBytes?: number;
 }
@@ -167,26 +170,41 @@ interface CatalogItemRow {
   published_at: number | null;
 }
 
-/** 头值取首个元素（X-Forwarded-* 形如 "a, b"——取最靠近客户端的一跳）。 */
-function firstHeaderToken(value: string | string[] | undefined): string | undefined {
-  const raw = Array.isArray(value) ? value[0] : value;
-  if (typeof raw !== 'string') return undefined;
-  const token = raw.split(',')[0]?.trim();
-  return token === undefined || token === '' ? undefined : token;
+/** 请求 origin（downloadUrl 组装用，RM1-11 信任收敛）：
+ *  - 配置了 publicOrigin（运维显式声明的公网 origin）→ 独占使用，不看任何请求头
+ *  - 未配置 → 用请求自身的协议 + Host 头（直暴形态）
+ *  刻意【不】采信 X-Forwarded-Proto / X-Forwarded-Host：那两个头由客户端自由填写，
+ *  首个 token 最易伪造——采信它等于让任意节点把其他节点的下载地址指向别处。
+ *  反代场景的正解是配 MOMO_HUB_PUBLIC_ORIGIN（见 README Caddy 段）。
+ *  已知边界：Host 头缺失时回落 'localhost'（HTTP/2 无 Host 头；M1 不涉及 HTTP/2）。 */
+function requestOrigin(req: FastifyRequest, publicOrigin: string | undefined): string {
+  if (publicOrigin !== undefined) return publicOrigin;
+  const host = req.headers.host ?? 'localhost';
+  return `${req.protocol}://${host}`;
 }
 
-/** 请求 origin（下载 URL 组装用）：反代头优先，缺省回落 req.protocol / Host 头。
- *
- *  反代场景：TLS 在 Caddy 终止时，hub 自身看到的是 http + 内网 Host——若不采信
- *  X-Forwarded-Proto/Host，拼出的 downloadUrl 会是 http:// 公网名，与 studio 侧
- *  登记的 https origin 不匹配（安装链的 origin 白名单会拒）。
- *  信任边界：hub 是私有仓，节点须持有 enrollment token 才能入网（M1 裁定
- *  「any-node-trusted」）；能入网的节点本就能自发布任意内容，伪造 downloadUrl
- *  不额外扩大攻击面。 */
-function requestOrigin(req: FastifyRequest): string {
-  const proto = firstHeaderToken(req.headers['x-forwarded-proto']) ?? req.protocol;
-  const host = firstHeaderToken(req.headers['x-forwarded-host']) ?? req.headers.host ?? 'localhost';
-  return `${proto}://${host}`;
+/** HTTP 头值清洗（RM1-10）：Node 的 setHeader 只接受 Latin-1 且禁 CR/LF——
+ *  节点名可含非 ASCII（如中文）与控制字符（enrollment 只做长度/trim 校验），
+ *  直接回填头会抛 ERR_INVALID_CHAR → 下载恒 500。
+ *  规则：剥控制字符（含 CR/LF）；剩余字符 >0xFF 的按 UTF-8 逐字节百分号编码
+ *  （与 URL query 编码同款，客户端可 decodeURIComponent 回原名）；
+ *  清洗后为空 → 头不可用 → 省略该头（不 500）。
+ *  边界：0x80–0xFF（Latin-1）原样保留（Node 允许原样进头）——这类字符不走
+ *  百分号编码，客户端按 latin1 解码即可还原。 */
+export function sanitizeHeaderValue(raw: string): string | null {
+  let out = '';
+  for (const ch of raw) {
+    const code = ch.codePointAt(0) ?? 0;
+    if (code <= 0x1f || code === 0x7f) continue; // 控制字符（含 CR/LF）剥除
+    if (code <= 0xff) {
+      out += ch; // Latin-1：Node 允许原样进头
+      continue;
+    }
+    for (const byte of Buffer.from(ch, 'utf8')) {
+      out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
+    }
+  }
+  return out.length > 0 ? out : null;
 }
 
 /** 解析 tags_json（落库是 JSON 文本；解析失败按空数组兜底，不让一条脏数据毁掉整份目录）。 */
@@ -270,7 +288,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
     const node = token ? verifyDeviceToken(db, token) : null;
     if (!node) return reply.code(401).send({ error: 'unauthorized' });
-    return reply.send(buildHubCatalog(db, requestOrigin(req)));
+    return reply.send(buildHubCatalog(db, requestOrigin(req, opts.publicOrigin)));
   });
 
   // 资源下载（spec §3.1）：Bearer 鉴权 → 参数早拒 → 版本行 → blob 流 + 校验和/发布者头
@@ -309,7 +327,9 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     }
 
     reply.header('X-Checksum-Sha256', row.checksum);
-    reply.header('X-Published-By', row.published_by);
+    // 节点名可含非 ASCII/控制字符——头值必须清洗（否则 setHeader 抛错 → 500）
+    const publishedBy = sanitizeHeaderValue(row.published_by);
+    if (publishedBy !== null) reply.header('X-Published-By', publishedBy);
     reply.header('Content-Type', 'application/gzip');
     reply.header('Content-Length', String(sizeBytes));
     return reply.send(createReadStream(blobPath));

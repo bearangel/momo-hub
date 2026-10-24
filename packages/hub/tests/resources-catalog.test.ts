@@ -8,6 +8,8 @@
 //    {error:'not_found'}，与路由级 404（Fastify 默认体）可区分）
 // ④ 401：catalog / download 未鉴权与错 token
 // ⑤ 事件链：发布成功 → 在线 ws 客户端收 resource.published（六字段逐项）
+// ⑥ fix R1（RM1-10）：X-Published-By 头清洗——中文节点名 / 含 CR-LF 节点名不致 500
+// ⑦ fix R1（RM1-11）：downloadUrl 的 origin 只认配置 publicOrigin 或请求 Host，不采信 X-Forwarded-*
 import { createHash } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -17,6 +19,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { openHubDatabase } from '../src/db';
 import { ensureHubIdentity } from '../src/identity';
 import { enrollNode } from '../src/auth';
+import { loadHubConfig } from '../src/config';
 import { createHubServer, type HubServer } from '../src/server';
 import {
   EVT, PROTOCOL_VERSION, RPC, encodeEnvelope, makeRequest, parseEnvelope, validateHubCatalog,
@@ -71,6 +74,33 @@ function publish(manifest: unknown, payload: Buffer, token: string | null = devi
   const headers: Record<string, string> = {};
   if (token !== null) headers.authorization = `Bearer ${token}`;
   return fetch(`${baseUrl}/resources/publish`, { method: 'POST', headers, body: form(manifest, payload) });
+}
+
+/** 向指定 hub 实例发布（专用实例夹具用）。 */
+function publishTo(url: string, token: string, manifest: unknown, payload: Buffer): Promise<Response> {
+  return fetch(`${url}/resources/publish`, {
+    method: 'POST', headers: { authorization: `Bearer ${token}` }, body: form(manifest, payload),
+  });
+}
+
+/** 专用 hub 实例（隔离夹具：自定义 publicOrigin / 特殊节点名）。 */
+async function newHub(opts: { publicOrigin?: string; nodeName?: string } = {}): Promise<{
+  baseUrl: string; deviceToken: string; close: () => Promise<void>;
+}> {
+  const dir = mkdtempSync(join(tmpdir(), 'momo-hub-catalog-fix-'));
+  const instanceDb = openHubDatabase(dir);
+  const instanceIdentity = ensureHubIdentity(instanceDb);
+  const instanceServer = createHubServer({
+    db: instanceDb, identity: instanceIdentity, dataDir: dir, publicOrigin: opts.publicOrigin,
+  });
+  const url = await instanceServer.listen(0, '127.0.0.1');
+  const cred = enrollNode(instanceDb, instanceIdentity.enrollmentToken, opts.nodeName ?? 'fix-node');
+  if ('error' in cred) throw new Error('enroll 失败');
+  return {
+    baseUrl: url,
+    deviceToken: cred.deviceToken,
+    close: async () => { await instanceServer.close(); instanceDb.close(); },
+  };
 }
 
 /** catalog 拉取（默认带鉴权头）。 */
@@ -207,12 +237,13 @@ describe('GET /resources/catalog', () => {
     expect(later?.downloadUrl).toBe(`${baseUrl}/resources/later-res/1.0.0/download`);
   });
 
-  it('downloadUrl 用反代头（X-Forwarded-Proto / X-Forwarded-Host）——公网 origin 形态正确', async () => {
+  it('downloadUrl 不采信 X-Forwarded-Proto / X-Forwarded-Host（RM1-11 信任收敛）——反代头由客户端自由填写', async () => {
     const res = await getCatalog({ 'x-forwarded-proto': 'https', 'x-forwarded-host': 'hub.example.com' });
     expect(res.status).toBe(200);
     const body = await res.json() as HubCatalog;
     const item = body.items.find((i) => i.slug === 'catalog-res');
-    expect(item?.downloadUrl).toBe('https://hub.example.com/resources/catalog-res/2.0.0/download');
+    // origin 只认「配置的 publicOrigin」或「请求自身的 Host」——伪造的反代头无效
+    expect(item?.downloadUrl).toBe(`${baseUrl}/resources/catalog-res/2.0.0/download`);
   });
 
   it('未鉴权 401：catalog 无 Authorization / 错 token → unauthorized', async () => {
@@ -299,5 +330,117 @@ describe('发布事件广播（resource.published）', () => {
     expect(payload.author).toBe('publisher-node');
     expect(typeof payload.at).toBe('number');
     expect(payload.at).toBeGreaterThan(0);
+  });
+});
+
+// ── fix R1 · RM1-11：downloadUrl 的 origin 来源（配置 publicOrigin vs 请求 Host）──
+
+describe('catalog downloadUrl 的 origin 来源（RM1-11）', () => {
+  it('未设 publicOrigin：downloadUrl 用请求自身的协议与 Host（直暴形态）', async () => {
+    const hub = await newHub();
+    try {
+      const res = await publishTo(hub.baseUrl, hub.deviceToken, manifestOf({ slug: 'origin-res' }), Buffer.from('origin payload'));
+      expect(res.status).toBe(201);
+      const body = await (await fetch(`${hub.baseUrl}/resources/catalog`, {
+        headers: { authorization: `Bearer ${hub.deviceToken}` },
+      })).json() as HubCatalog;
+      const item = body.items.find((i) => i.slug === 'origin-res');
+      expect(item?.downloadUrl).toBe(`${hub.baseUrl}/resources/origin-res/1.0.0/download`);
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('设了 publicOrigin：downloadUrl 独占配置值（请求 Host 与 X-Forwarded-* 都无效）', async () => {
+    const hub = await newHub({ publicOrigin: 'https://hub.example.com' });
+    try {
+      const res = await publishTo(hub.baseUrl, hub.deviceToken, manifestOf({ slug: 'origin-res' }), Buffer.from('origin payload'));
+      expect(res.status).toBe(201);
+      const body = await (await fetch(`${hub.baseUrl}/resources/catalog`, {
+        headers: {
+          authorization: `Bearer ${hub.deviceToken}`,
+          'x-forwarded-proto': 'http',
+          'x-forwarded-host': 'evil.example.com',
+        },
+      })).json() as HubCatalog;
+      const item = body.items.find((i) => i.slug === 'origin-res');
+      expect(item?.downloadUrl).toBe('https://hub.example.com/resources/origin-res/1.0.0/download');
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('非法 publicOrigin：启动报错（不静默降级成坏 URL）', () => {
+    for (const bad of ['', 'not-a-url', 'ftp://hub.example.com', 'https://', 'https://user:pw@hub.example.com',
+      'https://hub.example.com?x=1', 'https://hub.example.com#frag']) {
+      expect(() => loadHubConfig({ MOMO_HUB_PUBLIC_ORIGIN: bad }), `配置值：${bad}`).toThrow();
+      expect(() => createHubServer({ db, identity, publicOrigin: bad }), `配置值：${bad}`).toThrow();
+    }
+    // 合法值放行（尾斜杠归一）
+    expect(loadHubConfig({ MOMO_HUB_PUBLIC_ORIGIN: 'https://hub.example.com/' }).publicOrigin)
+      .toBe('https://hub.example.com');
+    // 未设 → 无 publicOrigin 字段
+    expect(loadHubConfig({}).publicOrigin).toBeUndefined();
+  });
+});
+
+// ── fix R1 · RM1-10：X-Published-By 头清洗（节点名可含非 ASCII / 控制字符）────
+
+describe('X-Published-By 头清洗（RM1-10）', () => {
+  it('中文节点名：下载 200（不 500），头值百分号编码后可解码回原名', async () => {
+    const hub = await newHub({ nodeName: '中文节点' });
+    try {
+      const res = await publishTo(hub.baseUrl, hub.deviceToken, manifestOf({ slug: 'cn-res' }), Buffer.from('cn payload'));
+      expect(res.status).toBe(201);
+      const dl = await fetch(`${hub.baseUrl}/resources/cn-res/1.0.0/download`, {
+        headers: { authorization: `Bearer ${hub.deviceToken}` },
+      });
+      expect(dl.status).toBe(200);
+      // 读完响应体：确认下载字节完整（并让连接回到可复用态）
+      await dl.arrayBuffer();
+      const header = dl.headers.get('x-published-by');
+      expect(header).not.toBeNull();
+      // 头值必须是纯 ASCII（Node setHeader 只接受 Latin-1 且禁 CR/LF）
+      expect(/^[\x20-\x7e]*$/.test(header ?? '')).toBe(true);
+      expect(decodeURIComponent(header ?? '')).toBe('中文节点');
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('含 CR/LF 的节点名：头中剥除控制字符（无 CR/LF 注入）', async () => {
+    const hub = await newHub({ nodeName: 'weird\r\nname' });
+    try {
+      const res = await publishTo(hub.baseUrl, hub.deviceToken, manifestOf({ slug: 'crlf-res' }), Buffer.from('crlf payload'));
+      expect(res.status).toBe(201);
+      const dl = await fetch(`${hub.baseUrl}/resources/crlf-res/1.0.0/download`, {
+        headers: { authorization: `Bearer ${hub.deviceToken}` },
+      });
+      expect(dl.status).toBe(200);
+      await dl.arrayBuffer(); // 读完响应体：确认下载字节完整
+      const header = dl.headers.get('x-published-by') ?? '';
+      expect(header).not.toContain('\r');
+      expect(header).not.toContain('\n');
+      expect(header).toBe('weirdname');
+    } finally {
+      await hub.close();
+    }
+  });
+
+  it('节点名清洗后为空：省略 X-Published-By 头（不 500）', async () => {
+    const hub = await newHub({ nodeName: '\u0000' });
+    try {
+      const res = await publishTo(hub.baseUrl, hub.deviceToken, manifestOf({ slug: 'blank-res' }), Buffer.from('blank payload'));
+      expect(res.status).toBe(201);
+      const dl = await fetch(`${hub.baseUrl}/resources/blank-res/1.0.0/download`, {
+        headers: { authorization: `Bearer ${hub.deviceToken}` },
+      });
+      expect(dl.status).toBe(200);
+      await dl.arrayBuffer();
+      expect(dl.headers.get('x-published-by')).toBeNull();
+      expect(dl.headers.get('x-checksum-sha256')).toMatch(/^[0-9a-f]{64}$/);
+    } finally {
+      await hub.close();
+    }
   });
 });

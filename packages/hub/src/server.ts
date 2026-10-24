@@ -14,6 +14,7 @@ import {
 } from 'momo-hub-protocol';
 import type { HubIdentity } from './identity';
 import { enrollNode, verifyDeviceToken } from './auth';
+import { normalizePublicOrigin } from './config';
 import { NodeRegistry, type NodeConn } from './registry';
 import { registerResourceRoutes } from './resources';
 import { logger } from './logger';
@@ -31,6 +32,9 @@ export interface CreateHubServerOpts {
   resourceMaxBytes?: number;   // publish 上限（默认 200MB；测试注入小值走同一代码路径）
   helloTimeoutMs?: number;      // 默认 5000
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
+  /** 公网 origin（RM1-11）：设置后 catalog 的 downloadUrl 独占使用该 origin；
+   *  非法值在此抛错（启动即失败，不静默降级）。 */
+  publicOrigin?: string;
 }
 
 /** blob 存储根目录推导：优先用 db 所在目录（hub.db 与 blobs 同根），
@@ -55,6 +59,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const helloTimeoutMs = opts.helloTimeoutMs ?? 5000;
   const keepaliveIntervalMs = opts.keepaliveIntervalMs ?? 30_000;
   const dataDir = opts.dataDir ?? deriveDataDir(db);
+  // 公网 origin 归一 + 校验：非法即启动报错（拼错的 origin 会让 downloadUrl 指向错主机）
+  const publicOrigin = opts.publicOrigin === undefined ? undefined : normalizePublicOrigin(opts.publicOrigin);
   const registry = new NodeRegistry();
   const app = fastify({ logger: false });
   void app.register(websocket);
@@ -76,7 +82,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     });
 
     // 资源发布端点（spec M1 §3.1）——multipart 流式收包 + 校验矩阵 + 版本不可变 409。
-    registerResourceRoutes(instance, { db, dataDir, registry, maxBytes: opts.resourceMaxBytes });
+    registerResourceRoutes(instance, { db, dataDir, registry, maxBytes: opts.resourceMaxBytes, publicOrigin });
 
     instance.get('/ws', { websocket: true }, (socket, req) => {
       const auth = req.headers.authorization ?? '';
@@ -165,7 +171,19 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
       const actualPort = typeof addr === 'object' && addr ? addr.port : port;
       return `http://${host === '0.0.0.0' ? '127.0.0.1' : host}:${actualPort}`;
     },
-    async close() { await app.close(); },
+    async close() {
+      // Node 的 server.close() 只做一次空闲连接清扫：响应刚结束、socket 还没登记进
+      // 空闲表的那一瞬会被漏掉——close 回调永远不来（实测偶发复现：hub 停机与测试
+      // teardown 都被拖住）。轮询清扫空闲连接：只关空闲的，不打断进行中的请求与 ws 会话。
+      const closing = app.close();
+      const idleCloser = setInterval(() => { app.server.closeIdleConnections(); }, 50);
+      idleCloser.unref();
+      try {
+        await closing;
+      } finally {
+        clearInterval(idleCloser);
+      }
+    },
     onlineNodes: () => registry.onlineNodes(),
   };
 }

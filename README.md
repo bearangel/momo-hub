@@ -42,6 +42,14 @@ example.com {
 
 momo-hub 自身只监听 HTTP（默认 `0.0.0.0:8787`），TLS 终结交给反代。
 
+反代后 hub 看到的仍是内网 HTTP，catalog 里的下载地址默认按请求的 Host 拼——要让 studio 拿到公网 https 地址，配置公网 origin：
+
+```bash
+MOMO_HUB_PUBLIC_ORIGIN=https://hub.example.com
+```
+
+设了它，catalog 的 `downloadUrl` 一律用该 origin 拼装（非法值启动即报错）；不设则用请求自身的协议与 Host 头。
+
 ### 加入凭证（enrollment token）
 
 新节点首次接入 hub 时用 enrollment token 换取自己的 device token（`POST /enroll`）。token 在 hub 启动横幅中打印；**泄露或需要吊销旧节点时轮换**：直接改库即可——`hub_meta` 表中 `enrollment_token` 行删掉后重启 hub 会自动生成新 token（或调 `packages/hub/src/identity.ts` 内的 `rotateEnrollmentToken(db)`）。M0 未提供轮换 CLI，命令行化留 M1。

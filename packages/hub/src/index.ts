@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const config = loadHubConfig(process.env);
   const db = openHubDatabase(config.dataDir);
   const identity = ensureHubIdentity(db);
-  const server = createHubServer({ db, identity });
+  const server = createHubServer({ db, identity, dataDir: config.dataDir });
   const url = await server.listen(config.port);
   logger.info(`momo-hub 已启动 ${url}（数据目录 ${config.dataDir}）`);
   logger.info(`hub id: ${identity.hubId}`);

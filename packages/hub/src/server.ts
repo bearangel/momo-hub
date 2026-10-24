@@ -4,6 +4,10 @@
 import fastify from 'fastify';
 import websocket from '@fastify/websocket';
 import type Database from 'better-sqlite3';
+import { randomUUID } from 'node:crypto';
+import { mkdirSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   EVT, PROTOCOL_VERSION, RPC, encodeEnvelope, isCompatible, parseEnvelope,
   type HelloReq, type RpcErrorPayload,
@@ -11,6 +15,7 @@ import {
 import type { HubIdentity } from './identity';
 import { enrollNode, verifyDeviceToken } from './auth';
 import { NodeRegistry, type NodeConn } from './registry';
+import { registerResourceRoutes } from './resources';
 import { logger } from './logger';
 
 export interface HubServer {
@@ -22,8 +27,22 @@ export interface HubServer {
 export interface CreateHubServerOpts {
   db: Database.Database;
   identity: HubIdentity;
+  dataDir?: string;            // blob 存储根目录；缺省从 db 文件路径推导
+  resourceMaxBytes?: number;   // publish 上限（默认 200MB；测试注入小值走同一代码路径）
   helloTimeoutMs?: number;      // 默认 5000
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
+}
+
+/** blob 存储根目录推导：优先用 db 所在目录（hub.db 与 blobs 同根），
+ *  内存库（无文件路径）退化为独立临时目录——避免多实例互相踩。 */
+function deriveDataDir(db: Database.Database): string {
+  const name = db.name;
+  if (name && name !== ':memory:' && !name.startsWith(':')) {
+    return path.dirname(path.resolve(name));
+  }
+  const dir = path.join(os.tmpdir(), `momo-hub-${randomUUID()}`);
+  mkdirSync(dir, { recursive: true });
+  return dir;
 }
 
 // 会话自持有连接：conn 只认本 socket 那一条 NodeConn。
@@ -35,6 +54,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const { db, identity } = opts;
   const helloTimeoutMs = opts.helloTimeoutMs ?? 5000;
   const keepaliveIntervalMs = opts.keepaliveIntervalMs ?? 30_000;
+  const dataDir = opts.dataDir ?? deriveDataDir(db);
   const registry = new NodeRegistry();
   const app = fastify({ logger: false });
   void app.register(websocket);
@@ -54,6 +74,9 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
       logger.info('节点已注册', { nodeId: r.nodeId });
       return reply.send({ nodeId: r.nodeId, deviceToken: r.deviceToken });
     });
+
+    // 资源发布端点（spec M1 §3.1）——multipart 流式收包 + 校验矩阵 + 版本不可变 409。
+    registerResourceRoutes(instance, { db, dataDir, registry, maxBytes: opts.resourceMaxBytes });
 
     instance.get('/ws', { websocket: true }, (socket, req) => {
       const auth = req.headers.authorization ?? '';

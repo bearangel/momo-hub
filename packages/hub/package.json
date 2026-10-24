@@ -5,13 +5,16 @@
   "license": "AGPL-3.0-only",
   "type": "commonjs",
   "main": "dist/index.js",
-  "bin": { "momo-hub": "dist/index.js" },
+  "bin": {
+    "momo-hub": "dist/index.js"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --config vitest.config.ts"
   },
   "dependencies": {
+    "@fastify/multipart": "^9",
     "@fastify/websocket": "^11.0.0",
     "better-sqlite3": "^12.11.1",
     "fastify": "^5.2.0",

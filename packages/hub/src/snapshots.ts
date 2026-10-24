@@ -1,5 +1,6 @@
-// hub 工作空间快照存档（M2c spec 2026-10-24 §3.1/§4 + T5）——
-// POST /workspaces/snapshots（数据面）+ workspace.snapshots RPC（列表，无组校验）。
+// hub 工作空间快照存档（M2c spec 2026-10-24 §3.1/§4 + T5 + RM2-6）——
+// POST /workspaces/snapshots（数据面）+ GET /workspaces/snapshots/:snapshotId/download
+// （RM2-6，T8 目标节点应用器取包数据面）+ workspace.snapshots RPC（列表，无组校验）。
 // 信任根与 M1 发布同源：multipart manifest+payload 两 part、服务端流式自算 checksum（C6）、
 // 同 workspaceName+version 不可变 → 409 双层（C4：预查 + 唯一键兜底）、超限 413 零残留。
 // 任何已注册节点可存档自己的快照——组校验只约束镜像动作（T6 mirror 才 leader-only）。
@@ -7,8 +8,9 @@ import type { FastifyInstance, FastifyReply } from 'fastify';
 import type Database from 'better-sqlite3';
 import type { Multipart } from '@fastify/multipart';
 import { randomUUID } from 'node:crypto';
+import { createReadStream, statSync } from 'node:fs';
 import { validateSnapshotManifest, type SnapshotManifest } from 'momo-hub-protocol';
-import { BlobTooLargeError, saveBlobStream } from './blobs';
+import { BlobTooLargeError, openBlob, saveBlobStream } from './blobs';
 import { verifyDeviceToken } from './auth';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
 import {
@@ -20,6 +22,9 @@ export const SNAPSHOT_MAX_BYTES = PUBLISH_MAX_BYTES;
 
 /** 快照 blob 子目录（spec §4：{dataDir}/ws-snapshots/{sha256}.tar.gz——与 M1 blobs 目录隔离）。 */
 const SNAPSHOT_SUBDIR = 'ws-snapshots';
+
+/** snapshotId 形态（上传侧 randomUUID 产出的标准 UUID）——下载参数早拒用。 */
+const SNAPSHOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface SnapshotRouteOpts {
   db: Database.Database;
@@ -136,6 +141,52 @@ export function registerSnapshotRoutes(app: FastifyInstance, opts: SnapshotRoute
     const res = reply.code(201).send({ snapshotId, checksum });
     void drainParts(); // 尾随 part 排干（201 后仍有 part 时防连接悬挂）
     return res;
+  });
+
+  // 快照下载（RM2-6，spec §3.1）：Bearer 鉴权 → 参数早拒 → meta 行 → blob 流 + 校验和头。
+  // 与 M1 资源下载端点同构（/resources/:slug/:version/download）——目标节点应用器
+  // （T8 mirror.apply）经此数据面取 tar.gz，checksum 三方对账：响应头 == meta 落库值
+  // == 客户端流式复算值。任何已注册节点可下载（与上传/列表同口径，无组校验）。
+  app.get('/workspaces/snapshots/:snapshotId/download', async (req, reply) => {
+    const { db, dataDir } = opts;
+
+    // ① 鉴权：device token Bearer（与上传、/ws 升级同源校验）
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const node = token ? verifyDeviceToken(db, token) : null;
+    if (!node) return reply.code(401).send({ error: 'unauthorized' });
+
+    // ② 参数早拒：snapshotId 必须是 UUID 形态（上传侧全部来自 randomUUID）——
+    //    不合法与未知同款 404，不向外区分「参数非法」与「不存在」（M1 同款纪律）。
+    const params = req.params as { snapshotId?: string };
+    const snapshotId = typeof params.snapshotId === 'string' ? params.snapshotId : '';
+    if (!SNAPSHOT_ID_PATTERN.test(snapshotId)) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const row = db.prepare('SELECT checksum, size_bytes FROM workspace_snapshots_meta WHERE snapshot_id = ?')
+      .get(snapshotId) as { checksum: string; size_bytes: number } | undefined;
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+
+    // ③ blob 文件名即 sha256（内容寻址，ws-snapshots 子目录）：checksum 非法或文件缺失 → 404
+    let blobPath: string;
+    try {
+      blobPath = openBlob(dataDir, row.checksum, SNAPSHOT_SUBDIR);
+    } catch {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    let sizeBytes: number;
+    try {
+      sizeBytes = statSync(blobPath).size;
+    } catch {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    // ④ 流式回包：X-Checksum-Sha256 = meta 落库值（== 上传时服务端自算值，C6 延续）
+    reply.header('X-Checksum-Sha256', row.checksum);
+    reply.header('Content-Type', 'application/gzip');
+    reply.header('Content-Length', String(sizeBytes));
+    return reply.send(createReadStream(blobPath));
   });
 }
 

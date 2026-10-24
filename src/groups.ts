@@ -88,7 +88,12 @@ export interface MirrorRequest {
   confirm?: boolean;
 }
 
-/** workspace.mirror 结果（应用在目标节点执行，hub 中转回执汇总）。 */
+/** workspace.mirror 结果（应用在目标节点执行，hub 中转回执汇总）。
+ *
+ * @deprecated 两段式落地（T6 + spec §3.1 收口）后该同步形态不再产出：第一段响应改用
+ *  {@link MirrorAcceptRes}（`{accepted:true, mirrorId}`），终态载荷改用
+ *  {@link MirrorResultPayload}（mirror.result res + workspace.mirrored 事件）。
+ *  保留仅为协议兼容占位，勿在新代码消费。 */
 export interface MirrorResult { ok: boolean; appliedResources: string[] }
 
 /** conflict 附带差异摘要（目标节点实况 vs 快照：新增/移除/变更计数）。 */

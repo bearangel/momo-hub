@@ -1,8 +1,10 @@
-// hub 工作空间快照存档契约锁（M2c spec §3.1/§4 + T5）——
+// hub 工作空间快照存档契约锁（M2c spec §3.1/§4 + T5 + RM2-6）——
 // 真实 listen + fetch FormData 上传（wire 语义全真）+ 真 socket ws RPC：
 // 201 落库落盘（ws-snapshots/{sha256}.tar.gz，服务端自算 checksum）/ manifest 校验矩阵 /
 // 同 workspaceName+version 重复 409（C4 同款双层）/ 超限 413 零残留 / 401 /
-// workspace.snapshots 列表（无组校验——任何注册节点可调）/ 裸 TCP 慢速早答排干纪律（照 M1）。
+// workspace.snapshots 列表（无组校验——任何注册节点可调）/ 下载端点
+// （RM2-6：流 checksum 三方对账 == 头 == meta 落库值 / 404 未知与坏 id / 401）/
+// 裸 TCP 慢速早答排干纪律（照 M1）。
 import { createHash } from 'node:crypto';
 import { existsSync, mkdtempSync, readFileSync, readdirSync } from 'node:fs';
 import net from 'node:net';
@@ -454,6 +456,72 @@ describe('workspace.snapshots RPC', () => {
     expect(badFilter.kind === 'res' && badFilter.ok).toBe(true);
     expect(((badFilter.payload ?? {}) as { snapshots: unknown[] }).snapshots.length).toBeGreaterThan(0);
     client.ws.close();
+  });
+});
+
+// ── GET /workspaces/snapshots/:snapshotId/download（RM2-6）────────────────────
+
+describe('GET /workspaces/snapshots/:snapshotId/download', () => {
+  function downloadUrl(snapshotId: string): string {
+    return `${baseUrl}/workspaces/snapshots/${encodeURIComponent(snapshotId)}/download`;
+  }
+
+  it('正常下载 200：流式 body 复算 checksum == X-Checksum-Sha256 头 == meta 落库值；体逐字节等于上传 payload', async () => {
+    const payload = Buffer.from('download me tar.gz payload for rm2-6');
+    const up = await upload(form(manifestOf({ workspaceName: 'dl-ws', version: '1' }), payload));
+    expect(up.status).toBe(201);
+    const { snapshotId } = await up.json() as { snapshotId: string; checksum: string };
+
+    const res = await fetch(downloadUrl(snapshotId), { headers: { authorization: `Bearer ${deviceToken}` } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('application/gzip');
+    expect(res.headers.get('content-length')).toBe(String(payload.length));
+
+    // 三方对账：流式复算 == 响应头 == meta 落库值（C6 延续——下载方不信任何单端）
+    const body = Buffer.from(await res.arrayBuffer());
+    const recomputed = createHash('sha256').update(body).digest('hex');
+    const headerChecksum = res.headers.get('x-checksum-sha256');
+    expect(headerChecksum).toBe(recomputed);
+    const metaRow = db.prepare('SELECT checksum FROM workspace_snapshots_meta WHERE snapshot_id = ?')
+      .get(snapshotId) as { checksum: string };
+    expect(metaRow.checksum).toBe(headerChecksum);
+
+    // 体完整：逐字节等于上传时的 payload（流式回包无截断）
+    expect(body.equals(payload)).toBe(true);
+  });
+
+  it('未知 snapshotId（合法 UUID 形态但不存在）→ 404 not_found', async () => {
+    const res = await fetch(downloadUrl('01234567-89ab-4cde-8f01-234567890abc'), {
+      headers: { authorization: `Bearer ${deviceToken}` },
+    });
+    expect(res.status).toBe(404);
+    expect(await res.json()).toEqual({ error: 'not_found' });
+  });
+
+  it('坏 snapshotId（非 UUID 形态，含路径穿越尝试）→ 404 早拒，与未知同款错误体不区分', async () => {
+    const headers = { authorization: `Bearer ${deviceToken}` };
+    for (const badId of ['not-a-uuid', 'x', 'snap.tar.gz']) {
+      const res = await fetch(downloadUrl(badId), { headers });
+      expect(res.status, `坏 id 用例：${badId}`).toBe(404);
+      expect(await res.json(), `坏 id 用例：${badId}`).toEqual({ error: 'not_found' });
+    }
+    // 路径穿越尝试：编码点段不被 URL 规范化，以参数形态抵达路由——形态早拒拦截
+    const traversal = await fetch(`${baseUrl}/workspaces/snapshots/%2e%2e%2f%2e%2e%2fblobs%2fx/download`, { headers });
+    expect(traversal.status).toBe(404);
+    expect(await traversal.json()).toEqual({ error: 'not_found' });
+  });
+
+  it('未鉴权 401：无 Authorization / 错 token → unauthorized', async () => {
+    const up = await upload(form(manifestOf({ workspaceName: 'dl-auth-ws', version: '1' }), Buffer.from('auth dl')));
+    expect(up.status).toBe(201);
+    const { snapshotId } = await up.json() as { snapshotId: string };
+
+    const noAuth = await fetch(downloadUrl(snapshotId));
+    expect(noAuth.status).toBe(401);
+    expect(await noAuth.json()).toEqual({ error: 'unauthorized' });
+    const badAuth = await fetch(downloadUrl(snapshotId), { headers: { authorization: 'Bearer wrong-token' } });
+    expect(badAuth.status).toBe(401);
+    expect(await badAuth.json()).toEqual({ error: 'unauthorized' });
   });
 });
 

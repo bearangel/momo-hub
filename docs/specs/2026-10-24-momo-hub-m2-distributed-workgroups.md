@@ -46,7 +46,8 @@ hub 新增**定向投递能力**：`registry.sendTo(nodeId, envelope)`（现仅 
 | 方法 | 请求 | 响应 |
 |---|---|---|
 | `workspace.snapshot.build`（leader 本地构建后上传） | multipart HTTP `POST /workspaces/snapshots`（数据面，同 M1 发布形态）：manifest part + payload part（tar.gz ≤200MB） | `{snapshotId, checksum}`（服务端自算，C6 同款纪律） |
-| `workspace.mirror` | `{groupId, targetNodeId, workspaceName, snapshotId, strategy:'replace'}` | `{ok, appliedResources: [...]}`（目标节点应用后经 hub 回执汇总）——**应用在目标节点执行**，hub 中转回执 |
+| （数据面，RM2-6）快照下载 | HTTP `GET /workspaces/snapshots/{snapshotId}/download`（Bearer）——目标节点应用器（`mirror.apply`）取包 | 流式 tar.gz + `X-Checksum-Sha256` 头（= meta 落库值 = 上传时服务端自算值）；未知/坏 snapshotId → 404（不区分），未鉴权 → 401 |
+| `workspace.mirror` | `{groupId, targetNodeId, workspaceName, snapshotId, strategy:'replace', confirm?}` | **两段式**：第一段受理即返 `{accepted:true, mirrorId}`；终态异步送达——`mirror.result` res（定向→leader，成功 `{appliedResources}` / 失败 `{code, message, diffSummary?}`）+ `workspace.mirrored` 事件（组内广播，见 §3.2）——**应用在目标节点执行**，hub 中转回执 |
 | `workspace.snapshots` | `{workspaceName?}` | `{snapshots: [{snapshotId, workspaceName, version, byNode, at}]}`（hub 存档目录，可回放旧版=`workspace.mirror` 引旧 snapshotId） |
 
 **委派（leader→hub→目标节点）**

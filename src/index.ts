@@ -2,5 +2,6 @@
 export * from './envelope';
 export * from './methods';
 export * from './events';
+export * from './resources';
 export * from './version';
 export * from './error';

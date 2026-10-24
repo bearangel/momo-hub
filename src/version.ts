@@ -1,5 +1,5 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
-export const PROTOCOL_VERSION = '1.0.0';
+export const PROTOCOL_VERSION = '1.1.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

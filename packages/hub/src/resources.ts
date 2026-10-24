@@ -70,9 +70,30 @@ export function normalizePublishManifest(raw: unknown): PublishManifestResult {
   return { ok: true, manifest };
 }
 
-/** 读 manifest part（有界内存）：字段 part 取值，文件 part 逐块读，超限返回 null。 */
+/** 把一个 part 文件流消费干净（内容丢弃，不落盘）。
+ *  必须用异步迭代器【读】，不能只挂 'data' 监听或 resume()：
+ *  busboy 的文件流靠 push 背压——缓冲区涨到 highWaterMark 会置 `_pause` 并扣住
+ *  multipart 的 write 回调；只有真正 read() 才会触发 busboy 的 `_read` → 释放回调 →
+ *  底层请求体继续读完。少了这一步：请求体读不完 → socket 悬挂（连接不可复用、
+ *  server.close() 挂起）。 */
+async function discardPartFile(file: Readable): Promise<void> {
+  try {
+    const it = file[Symbol.asyncIterator]();
+    for (;;) {
+      const next = await it.next();
+      if (next.done) break; // 内容丢弃：只读到流尾
+    }
+  } catch {
+    // 流已销毁/出错：字节无处可去，忽略（响应已发出）
+  }
+}
+
+/** 读 manifest part（有界内存）：字段 part 取值，文件 part 逐块读，超限返回 null。
+ *  超限后仍把流尾消费干净——中途弃流会销毁 part 流 → busboy 停读（背压）→ 请求体收不完
+ *  → 连接悬挂（连接不可复用、服务关闭挂起）。 */
 async function readManifestPart(part: Multipart): Promise<string | null> {
   if (part.type === 'field') {
+    if (part.valueTruncated) return null; // 字段被 multipart limits 截断 → 不可信
     // 字段 part 若声明 Content-Type: application/json，插件已把它解析成对象——回写成 JSON 文本再走统一解析。
     const raw: unknown = part.value;
     const value = typeof raw === 'string'
@@ -82,28 +103,30 @@ async function readManifestPart(part: Multipart): Promise<string | null> {
   }
   const chunks: Buffer[] = [];
   let size = 0;
+  let overLimit = false;
   for await (const chunk of part.file) {
-    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as Uint8Array);
     size += buf.length;
-    if (size > MANIFEST_MAX_BYTES) return null;
+    if (overLimit) continue; // 已超限：继续消费流尾（弃流会悬挂连接），内容丢弃
+    if (size > MANIFEST_MAX_BYTES) { overLimit = true; chunks.length = 0; continue; }
     chunks.push(buf);
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return overLimit ? null : Buffer.concat(chunks).toString('utf8');
 }
 
-/** package part 的字节流。
+/** package part 的字节流；字段 part 形态非法（非字符串/被截断）时返回 null → 400 invalid_manifest。
  *  文件 part 走一层 PassThrough 包装：saveBlobStream 超限时管道会销毁源流——
  *  直接把 part.file 交出去，它会被销毁 → busboy 停读（背压）→ 请求体收不完 →
  *  socket 悬挂（连接不可复用、服务关闭挂起）。包装层在管道关闭时把底层 part 流继续
  *  drain 掉，保证请求能收尾、超限内容不落盘。 */
-function packageStream(part: Multipart): NodeJS.ReadableStream {
+function packageStream(part: Multipart): NodeJS.ReadableStream | null {
   if (part.type !== 'file') {
-    const value = typeof part.value === 'string' ? part.value : String(part.value ?? '');
-    return Readable.from([Buffer.from(value, 'utf8')]);
+    if (part.valueTruncated || typeof part.value !== 'string') return null;
+    return Readable.from([Buffer.from(part.value, 'utf8')]);
   }
   const file = part.file;
   const wrapper = new PassThrough();
-  const drain = (): void => { file.resume(); };
+  const drain = (): void => { void discardPartFile(file); };
   wrapper.on('error', drain);
   wrapper.on('close', drain);
   file.on('error', () => { wrapper.destroy(); });
@@ -123,8 +146,9 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
   // multipart 插件挂在本作用域（fastify-plugin 不再封装 → 内容类型解析器与 req.parts 装饰对子作用域生效）。
   // fileSize 显式 Infinity：真实上限以实际落盘字节为准（saveBlobStream 手动流控，C5）——
   // 插件默认取 fastify bodyLimit（1MB），会把大包静默截断。
+  // fieldSize = manifest 上限：字段形态的 manifest 超限即被截断（valueTruncated）→ 400 invalid_manifest。
   void app.register(multipart, {
-    limits: { fileSize: Infinity, files: 8, fields: 8, parts: 16 },
+    limits: { fileSize: Infinity, fieldSize: MANIFEST_MAX_BYTES, files: 8, fields: 8, parts: 16 },
   });
 
   app.post('/resources/publish', async (req, reply) => {
@@ -142,6 +166,15 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
 
     const iterator = req.parts();
 
+    // ③ 收 part：manifest 必须先于 package（契约：manifest 在前）——
+    //    manifest 不合法 → 400；package 缺失 → 400；multipart 解析炸 → 400。
+    let manifest: HubPublishManifest | null = null;
+    let manifestError: PublishErrorCode | null = null;
+    // 已从迭代器取出、但可能尚未被消费的 package part（早答路径需要把它排干）。
+    let packagePart: Multipart | null = null;
+    // package 流已交给 saveBlobStream（包装层负责排干——不能两个消费方同时读一个流）。
+    let packageHandedOff = false;
+
     // 早答的统一出口：回错误体后把剩余 part 消费干净。
     // multipart 解析一开始，原始流就被 busboy 接管（pipe）——node 不再自动 drain；
     // 未被消费的 part 流会让 busboy 背压停读 → 请求体收不完 → socket 悬挂
@@ -151,23 +184,25 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
         for (;;) {
           const next = await iterator.next();
           if (next.done) break;
-          if (next.value.type === 'file') next.value.file.resume();
+          if (next.value.type === 'file') void discardPartFile(next.value.file);
         }
       } catch {
         // 形态损坏：剩余字节无处可去，忽略（响应已发出）
       }
     };
     const fail = (status: number, code: PublishErrorCode): FastifyReply => {
+      // 已经取出但未消费的 package part（文件形态）必须在这里排干：
+      // busboy 停在当前 part 上 → 请求体读不完 → 连接悬挂（close 挂起、连接不可复用）。
+      // 迭代器只能拿到【下一个】part，拿不到手上这个——只能直接把它的流读干净。
+      // 已交给 saveBlobStream 的不算（包装层在管道关闭时排干——一个流只能有一个消费方）。
+      if (!packageHandedOff && packagePart !== null && packagePart.type === 'file') {
+        void discardPartFile(packagePart.file);
+      }
       const res = reply.code(status).send({ error: code });
       void drainParts();
       return res;
     };
 
-    // ③ 收 part：manifest 必须先于 package（契约：manifest 在前）——
-    //    manifest 不合法 → 400；package 缺失 → 400；multipart 解析炸 → 400。
-    let manifest: HubPublishManifest | null = null;
-    let manifestError: PublishErrorCode | null = null;
-    let packagePart: Multipart | null = null;
     try {
       for (;;) {
         const next = await iterator.next();
@@ -193,7 +228,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
           packagePart = part;
           break; // 交给 saveBlobStream 流式收包
         }
-        if (part.type === 'file') part.file.resume(); // 未知 part：丢弃
+        if (part.type === 'file') void discardPartFile(part.file); // 未知 part：丢弃
       }
     } catch {
       return fail(400, 'invalid_manifest'); // multipart 形态损坏
@@ -202,6 +237,11 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     if (manifestError !== null) return fail(400, manifestError);
     if (manifest === null) return fail(400, 'invalid_manifest');
     if (packagePart === null) return fail(400, 'invalid_manifest');
+    // package 是字段 part 且值非字符串（插件预解析成对象）→ 形态非法 → 400
+    // （杜绝 "[object Object]" 当 blob 落盘）。
+    if (packagePart.type !== 'file' && (packagePart.valueTruncated || typeof packagePart.value !== 'string')) {
+      return fail(400, 'invalid_manifest');
+    }
 
     // ④ 版本不可变预查（C4 快路径）：已有同 slug+version → 409
     const dup = db.prepare('SELECT 1 FROM resource_versions WHERE slug = ? AND version = ?')
@@ -209,10 +249,14 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     if (dup !== undefined) return fail(409, 'version_exists');
 
     // ⑤ 流式收包：服务端自算 sha256（C6）；超限中断并清临时件（C5）
+    //    包装层此刻才建：早答路径（409/400）拿到的是未包装的裸 part 流，由 fail() 排干。
+    const packageSource = packageStream(packagePart);
+    if (packageSource === null) return fail(400, 'invalid_manifest'); // 防御：形态已在上方校验
+    packageHandedOff = true; // 包装层在管道关闭时负责排干底层 part 流
     let checksum: string;
     let sizeBytes: number;
     try {
-      const saved = await saveBlobStream(packageStream(packagePart), maxBytes, dataDir);
+      const saved = await saveBlobStream(packageSource, maxBytes, dataDir);
       checksum = saved.checksum;
       sizeBytes = saved.sizeBytes;
     } catch (err) {
@@ -244,7 +288,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
         slug: manifest.slug,
         type: manifest.type,
         name: manifest.name,
-        author: manifest.author,
+        author: node.name, // 信任根在 hub（R-M1-8）：author = 鉴权节点名，manifest.author 丢弃
         description: manifest.description,
         readme: manifest.readme,
         tags_json: JSON.stringify(manifest.tags),
@@ -257,16 +301,24 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     try {
       tx();
     } catch (err) {
-      if (isUniqueViolation(err)) return reply.code(409).send({ error: 'version_exists' });
+      // 唯一键兜底 409：事务已回滚，但尾随 part 仍需排干（否则连接悬挂）
+      if (isUniqueViolation(err)) {
+        reply.code(409).send({ error: 'version_exists' });
+        void drainParts();
+        return reply;
+      }
       throw err;
     }
 
     // ⑦ 201：回执含服务端自算的校验和与字节数
-    return reply.code(201).send({
+    const res = reply.code(201).send({
       slug: manifest.slug,
       version: manifest.version,
       checksum,
       sizeBytes,
     });
+    // 尾随 part 排干：package 之后若还有 part，未消费会让 busboy 背压停读 → 连接悬挂
+    void drainParts();
+    return res;
   });
 }

@@ -5,9 +5,7 @@
   "license": "AGPL-3.0-only",
   "type": "commonjs",
   "main": "dist/index.js",
-  "bin": {
-    "momo-hub": "dist/index.js"
-  },
+  "bin": { "momo-hub": "dist/index.js" },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",

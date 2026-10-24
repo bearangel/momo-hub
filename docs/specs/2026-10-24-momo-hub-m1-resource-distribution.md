@@ -30,11 +30,11 @@
 | 端点 | 方法 | 请求 | 响应 | 错误 |
 |---|---|---|---|---|
 | `/resources/catalog` | GET | — | `HubCatalog`（JSON，见 3.2） | 500 |
-| `/resources/publish` | POST | multipart：`manifest`（JSON part）+ `package`（tar.gz part，≤200MB 流式） | 201 `{slug, version, checksum, sizeBytes}` | 400 `{error:'invalid_manifest'\|'invalid_slug'\|'invalid_version'\|'version_exists'}`；401；413 超限 |
+| `/resources/publish` | POST | multipart：`manifest`（JSON part）+ `package`（tar.gz part，≤200MB 流式） | 201 `{slug, version, checksum, sizeBytes}` | 400 `{error:'invalid_manifest'\|'invalid_slug'\|'invalid_version'}`；401；409 `{error:'version_exists'}`；413 超限 |
 | `/resources/{slug}/{version}/download` | GET | — | tar.gz 流 + `X-Checksum-Sha256` 头 + `X-Published-By` 头 | 404；401 |
 
 - 鉴权：`Authorization: Bearer <deviceToken>`（与 /ws 升级同源校验）
-- 流式：publish 端点边收边算 sha256 边落临时文件，全部收完且 ≤200MB 才转正入库（C6）；超限中断连接删临时件
+- 流式：publish 端点边收边算 sha256 边落临时文件，全部收完且 ≤200MB 才转正入库（C6）；超限回 413 + 排干剩余上传 + 删临时件
 
 ### 3.2 `HubCatalog` 与 `HubResourceMeta`（新类型，protocol 包）
 

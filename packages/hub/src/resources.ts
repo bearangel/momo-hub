@@ -3,15 +3,19 @@
 // 信任根在 hub：校验和服务端流式自算（客户端只传内容，C6）；版本不可变：同 slug+version → 409（C4）。
 // 409 双层（R-M1-4）：预查给明确错误体（快路径），并发窗口撞唯一键由事务回滚兜底——错误体同款。
 import multipart, { type Multipart } from '@fastify/multipart';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type Database from 'better-sqlite3';
+import { createReadStream, statSync } from 'node:fs';
 import { PassThrough, Readable } from 'node:stream';
 import {
-  isValidHubSlug, isValidHubVersion, validateHubManifest, type HubPublishManifest,
+  EVT, PROTOCOL_VERSION, isValidHubSlug, isValidHubVersion, validateHubManifest,
+  type HubCatalog, type HubPublishManifest, type HubResourceMeta, type HubResourceType,
+  type ResourcePublishedEvent,
 } from 'momo-hub-protocol';
-import { BlobTooLargeError, saveBlobStream } from './blobs';
+import { BlobTooLargeError, openBlob, saveBlobStream } from './blobs';
 import { verifyDeviceToken } from './auth';
 import type { NodeRegistry } from './registry';
+import { logger } from './logger';
 
 /** 发布体上限（spec C5：200MB/包，与 marketplace MAX_DOWNLOAD_BYTES 一致）。 */
 export const PUBLISH_MAX_BYTES = 200 * 1024 * 1024;
@@ -141,6 +145,114 @@ function isUniqueViolation(err: unknown): boolean {
   return code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE';
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 资源目录与下载（spec 2026-10-24 M1 §3.1/§3.2 + T6 对齐口径）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 目录项来源行：resources JOIN「最新发布」版本行（LEFT JOIN——缺版本行则该项不成项）。 */
+interface CatalogItemRow {
+  slug: string;
+  type: HubResourceType;
+  name: string;
+  author: string;
+  description: string;
+  readme: string;
+  tags_json: string;
+  category: string;
+  icon_emoji: string;
+  latest_version: string;
+  checksum: string | null;
+  size_bytes: number | null;
+  published_by: string | null;
+  published_at: number | null;
+}
+
+/** 头值取首个元素（X-Forwarded-* 形如 "a, b"——取最靠近客户端的一跳）。 */
+function firstHeaderToken(value: string | string[] | undefined): string | undefined {
+  const raw = Array.isArray(value) ? value[0] : value;
+  if (typeof raw !== 'string') return undefined;
+  const token = raw.split(',')[0]?.trim();
+  return token === undefined || token === '' ? undefined : token;
+}
+
+/** 请求 origin（下载 URL 组装用）：反代头优先，缺省回落 req.protocol / Host 头。
+ *
+ *  反代场景：TLS 在 Caddy 终止时，hub 自身看到的是 http + 内网 Host——若不采信
+ *  X-Forwarded-Proto/Host，拼出的 downloadUrl 会是 http:// 公网名，与 studio 侧
+ *  登记的 https origin 不匹配（安装链的 origin 白名单会拒）。
+ *  信任边界：hub 是私有仓，节点须持有 enrollment token 才能入网（M1 裁定
+ *  「any-node-trusted」）；能入网的节点本就能自发布任意内容，伪造 downloadUrl
+ *  不额外扩大攻击面。 */
+function requestOrigin(req: FastifyRequest): string {
+  const proto = firstHeaderToken(req.headers['x-forwarded-proto']) ?? req.protocol;
+  const host = firstHeaderToken(req.headers['x-forwarded-host']) ?? req.headers.host ?? 'localhost';
+  return `${proto}://${host}`;
+}
+
+/** 解析 tags_json（落库是 JSON 文本；解析失败按空数组兜底，不让一条脏数据毁掉整份目录）。 */
+function parseTags(tagsJson: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(tagsJson);
+    if (Array.isArray(parsed) && parsed.every((t) => typeof t === 'string')) return parsed as string[];
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/** 组装 hub 目录（spec §3.2 HubCatalog）。
+ *  - items：resources JOIN「最近发布」的版本行（latest_version 存的就是最近一次发布的版本）
+ *  - versions：该 slug 的全部版本号，新→旧（published_at 倒序，同毫秒以 rowid 兜底）
+ *  - downloadUrl：按请求 origin 拼绝对地址（反代场景天然正确）
+ *  - author 直映射 resources.author（= 鉴权节点名，R-M1-8）；verificationStatus 恒 'unverified'（表无该列） */
+export function buildHubCatalog(db: Database.Database, origin: string): HubCatalog {
+  const itemRows = db.prepare(`
+    SELECT r.slug, r.type, r.name, r.author, r.description, r.readme, r.tags_json, r.category,
+           r.icon_emoji, r.latest_version,
+           v.checksum, v.size_bytes, v.published_by, v.published_at
+    FROM resources r
+    LEFT JOIN resource_versions v ON v.slug = r.slug AND v.version = r.latest_version
+  `).all() as CatalogItemRow[];
+
+  // versions：全量版本号新→旧（一次查询全取，按 slug 分组——避免逐项 N+1）
+  const versionRows = db.prepare(
+    'SELECT slug, version FROM resource_versions ORDER BY published_at DESC, rowid DESC',
+  ).all() as Array<{ slug: string; version: string }>;
+  const versionsBySlug = new Map<string, string[]>();
+  for (const row of versionRows) {
+    const list = versionsBySlug.get(row.slug);
+    if (list) list.push(row.version);
+    else versionsBySlug.set(row.slug, [row.version]);
+  }
+
+  const items: HubResourceMeta[] = [];
+  for (const row of itemRows) {
+    // 最新版本行缺失（数据不一致）→ 该项不成项（无 checksum/sizeBytes 不可用）
+    if (row.checksum === null || row.size_bytes === null || row.published_at === null) continue;
+    items.push({
+      slug: row.slug,
+      type: row.type,
+      name: row.name,
+      version: row.latest_version,
+      author: row.author,
+      description: row.description,
+      readme: row.readme,
+      tags: parseTags(row.tags_json),
+      category: row.category,
+      iconEmoji: row.icon_emoji,
+      verificationStatus: 'unverified',
+      downloadUrl: `${origin}/resources/${row.slug}/${row.latest_version}/download`,
+      checksum: row.checksum,
+      sizeBytes: row.size_bytes,
+      publishedAt: row.published_at,
+      versions: versionsBySlug.get(row.slug) ?? [row.latest_version],
+    });
+  }
+  // 目录按发布时间倒序（新的在前）——同毫秒以 slug 兜底，保证顺序确定
+  items.sort((a, b) => (b.publishedAt - a.publishedAt) || a.slug.localeCompare(b.slug));
+  return { version: PROTOCOL_VERSION, updatedAt: new Date().toISOString(), items };
+}
+
 export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRouteOpts): void {
   const maxBytes = opts.maxBytes ?? PUBLISH_MAX_BYTES;
   // multipart 插件挂在本作用域（fastify-plugin 不再封装 → 内容类型解析器与 req.parts 装饰对子作用域生效）。
@@ -149,6 +261,58 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
   // fieldSize = manifest 上限：字段形态的 manifest 超限即被截断（valueTruncated）→ 400 invalid_manifest。
   void app.register(multipart, {
     limits: { fileSize: Infinity, fieldSize: MANIFEST_MAX_BYTES, files: 8, fields: 8, parts: 16 },
+  });
+
+  // 资源目录（spec §3.1）：Bearer 鉴权 → 目录快照（downloadUrl 按请求 origin 拼装）
+  app.get('/resources/catalog', async (req, reply) => {
+    const { db } = opts;
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const node = token ? verifyDeviceToken(db, token) : null;
+    if (!node) return reply.code(401).send({ error: 'unauthorized' });
+    return reply.send(buildHubCatalog(db, requestOrigin(req)));
+  });
+
+  // 资源下载（spec §3.1）：Bearer 鉴权 → 参数早拒 → 版本行 → blob 流 + 校验和/发布者头
+  app.get('/resources/:slug/:version/download', async (req, reply) => {
+    const { db, dataDir } = opts;
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const node = token ? verifyDeviceToken(db, token) : null;
+    if (!node) return reply.code(401).send({ error: 'unauthorized' });
+
+    // 参数早拒：slug/version 必须过 S1 白名单（防路径与日志注入）——不合法与未知同款 404，
+    // 不向外区分「参数非法」与「不存在」。
+    const params = req.params as { slug?: string; version?: string };
+    const slug = typeof params.slug === 'string' ? params.slug : '';
+    const version = typeof params.version === 'string' ? params.version : '';
+    if (!isValidHubSlug(slug) || !isValidHubVersion(version)) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    const row = db.prepare('SELECT checksum, published_by FROM resource_versions WHERE slug = ? AND version = ?')
+      .get(slug, version) as { checksum: string; published_by: string } | undefined;
+    if (!row) return reply.code(404).send({ error: 'not_found' });
+
+    // blob 文件名即 sha256（内容寻址）：checksum 非法或文件缺失 → 404
+    let blobPath: string;
+    try {
+      blobPath = openBlob(dataDir, row.checksum);
+    } catch {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    let sizeBytes: number;
+    try {
+      sizeBytes = statSync(blobPath).size;
+    } catch {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+
+    reply.header('X-Checksum-Sha256', row.checksum);
+    reply.header('X-Published-By', row.published_by);
+    reply.header('Content-Type', 'application/gzip');
+    reply.header('Content-Length', String(sizeBytes));
+    return reply.send(createReadStream(blobPath));
   });
 
   app.post('/resources/publish', async (req, reply) => {
@@ -317,7 +481,23 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       throw err;
     }
 
-    // ⑦ 201：回执含服务端自算的校验和与字节数
+    // ⑦ 发布事件广播（spec §3.3/§5）：入库成功后广播全部在线节点 →
+    //    studio 侧 HubManager 收到 resource.published → 资源库更新角标。
+    //    广播失败不得推翻已提交的发布（DB 已落库）——只记日志。
+    try {
+      opts.registry.broadcast(EVT.resourcePublished, {
+        slug: manifest.slug,
+        type: manifest.type,
+        name: manifest.name,
+        version: manifest.version,
+        author: node.name,
+        at: publishedAt,
+      } satisfies ResourcePublishedEvent);
+    } catch (err) {
+      logger.warn('发布事件广播失败（发布已入库）', { slug: manifest.slug, err });
+    }
+
+    // ⑧ 201：回执含服务端自算的校验和与字节数
     const res = reply.code(201).send({
       slug: manifest.slug,
       version: manifest.version,

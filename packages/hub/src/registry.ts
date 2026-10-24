@@ -26,6 +26,13 @@ export class NodeRegistry {
   broadcast(method: string, payload: unknown): void {
     const evt: EventEnvelope = { v: 1, kind: 'evt', method, payload };
     const raw = encodeEnvelope(evt);
-    for (const c of this.byId.values()) c.ws.send(raw);
+    // 单条连接发送失败不得中断其余连接的广播（死 socket 不拖垮全场）
+    for (const c of this.byId.values()) {
+      try {
+        c.ws.send(raw);
+      } catch {
+        // 连接已断：忽略——它会在 close 时被摘除
+      }
+    }
   }
 }

@@ -16,3 +16,10 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm lint
       - run: pnpm test
+
+  docker:
+    # ubuntu-latest 自带 docker daemon；只验构建不 run——run 需起服务，冒烟留 M1e
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t momo-hub:ci .

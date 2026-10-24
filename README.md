@@ -7,14 +7,14 @@ Momo Studio 的常驻中心服务——资源分发（私有 marketplace，M1）
 - 架构：控制面 WebSocket（RPC + 事件）+ 数据面 HTTP；Node 24 / TypeScript strict / Fastify + SQLite
 - 协议包：仓库根即 momo-hub-protocol（momo-studio 经 git tag 依赖消费）
 
-状态：M0 连接基建开发中。
+状态：M0 已交付（tag v0.1.0）——M1 资源分发开发中。
 
 ## 快速开始
 
 ### 裸 Node 运行（三步）
 
 ```bash
-git clone <repo> && cd momo-hub
+git clone https://github.com/bearangel/momo-hub && cd momo-hub
 npx pnpm@9.0.0 install && npx pnpm@9.0.0 build
 MOMO_HUB_PORT=8787 MOMO_HUB_DATA_DIR=~/.momo-hub node packages/hub/dist/index.js
 ```

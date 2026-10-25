@@ -79,4 +79,6 @@ export interface WorkspaceMirroredEvent {
   workspaceName: string;
   snapshotId: string;
   appliedResources: string[];
+  /** 目标无法解析的引用（软失败——T8b 应用器语义；缺省 = 全部解析）。 */
+  unresolvedRefs?: string[];
 }

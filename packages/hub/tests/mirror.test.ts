@@ -123,7 +123,7 @@ function mirrorReq(groupId: string, targetNodeId: string, workspaceName: string,
  *  confirm 断言可选（undefined=不得携带该键）。 */
 async function targetApplyAndReceipt(
   target: Client,
-  receipt: { ok: true; appliedResources: string[] } | { ok: false; code: string; message: string; diffSummary?: { added: number; removed: number; changed: number } },
+  receipt: { ok: true; appliedResources: string[]; unresolvedRefs?: string[] } | { ok: false; code: string; message: string; diffSummary?: { added: number; removed: number; changed: number } },
   opts: { mirrorId?: string; expectConfirm?: boolean } = {},
 ): Promise<{ applyEnv: RequestEnvelope; mirrorId: string }> {
   const applyEnv = await target.next((e) => e.kind === 'req' && e.method === MIRROR_WIRE.apply
@@ -132,7 +132,7 @@ async function targetApplyAndReceipt(
   const payload = applyEnv.payload as { mirrorId: string; confirm?: boolean };
   if (opts.expectConfirm !== undefined) expect(payload.confirm).toBe(opts.expectConfirm);
   const resBody: Record<string, unknown> = receipt.ok
-    ? { appliedResources: receipt.appliedResources }
+    ? { appliedResources: receipt.appliedResources, ...(receipt.unresolvedRefs ? { unresolvedRefs: receipt.unresolvedRefs } : {}) }
     : { code: receipt.code, message: receipt.message, ...(receipt.diffSummary ? { diffSummary: receipt.diffSummary } : {}) };
   target.ws.send(encodeEnvelope({
     v: 1, kind: 'res', id: applyEnv.id, method: MIRROR_WIRE.receipt, ok: receipt.ok, payload: resBody,
@@ -172,6 +172,32 @@ describe('workspace.mirror 全链', () => {
     await new Promise((r) => setTimeout(r, 250));
     expect(outsider.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.workspaceMirrored)).toHaveLength(0);
     leader.ws.close(); target.ws.close(); outsider.ws.close();
+  });
+
+  it('回执 unresolvedRefs（T8b 软失败清单）→ mirror.result 与 workspace.mirrored 原样透传；异形值按缺省处理', async () => {
+    const snapshotId = await uploadSnapshot('ws-unresolved', '1');
+    const { leader, target, groupId } = await setupGroup('unresolved');
+
+    const mirror = await callRpc(leader, RPC.workspace.mirror, mirrorReq(groupId, target.nodeId, 'ws-unresolved', snapshotId));
+    const mirrorId = (resPayload(mirror) as { mirrorId: string }).mirrorId;
+
+    await targetApplyAndReceipt(target, {
+      ok: true, appliedResources: ['agent/coder'],
+      unresolvedRefs: ['mcp:ghost-server', 'skill:ghost-skill'],
+    });
+    const result = await leader.next((e) => e.kind === 'res' && e.method === MIRROR_WIRE.result && e.id === mirrorId);
+    expect(result.kind === 'res' && result.ok).toBe(true);
+    expect(result.payload).toEqual({
+      mirrorId, appliedResources: ['agent/coder'],
+      unresolvedRefs: ['mcp:ghost-server', 'skill:ghost-skill'],
+    });
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.workspaceMirrored);
+    expect(evt.payload).toEqual({
+      groupId, targetNodeId: target.nodeId, workspaceName: 'ws-unresolved', snapshotId,
+      appliedResources: ['agent/coder'],
+      unresolvedRefs: ['mcp:ghost-server', 'skill:ghost-skill'],
+    });
+    leader.ws.close(); target.ws.close();
   });
 });
 

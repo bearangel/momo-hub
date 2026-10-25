@@ -128,12 +128,13 @@ export interface MirrorApplyPayload {
 /** workspace.mirror 第一段响应（hub 收到即返——异步两段式的受理回执）。 */
 export interface MirrorAcceptRes { accepted: boolean; mirrorId: string }
 
-/** mirror.receipt 成功回执载荷（目标节点已应用完毕）。 */
-export interface MirrorReceiptOk { appliedResources: string[] }
+/** mirror.receipt 成功回执载荷（目标节点已应用完毕）。unresolvedRefs = 目标无法
+ *  解析的引用（软失败——T8b 应用器语义），hub 原样透传 leader/组内广播。 */
+export interface MirrorReceiptOk { appliedResources: string[]; unresolvedRefs?: string[] }
 
 /** mirror.result 第二段载荷：成功 / 失败（conflict 时附差异摘要；code 复用 RpcErrorCode）。 */
 export type MirrorResultPayload =
-  | { mirrorId: string; appliedResources: string[] }
+  | { mirrorId: string; appliedResources: string[]; unresolvedRefs?: string[] }
   | { mirrorId: string; code: string; message: string; diffSummary?: MirrorDiffSummary };
 
 // ────────────────────────────────────────────────────────────────────────────

@@ -127,12 +127,16 @@ export class MirrorRouter {
     this.settle(pending);
 
     if (res.ok) {
-      const raw = res.payload as { appliedResources?: unknown } | null;
+      const raw = res.payload as { appliedResources?: unknown; unresolvedRefs?: unknown } | null;
       const appliedResources = Array.isArray(raw?.appliedResources) && raw.appliedResources.every((s) => typeof s === 'string')
         ? (raw.appliedResources as string[])
         : [];
-      this.broadcastMirrored(pending, appliedResources);
-      this.notifyResult(pending, true, { mirrorId: pending.mirrorId, appliedResources });
+      // unresolvedRefs（T8b 软失败清单）同款校验透传——缺省/异形 = 视为全部解析
+      const unresolvedRefs = Array.isArray(raw?.unresolvedRefs) && raw.unresolvedRefs.every((s) => typeof s === 'string')
+        ? (raw.unresolvedRefs as string[])
+        : undefined;
+      this.broadcastMirrored(pending, appliedResources, unresolvedRefs);
+      this.notifyResult(pending, true, { mirrorId: pending.mirrorId, appliedResources, ...(unresolvedRefs ? { unresolvedRefs } : {}) });
       return;
     }
     const raw = (res.payload ?? {}) as { code?: unknown; message?: unknown; diffSummary?: unknown };
@@ -171,7 +175,7 @@ export class MirrorRouter {
   }
 
   /** workspace.mirrored 组内广播（§3.2——组内皆可见谁被镜像到什么版本）。 */
-  private broadcastMirrored(pending: PendingMirror, appliedResources: string[]): void {
+  private broadcastMirrored(pending: PendingMirror, appliedResources: string[], unresolvedRefs?: string[]): void {
     const evt: EventEnvelope = {
       v: 1, kind: 'evt', method: EVT.workspaceMirrored,
       payload: {
@@ -180,6 +184,7 @@ export class MirrorRouter {
         workspaceName: pending.workspaceName,
         snapshotId: pending.snapshotId,
         appliedResources,
+        ...(unresolvedRefs ? { unresolvedRefs } : {}),
       } satisfies WorkspaceMirroredEvent,
     };
     const members = this.db.prepare('SELECT node_id FROM group_members WHERE group_id = ?')

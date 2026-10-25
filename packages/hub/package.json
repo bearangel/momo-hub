@@ -1,6 +1,6 @@
 {
   "name": "momo-hub",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "momo-hub 中心服务（Fastify + WebSocket + SQLite）",
   "license": "AGPL-3.0-only",
   "type": "commonjs",

@@ -417,6 +417,21 @@ describe('validateSnapshotManifest 好例', () => {
     m.config.agentMembers[1] = { name: 'big', customDefinition: 'a'.repeat(64 * 1024) };
     expect(validateSnapshotManifest(m)).not.toBeNull();
   });
+
+  it('modelBinding 在场 → 归一化保留；未知字段在段内剥除', () => {
+    const m = validManifest();
+    const out = validateSnapshotManifest({
+      ...m,
+      config: { ...m.config, modelBinding: { provider: 'zhipu', model: 'glm-5.3', extra: 1 } },
+    });
+    expect(out?.config.modelBinding).toEqual({ provider: 'zhipu', model: 'glm-5.3' });
+  });
+
+  it('modelBinding 缺省 → 合法且不落段（1.2.0 旧快照向后兼容）', () => {
+    const out = validateSnapshotManifest(validManifest());
+    expect(out).not.toBeNull();
+    expect(out?.config).not.toHaveProperty('modelBinding');
+  });
 });
 
 describe('validateSnapshotManifest 坏矩阵：顶层结构', () => {
@@ -555,6 +570,22 @@ describe('validateSnapshotManifest 坏矩阵：config 配置段', () => {
     expect(bad({ nil: null })).toBeNull();
     expect(bad({ nan: Number.NaN })).toBeNull();
     expect(bad({ num: 1, str: 's', bool: true })).not.toBeNull();
+  });
+
+  it('modelBinding 非对象 / provider 缺失或空 / model 空或非串 / 超长 → null', () => {
+    const base = validManifest();
+    const bad = (patch: Record<string, unknown>): unknown =>
+      validateSnapshotManifest({ ...base, config: { ...base.config, ...patch } });
+    expect(bad({ modelBinding: 'zhipu' })).toBeNull();
+    expect(bad({ modelBinding: {} })).toBeNull();
+    expect(bad({ modelBinding: { provider: '', model: 'm' } })).toBeNull();
+    expect(bad({ modelBinding: { provider: 'p'.repeat(65), model: 'm' } })).toBeNull();
+    expect(bad({ modelBinding: { provider: 'zhipu' } })).toBeNull();
+    expect(bad({ modelBinding: { provider: 'zhipu', model: '' } })).toBeNull();
+    expect(bad({ modelBinding: { provider: 'zhipu', model: 'm'.repeat(201) } })).toBeNull();
+    // 边界：provider 恰 64 / model 恰 200 合法
+    expect(bad({ modelBinding: { provider: 'p'.repeat(64), model: 'm' } })).not.toBeNull();
+    expect(bad({ modelBinding: { provider: 'zhipu', model: 'm'.repeat(200) } })).not.toBeNull();
   });
 });
 

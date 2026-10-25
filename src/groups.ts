@@ -169,6 +169,11 @@ export interface WorkspaceSnapshotConfig {
   pluginsEnabled: SnapshotPluginRef[];
   /** provider 引用：类型 + 型号偏好（红线：不含 key）。 */
   providerRefs: SnapshotProviderRef[];
+  /**
+   * 工作空间默认模型绑定（可选段——D4/T16b）：缺省 = 源节点未设默认模型（1.2.0
+   * 旧快照无此段照常镜像）；在场时目标节点据此落默认模型偏好（不覆盖本机显式选择）。
+   */
+  modelBinding?: SnapshotModelBinding;
   /** 工具上限等偏好（标量值）。 */
   prefs: Record<string, string | number | boolean>;
 }
@@ -186,6 +191,14 @@ export interface SnapshotPluginRef { pluginId: string; slug: string }
 
 export interface SnapshotProviderRef { provider: string; model?: string }
 
+/**
+ * 工作空间默认模型绑定（D4/T16b 可选段，1.2.0 向后兼容）：源节点「设置 → 默认模型」
+ * 的全局默认对话模型（defaultChatModel）。provider 为 platform 形态（与 providerRefs
+ * 同口径，跨节点可解析）；model 非空（空绑定无意义，构建侧缺省不发段）；
+ * 不含 key（红线，key 永在 keychain）。
+ */
+export interface SnapshotModelBinding { provider: string; model: string }
+
 // ────────────────────────────────────────────────────────────────────────────
 // validateSnapshotManifest（S1/C6 同款纪律：字段类型/长度/未知容忍/DoS 下限）
 // ────────────────────────────────────────────────────────────────────────────
@@ -200,6 +213,8 @@ const PLUGINS_MAX = 256;
 const PROVIDERS_MAX = 64;
 const PREFS_MAX = 64;
 const PROVIDER_NAME_MAX = 64;
+/** 模型名上限（modelBinding.model——覆盖 glm-5.3 / gpt-4o / 自定义兼容端点名等形态） */
+const MODEL_NAME_MAX = 200;
 const CUSTOM_DEFINITION_MAX_BYTES = 64 * 1024; // S1 README_MAX_BYTES 同款
 
 const isStr = (x: unknown): x is string => typeof x === 'string';
@@ -298,6 +313,15 @@ function providersFrom(raw: unknown): SnapshotProviderRef[] | null {
   return out;
 }
 
+/** modelBinding 可选段：缺省（undefined）合法——1.2.0 旧快照向后兼容；
+ *  在场则 provider/model 均非空有界串，非法整包 null（与七子段同强度）。 */
+function modelBindingFrom(raw: unknown): SnapshotModelBinding | undefined | null {
+  if (raw === undefined) return undefined;
+  if (!isRecord(raw) || !isBoundedStr(raw.provider, PROVIDER_NAME_MAX)) return null;
+  if (!isBoundedStr(raw.model, MODEL_NAME_MAX)) return null;
+  return { provider: raw.provider, model: raw.model };
+}
+
 function prefsFrom(raw: unknown): Record<string, string | number | boolean> | null {
   if (!isRecord(raw)) return null;
   const entries = Object.entries(raw);
@@ -327,12 +351,16 @@ function configFrom(raw: unknown): WorkspaceSnapshotConfig | null {
   if (providerRefs === null) return null;
   const prefs = prefsFrom(raw.prefs);
   if (prefs === null) return null;
-  return { agentMembers, teams, mcpEnabled, skills, pluginsEnabled, providerRefs, prefs };
+  const modelBinding = modelBindingFrom(raw.modelBinding);
+  if (modelBinding === null) return null;
+  const config: WorkspaceSnapshotConfig = { agentMembers, teams, mcpEnabled, skills, pluginsEnabled, providerRefs, prefs };
+  if (modelBinding !== undefined) config.modelBinding = modelBinding;
+  return config;
 }
 
 /** 快照 manifest 结构校验（对齐 validateHubManifest 强度）：顶层 workspaceName/version
- *  过长度与 S1 白名单、resources 引用清单逐项校验、config 配置段七子段逐项校验；
- *  未知字段容忍（剥除）；任何已知字段缺失/类型不符返回 null。 */
+ *  过长度与 S1 白名单、resources 引用清单逐项校验、config 配置段七子段 + 可选
+ *  modelBinding 段逐项校验；未知字段容忍（剥除）；任何已知字段缺失/类型不符返回 null。 */
 export function validateSnapshotManifest(raw: unknown): SnapshotManifest | null {
   if (!isRecord(raw)) return null;
   if (!isBoundedStr(raw.workspaceName, WORKSPACE_NAME_MAX)) return null;

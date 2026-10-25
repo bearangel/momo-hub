@@ -107,6 +107,11 @@ interface PendingForward {
 
 interface SubEntry { leaderNodeId: string; targetNodeId: string; sessionId: string }
 
+/** 构造选项（转发超时测试注入——server.ts viewForwardTimeoutMs 透传）。 */
+export interface RemoteViewRouterOpts {
+  forwardTimeoutMs?: number;
+}
+
 export class RemoteViewRouter {
   /** consent 内存态 per-nodeId（缺省 true——spec §5.5；断线清除回默认，RM2-9）。 */
   private consents = new Map<string, boolean>();
@@ -114,8 +119,15 @@ export class RemoteViewRouter {
   private pendingById = new Map<string, PendingForward>();
   /** 订阅登记：leader\0target\0session 三元组去重（同键重复 subscribe 幂等）。 */
   private subs = new Map<string, SubEntry>();
+  private readonly forwardTimeoutMs: number;
 
-  constructor(private readonly db: Database.Database, private readonly registry: NodeRegistry) {}
+  constructor(
+    private readonly db: Database.Database,
+    private readonly registry: NodeRegistry,
+    opts: RemoteViewRouterOpts = {},
+  ) {
+    this.forwardTimeoutMs = opts.forwardTimeoutMs ?? FORWARD_TIMEOUT_MS;
+  }
 
   /**
    * view.* 六方法统一入口（leader-only 与「leader 和 target 同组」由外围守卫提取器
@@ -128,9 +140,11 @@ export class RemoteViewRouter {
     const targetNodeId = optBoundedStr(reqStr(payload, 'targetNodeId'), NODE_ID_MAX);
     if (!targetNodeId) return { ok: false, error: err('bad_request', 'targetNodeId 缺失或超长') };
 
-    const sessionId = reqStr(payload, 'sessionId');
+    // 登记侧 sessionId 与 tail 上行同界（SESSION_ID_MAX——T13 评审 Minor③：
+    // 订阅键长度对称约束，防超长键灌入 subs 表）
+    const sessionId = isRecord(payload) ? optBoundedStr(payload.sessionId, SESSION_ID_MAX) : null;
     if ((method === RPC.view.subscribe || method === RPC.view.unsubscribe) && !sessionId) {
-      return { ok: false, error: err('bad_request', 'sessionId 缺失') };
+      return { ok: false, error: err('bad_request', 'sessionId 缺失或超长') };
     }
 
     if (!commonGroupId(this.db, ctx.nodeId, targetNodeId)) {
@@ -139,10 +153,9 @@ export class RemoteViewRouter {
 
     if (method === RPC.view.unsubscribe) {
       // 清理路径（豁免 consent）：本地注销先行；离线/无目标应答仍 ok（幂等语义）
-      const sid = reqStr(payload, 'sessionId');
-      if (sid !== null) {
-        this.subs.delete(subKey(ctx.nodeId, targetNodeId, sid));
-        logger.info('订阅已注销', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId: sid, by: 'unsubscribe' });
+      if (sessionId !== null) {
+        this.subs.delete(subKey(ctx.nodeId, targetNodeId, sessionId));
+        logger.info('订阅已注销', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId, by: 'unsubscribe' });
       }
       if (!this.registry.get(targetNodeId)) return { ok: true, payload: { ok: true } };
       return this.forward(ctx.nodeId, targetNodeId, method, payload);
@@ -154,10 +167,9 @@ export class RemoteViewRouter {
 
     const outcome = await this.forward(ctx.nodeId, targetNodeId, method, payload);
     if (outcome.ok && method === RPC.view.subscribe) {
-      const sid = reqStr(payload, 'sessionId');
-      if (sid !== null) {
-        this.subs.set(subKey(ctx.nodeId, targetNodeId, sid), { leaderNodeId: ctx.nodeId, targetNodeId, sessionId: sid });
-        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId: sid });
+      if (sessionId !== null) {
+        this.subs.set(subKey(ctx.nodeId, targetNodeId, sessionId), { leaderNodeId: ctx.nodeId, targetNodeId, sessionId });
+        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId });
       }
     }
     return outcome;
@@ -189,7 +201,10 @@ export class RemoteViewRouter {
       return { ok: true, payload: { ok: true } };
     }
     const subscribers = [...this.subs.values()]
-      .filter((s) => s.targetNodeId === ctx.nodeId && s.sessionId === tail.sessionId);
+      .filter((s) => s.targetNodeId === ctx.nodeId && s.sessionId === tail.sessionId
+        // 订阅存续期复检同组（T13 评审 Important①）：hub 不主动杀登记，退组后
+        // 靠复检收敛——同组关系已解除的订阅不再扇出
+        && commonGroupId(this.db, s.leaderNodeId, s.targetNodeId) !== undefined);
     if (subscribers.length === 0) {
       logger.info('尾部事件无订阅，丢弃', { from: ctx.nodeId, sessionId: tail.sessionId, count: tail.events.length });
       return { ok: true, payload: { ok: true } };
@@ -237,8 +252,12 @@ export class RemoteViewRouter {
       const timer = setTimeout(() => {
         this.pendingById.delete(id);
         logger.warn('查看转发超时', { method, targetNodeId, leaderNodeId });
-        resolve({ ok: false, error: err('internal', '目标节点响应超时') });
-      }, FORWARD_TIMEOUT_MS);
+        // unsubscribe 超时按幂等清理语义回 ok（本地注销已先行，T13 评审 Important②
+        // 对齐报告约定：目标不应答不得卡死 leader 的退订请求）
+        resolve(method === RPC.view.unsubscribe
+          ? { ok: true, payload: { ok: true } }
+          : { ok: false, error: err('internal', '目标节点响应超时') });
+      }, this.forwardTimeoutMs);
       timer.unref?.();
       this.pendingById.set(id, { id, method, leaderNodeId, targetNodeId, settle: resolve, timer });
       void this.registry.sendTo(targetNodeId, { v: 1, kind: 'req', id, method, payload }).then((sent) => {

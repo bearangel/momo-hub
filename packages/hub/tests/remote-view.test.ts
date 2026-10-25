@@ -604,3 +604,101 @@ describe('view.consent 上行处理', () => {
     if (!ghost.ok) expect(ghost.error.code).toBe('forbidden');
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// T13 评审收口（Important①/② + Minor③）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('T13 评审收口', () => {
+  it('Important① 订阅存续期复检同组：target 退组后 tail 不扇出（同组时正常扇出为对照）', async () => {
+    const { leader, target, groupId } = await setupGroup('recheck');
+    const sub = callRpcEnv(leader, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1' }));
+    const fwdSub = await awaitForwarded(target, RPC.view.subscribe);
+    replyTarget(target, fwdSub, true, { ok: true });
+    expect(resPayload(await sub.res)).toEqual({ ok: true });
+
+    // 对照：退组前 tail 正常扇出
+    await sendTail(target, 'sess-1', [msg(1, '同组时可见')]);
+    const a1 = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    expect((a1.payload as { events: ViewMessage[] }).events).toEqual([msg(1, '同组时可见')]);
+
+    // target 退组 → 订阅登记仍在（hub 不主动杀），但复检同组失败 → 不扇出
+    await callRpc(target, RPC.group.leave, { groupId });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string; kind: string }).nodeId === target.nodeId
+      && (e.payload as { kind: string }).kind === 'left');
+    const tailRes = await sendTail(target, 'sess-1', [msg(2, '退组后不可见')]);
+    expect(tailRes.kind === 'res' && tailRes.ok).toBe(true);
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.viewAppended)).toHaveLength(1); // 仍只有退组前那份
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('Important② unsubscribe 转发超时回 ok（幂等清理——本地注销先行，目标不应答不卡死退订）；其他方法超时仍 internal', async () => {
+    const server2 = createHubServer({ db, identity, dataDir, viewForwardTimeoutMs: 150 });
+    const base2 = await server2.listen(0, '127.0.0.1');
+    const wsUrl2 = base2.replace(/^http/, 'ws') + '/ws';
+    try {
+      const connect2 = async (name: string): Promise<Client> => {
+        const cred = enrollNode(db, identity.enrollmentToken, name);
+        if ('error' in cred) throw new Error('enroll 失败');
+        return new Promise((resolve, reject) => {
+          const ws = new WebSocket(wsUrl2, { headers: { authorization: `Bearer ${cred.deviceToken}` } });
+          const inbox: Envelope[] = [];
+          const waiters: Array<{ match: (e: Envelope) => boolean; resolve: (e: Envelope) => void }> = [];
+          ws.on('message', (data) => {
+            const e = parseEnvelope(String(data));
+            if (!e) return;
+            inbox.push(e);
+            const i = waiters.findIndex((w) => w.match(e));
+            if (i >= 0) waiters.splice(i, 1)[0]!.resolve(e);
+          });
+          ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer: PROTOCOL_VERSION }))));
+          ws.on('error', reject);
+          const next = (match: (e: Envelope) => boolean): Promise<Envelope> =>
+            new Promise((res) => { const hit = inbox.find(match); if (hit) return res(hit); waiters.push({ match, resolve: res }); });
+          void next((e) => e.kind === 'res' && e.method === RPC.hello).then((h) => {
+            if (h.kind !== 'res' || !h.ok) reject(new Error('hello 失败'));
+            else resolve({ ws, nodeId: cred.nodeId, cred, inbox, next });
+          });
+        });
+      };
+      const leader = await connect2('to-leader');
+      const target = await connect2('to-target');
+      const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-timeout' });
+      const { groupId } = resPayload(created) as { groupId: string };
+      const invited = await callRpc(leader, RPC.group.invite, { groupId });
+      await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+
+      // unsubscribe：转发到达目标但目标静默 → 超时后 leader 收 ok（幂等清理）
+      const unsub = callRpcEnv(leader, RPC.view.unsubscribe, viewReq(RPC.view.unsubscribe, target.nodeId, { sessionId: 's' }));
+      await awaitForwarded(target, RPC.view.unsubscribe); // 故意不答
+      const r1 = await unsub.res;
+      expect(r1.kind === 'res' && r1.ok).toBe(true);
+
+      // 对照：view.workspace 同款静默 → 超时 internal
+      const probe = callRpcEnv(leader, RPC.view.workspace, viewReq(RPC.view.workspace, target.nodeId));
+      await awaitForwarded(target, RPC.view.workspace); // 故意不答
+      const r2 = await probe.res;
+      expect(errOf(r2).code).toBe('internal');
+      leader.ws.close(); target.ws.close();
+    } finally {
+      await server2.close();
+    }
+  });
+
+  it('Minor③ 登记侧 sessionId 界长：超过 SESSION_ID_MAX(128) 的 subscribe/unsubscribe → bad_request', async () => {
+    const { leader, target } = await setupGroup('sbound');
+    const long = 'x'.repeat(129);
+    const s1 = await callRpc(leader, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: long }));
+    expect(errOf(s1).code).toBe('bad_request');
+    const s2 = await callRpc(leader, RPC.view.unsubscribe, viewReq(RPC.view.unsubscribe, target.nodeId, { sessionId: long }));
+    expect(errOf(s2).code).toBe('bad_request');
+    // 128 位内仍正常走转发路径（目标应收到转发 req）
+    const sub = callRpcEnv(leader, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'y'.repeat(128) }));
+    const fwd = await awaitForwarded(target, RPC.view.subscribe);
+    replyTarget(target, fwd, true, { ok: true });
+    expect(resPayload(await sub.res)).toEqual({ ok: true });
+    leader.ws.close(); target.ws.close();
+  });
+});

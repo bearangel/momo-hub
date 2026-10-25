@@ -39,6 +39,7 @@ export interface CreateHubServerOpts {
   snapshotMaxBytes?: number;   // 工作空间快照上限（默认 200MB；测试注入小值走同一代码路径）
   helloTimeoutMs?: number;      // 默认 5000
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
+  viewForwardTimeoutMs?: number; // 查看转发超时注入（T13 评审 Important② 用例消费；默认 10s）
   /** 公网 origin（RM1-11）：设置后 catalog 的 downloadUrl 独占使用该 origin；
    *  非法值在此抛错（启动即失败，不静默降级）。 */
   publicOrigin?: string;
@@ -74,7 +75,9 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   // 委派路由器（账本状态机 + task.* RPC + 上行 report 对账——同为生命周期单例）
   const delegationRouter = new DelegationRouter(db, registry);
   // 远程查看路由器（M2e：六方法定向转发 + consent 内存态 + 订阅登记/断开注销）
-  const viewRouter = new RemoteViewRouter(db, registry);
+  const viewRouter = new RemoteViewRouter(db, registry, {
+    ...(opts.viewForwardTimeoutMs !== undefined ? { forwardTimeoutMs: opts.viewForwardTimeoutMs } : {}),
+  });
   // 存活 socket 登记：close() 据此排空 close 处理器——M2d 起离线钩子查库
   // （delegations），晚到的 close 事件若越过 close() 落在嵌入方 db.close() 之后，
   // 会以未捕获异常炸进程（index.ts 关停序 server.close()→db.close() 同暴露）。

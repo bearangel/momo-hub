@@ -7,6 +7,7 @@ import {
   MIRROR_WIRE,
   PROTOCOL_VERSION,
   RPC,
+  TASK_WIRE,
   isCompatible,
   validateHubManifest,
   validateSnapshotManifest,
@@ -27,6 +28,7 @@ import {
   type TaskAssignedEvent,
   type TaskProgressEvent,
   type TaskRecord,
+  type TaskReportPayload,
   type TaskTerminalEvent,
   type ViewAppendedEvent,
   type ViewMessagePage,
@@ -298,6 +300,20 @@ describe('委派类型 round-trip', () => {
       'updatedAt',
       'workspaceName',
     ]);
+  });
+
+  it('TASK_WIRE.report 常量与 TaskReportPayload 形状（M2d T9 wire 约定锁）', () => {
+    expect(TASK_WIRE).toEqual({ report: 'task.report' });
+    const running: TaskReportPayload = {
+      status: 'running',
+      sessionId: 'sess-1',
+      progress: { lastSeq: 42, excerpt: '正在编辑…' },
+    };
+    expect(JSON.parse(JSON.stringify(running))).toEqual(running);
+    const done: TaskReportPayload = { status: 'done' };
+    expect(Object.keys(done)).toEqual(['status']);
+    const failed: TaskReportPayload = { status: 'failed', reason: 'declined' };
+    expect(JSON.parse(JSON.stringify(failed))).toEqual(failed);
   });
 });
 

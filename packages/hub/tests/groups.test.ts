@@ -84,11 +84,11 @@ afterAll(async () => { await server.close(); db.close(); });
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('迁移 v3 组三表', () => {
-  it('schema_version=6（v3 组三表 + M2c 快照表两条追加）；三表存在；重开幂等', () => {
+  it('schema_version=7（v3 组三表 + M2c 快照 + M2d 委派表追加）；三表存在；重开幂等', () => {
     const dir = mkdtempSync(join(tmpdir(), 'momo-hub-mig-'));
     const d1: Database.Database = openHubDatabase(dir);
     const version = d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string };
-    expect(version.value).toBe('6');
+    expect(version.value).toBe('7');
     const tables = (d1.prepare(
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('groups', 'group_members', 'group_invites')`,
     ).all() as Array<{ name: string }>).map((r) => r.name).sort();
@@ -96,7 +96,7 @@ describe('迁移 v3 组三表', () => {
     d1.close();
     // 重开幂等：不重复应用、不炸
     const d2 = openHubDatabase(dir);
-    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('6');
+    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('7');
     d2.close();
   });
 });
@@ -381,14 +381,21 @@ type Connected = Awaited<ReturnType<typeof connect>>;
     a.ws.close();
   });
 
-  it('未注册的 leader-only 方法（task.*/view.*）照旧 unknown_method；mirror 已注册（M2c）空载荷 → bad_request', async () => {
+  it('未注册的 leader-only 方法（view.*）照旧 unknown_method；mirror/task.* 已注册（M2c/M2d）空载荷 → bad_request（task.list 空 → 本组空清单）', async () => {
     const a = await connect('un-a');
-    for (const method of [RPC.task.delegate, RPC.task.cancel, RPC.view.workspace, RPC.view.subscribe]) {
+    for (const method of [RPC.view.workspace, RPC.view.subscribe]) {
       const res = await callRpc(a, method, {});
       expect(errCode(res)).toBe('unknown_method');
     }
     const mirror = await callRpc(a, RPC.workspace.mirror, {});
     expect(errCode(mirror)).toBe('bad_request');
+    const delegate = await callRpc(a, RPC.task.delegate, {});
+    expect(errCode(delegate)).toBe('bad_request');
+    const cancel = await callRpc(a, RPC.task.cancel, {});
+    expect(errCode(cancel)).toBe('bad_request');
+    const list = await callRpc(a, RPC.task.list, {});
+    expect(list.kind === 'res' && list.ok).toBe(true);
+    expect((list as { payload: { tasks: unknown[] } }).payload.tasks).toEqual([]);
     a.ws.close();
   });
 

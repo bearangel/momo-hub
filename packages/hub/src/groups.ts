@@ -75,17 +75,25 @@ function broadcastGroupChanged(
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * leader-only 方法 → 载荷 groupId 提取器。映射先建全：M2c/d/e 的 mirror、
- * task、view 域方法尚未注册为 handler，未注册方法照旧 unknown_method、不进守卫；
- * 注册后守卫自动生效。提取不到 groupId（载荷坏 / M2d 的 task.cancel 需查
- * delegations 表、M2e 的 view 域方法需按 targetNodeId 归组——届时接线）时放行，
- * 交由 handler 的载荷校验给出 bad_request / not_found。
+ * leader-only 方法 → 载荷 groupId 提取器（db 供需查表回填的方法用）。映射先建全：
+ * M2e 的 view 域方法尚未注册为 handler，未注册方法照旧 unknown_method、不进守卫；
+ * 注册后守卫自动生效。提取不到 groupId（载荷坏 / taskId 未知 / M2e 的 view 域方法
+ * 需按 targetNodeId 归组——届时接线）时放行，交由 handler 的载荷校验给出
+ * bad_request / not_found。task.cancel 已回填（M2d T9）：按 taskId 查 delegations
+ * 得 group_id——未知 taskId 返 null 放行，由 handler 给 not_found。
  */
-const LEADER_ONLY_METHODS: Record<string, (payload: unknown) => string | null> = {
+const LEADER_ONLY_METHODS: Record<string, (payload: unknown, db: Database.Database) => string | null> = {
   [RPC.group.transfer]: (p) => reqStr(p, 'groupId'),
   [RPC.workspace.mirror]: (p) => reqStr(p, 'groupId'),
   [RPC.task.delegate]: (p) => reqStr(p, 'groupId'),
-  [RPC.task.cancel]: () => null,
+  [RPC.task.cancel]: (p, db) => {
+    const taskId = reqStr(p, 'taskId');
+    if (!taskId) return null;
+    const row = db.prepare('SELECT group_id FROM delegations WHERE task_id = ?').get(taskId) as
+      | { group_id: string }
+      | undefined;
+    return row?.group_id ?? null;
+  },
   [RPC.view.workspace]: () => null,
   [RPC.view.sessions]: () => null,
   [RPC.view.messages]: () => null,
@@ -106,7 +114,7 @@ export function checkGroupRole(
 ): { ok: true } | { ok: false; error: RpcErrorPayload } {
   const extractor = LEADER_ONLY_METHODS[method];
   if (!extractor) return { ok: true };
-  const groupId = extractor(payload);
+  const groupId = extractor(payload, db);
   if (groupId === null) return { ok: true };
   const group = groupRow(db, groupId);
   if (!group) return { ok: false, error: err('not_found', '工作组不存在') };

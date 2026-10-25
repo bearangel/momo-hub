@@ -585,7 +585,6 @@ describe('上报健壮性', () => {
     report(target.ws, taskId, { status: 'cancelled' }); // status 非上报枚举
     report(target.ws, taskId, {}); // 缺 status
     report(target.ws, taskId, { status: 'running', progress: { lastSeq: -1, excerpt: 'x' } }); // lastSeq 非法
-    report(target.ws, taskId, { status: 'running', progress: { lastSeq: 1, excerpt: '' } }); // excerpt 空
     report(target.ws, taskId, { status: 'running' }, false); // ok=false
     await settle();
 
@@ -598,6 +597,23 @@ describe('上报健壮性', () => {
     const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress);
     expect(prog.payload).toEqual({ taskId, sessionId: 'sess-ok', lastSeq: 2, excerpt: 'ok' });
     leader.ws.close(); target.ws.close(); outsider.ws.close();
+  });
+
+  it('RM2-7：excerpt="" 视同缺省受理——进度拍照转且 lastSeq 不丢，转发用占位（leader 恒见非空摘要）', async () => {
+    const { leader, target, groupId } = await setupGroup('rmtree');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId));
+
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-x', progress: { lastSeq: 7, excerpt: '' } });
+    const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress);
+    expect(prog.payload).toEqual({ taskId, sessionId: 'sess-x', lastSeq: 7, excerpt: '（无文本增量）' });
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', session_id: 'sess-x' });
+
+    // progress 整段缺省同款占位（T10 目标侧恒非空双保险；hub 侧兜底一致）
+    report(target.ws, taskId, { status: 'running', progress: { lastSeq: 9, excerpt: '' } });
+    const beat = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { lastSeq: number }).lastSeq === 9);
+    expect((beat.payload as { excerpt: string }).excerpt).toBe('（无文本增量）');
+    leader.ws.close(); target.ws.close();
   });
 });
 

@@ -110,7 +110,8 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
 }
 
 /** task.report 载荷校验：status 三值枚举（interrupted/cancelled 不是上报值）、
- *  sessionId/reason 有界串、progress 形态严格（lastSeq 非负整数 + excerpt 有界）。 */
+ *  sessionId/reason 有界串、progress 形态（lastSeq 非负整数 + excerpt 有界串——
+ *  RM2-7：excerpt="" 视同缺省受理，转发时以占位呈现，lastSeq 不丢）。 */
 function parseReportPayload(raw: unknown): TaskReportPayload | null {
   if (!isRecord(raw)) return null;
   if (raw.status !== 'running' && raw.status !== 'done' && raw.status !== 'failed') return null;
@@ -130,7 +131,7 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
     if (!isRecord(p)) return null;
     const lastSeq = p.lastSeq;
     if (typeof lastSeq !== 'number' || !Number.isInteger(lastSeq) || lastSeq < 0) return null;
-    const excerpt = optBoundedStr(p.excerpt, EXCERPT_MAX);
+    const excerpt = typeof p.excerpt === 'string' && p.excerpt.length <= EXCERPT_MAX ? p.excerpt : null;
     if (excerpt === null) return null;
     out.progress = { lastSeq, excerpt };
   }
@@ -377,7 +378,9 @@ export class DelegationRouter {
   }
 
   /** task.progress 直转（节流合并由目标侧负责——hub 不缓存不合并）。sessionId
-   *  缺省（上报与账本均无）时转发空串，保 TaskProgressEvent 形态恒定。 */
+   *  缺省（上报与账本均无）时转发空串，保 TaskProgressEvent 形态恒定。
+   *  RM2-7：excerpt 空/缺省 → 占位「（无文本增量）」转发（leader 恒见非空摘要——
+   *  T10 目标侧恒非空是第一道保险，hub 兜底是第二道）。 */
   private forwardProgress(row: DelegationRow, report: TaskReportPayload): void {
     const evt: EventEnvelope = {
       v: 1, kind: 'evt', method: EVT.taskProgress,
@@ -385,7 +388,7 @@ export class DelegationRouter {
         taskId: row.task_id,
         sessionId: row.session_id ?? '',
         lastSeq: report.progress?.lastSeq ?? 0,
-        excerpt: report.progress?.excerpt ?? '',
+        excerpt: report.progress?.excerpt || '（无文本增量）',
       } satisfies TaskProgressEvent,
     };
     void this.registry.sendTo(row.by_node_id, evt);

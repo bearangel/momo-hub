@@ -119,7 +119,14 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
       const auth = req.headers.authorization ?? '';
       const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
       const node = token ? verifyDeviceToken(db, token) : null;
-      if (!node) { socket.close(4401, 'unauthorized'); return; }
+      if (!node) {
+        // 鉴权失败即摘（T9 Minor#2）：本分支 return 早于 close 处理器注册——
+        // 不摘则该 socket 永驻 liveSockets（连接干净关闭也无人 delete），
+        // close() 排空恒拖满 500ms 上限
+        liveSockets.delete(socket);
+        socket.close(4401, 'unauthorized');
+        return;
+      }
 
       const session: Session = { nodeId: node.nodeId, nodeName: node.name, helloDone: false, conn: null };
       const helloTimer = setTimeout(() => socket.close(4403, 'hello_timeout'), helloTimeoutMs);

@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { WebSocket } from 'ws';
 import {
-  EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, encodeEnvelope, isCompatible, parseEnvelope,
+  EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, VIEW_WIRE, encodeEnvelope, isCompatible, parseEnvelope,
   type HelloReq, type RpcErrorPayload,
 } from 'momo-hub-protocol';
 import type { HubIdentity } from './identity';
@@ -22,6 +22,7 @@ import { registerResourceRoutes } from './resources';
 import { handleWorkspaceSnapshots, registerSnapshotRoutes } from './snapshots';
 import { MirrorRouter } from './mirror';
 import { DelegationRouter } from './delegations';
+import { RemoteViewRouter, isViewRpcMethod } from './remote-view';
 import { logger } from './logger';
 
 export interface HubServer {
@@ -72,16 +73,22 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const mirrorRouter = new MirrorRouter(db, registry);
   // 委派路由器（账本状态机 + task.* RPC + 上行 report 对账——同为生命周期单例）
   const delegationRouter = new DelegationRouter(db, registry);
+  // 远程查看路由器（M2e：六方法定向转发 + consent 内存态 + 订阅登记/断开注销）
+  const viewRouter = new RemoteViewRouter(db, registry);
   // 存活 socket 登记：close() 据此排空 close 处理器——M2d 起离线钩子查库
   // （delegations），晚到的 close 事件若越过 close() 落在嵌入方 db.close() 之后，
   // 会以未捕获异常炸进程（index.ts 关停序 server.close()→db.close() 同暴露）。
   const liveSockets = new Set<WebSocket>();
   const app = fastify({ logger: false });
   void app.register(websocket);
-  // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域三方法。
+  // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域三方法 +
+  // M2e 查看域八方法（六公开 view.* + 私有上行 view.consent/view.tail）。
   // workspace.snapshots/task.list 无组角色限制不进 LEADER_ONLY_METHODS 守卫直通；
-  // workspace.mirror/task.delegate/task.cancel leader-only 由守卫层校验
-  // （task.cancel 提取器按 taskId 查 delegations 回填 groupId——M2d T9 回填）。
+  // workspace.mirror/task.delegate/task.cancel/view.* 六方法 leader-only 由守卫层
+  // 校验（task.cancel 提取器按 taskId 查 delegations 回填 groupId——M2d T9 回填；
+  // view.* 提取器按 targetNodeId 查「leader 与 target 同组」——M2e T13 回填）；
+  // view.consent/view.tail 为节点上行（非 leader-only），不进守卫。
+  const viewHandler = (method: string): GroupHandler => (ctx, payload) => viewRouter.handleView(ctx, method, payload);
   const RPC_HANDLERS: Record<string, GroupHandler> = {
     ...GROUP_HANDLERS,
     [RPC.workspace.snapshots]: handleWorkspaceSnapshots,
@@ -89,6 +96,14 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     [RPC.task.delegate]: (ctx, payload) => delegationRouter.handleDelegate(ctx, payload),
     [RPC.task.cancel]: (ctx, payload) => delegationRouter.handleCancel(ctx, payload),
     [RPC.task.list]: (ctx, payload) => delegationRouter.handleList(ctx, payload),
+    [RPC.view.workspace]: viewHandler(RPC.view.workspace),
+    [RPC.view.sessions]: viewHandler(RPC.view.sessions),
+    [RPC.view.messages]: viewHandler(RPC.view.messages),
+    [RPC.view.tasks]: viewHandler(RPC.view.tasks),
+    [RPC.view.subscribe]: viewHandler(RPC.view.subscribe),
+    [RPC.view.unsubscribe]: viewHandler(RPC.view.unsubscribe),
+    [VIEW_WIRE.consent]: (ctx, payload) => viewRouter.handleConsent(ctx, payload),
+    [VIEW_WIRE.tail]: (ctx, payload) => viewRouter.handleTail(ctx, payload),
   };
   // 路由必须挂在 websocket 插件之后的 register 里：fastify 5.12 的 onRoute 钩子在 .get()
   // 调用时同步跑，而 register() 的插件加载推迟到 ready()——直接紧跟 register(websocket)
@@ -141,11 +156,13 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         if (!env) { socket.close(4400, 'bad_envelope'); return; }
         if (env.kind === 'evt') return; // 上行 evt 忽略（M0 语义不变）
         if (env.kind === 'res') {
-          // 上行 res 按 method 分流：task.report → 委派上报（M2d）；其余 → 镜像
-          // 回执（M2c，唯一其余合法项）。未匹配（迟到/重复/伪造/未知 method）由
-          // 各路由器静默忽略。hello 前的 res 不可能有对账项，一并忽略。
+          // 上行 res 按 method 分流：task.report → 委派上报（M2d）；view.* 六方法 →
+          // 查看转发对账（M2e，id=转发 id 关联）；其余 → 镜像回执（M2c，唯一其余
+          // 合法项）。未匹配（迟到/重复/伪造/未知 method）由各路由器静默忽略。
+          // hello 前的 res 不可能有对账项，一并忽略。
           if (session.helloDone) {
             if (env.method === TASK_WIRE.report) delegationRouter.acceptReport(session.nodeId, env);
+            else if (isViewRpcMethod(env.method)) viewRouter.acceptViewRes(session.nodeId, env);
             else mirrorRouter.acceptReceipt(session.nodeId, env);
           }
           return;
@@ -235,6 +252,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
           mirrorRouter.onNodeOffline(session.nodeId);
           // M2d：该节点非终态委派 pending/running → interrupted + 通知 leader（MC5）
           delegationRouter.onNodeOffline(session.nodeId);
+          // M2e：consent 回默认（RM2-9）+ 订阅双侧注销（RF#1）+ 查看在途结算
+          viewRouter.onNodeOffline(session.nodeId);
           registry.broadcast(EVT.nodeOffline, { nodeId: session.nodeId, at: Date.now() });
         }
       });

@@ -64,3 +64,29 @@ export interface ViewSubscribeRes { ok: boolean }
 
 export interface ViewUnsubscribeReq { targetNodeId: string; sessionId: string }
 export interface ViewUnsubscribeRes { ok: boolean }
+
+// ────────────────────────────────────────────────────────────────────────────
+// 查看私有 wire（T13 约定；hub 侧执行语义见 packages/hub/src/remote-view.ts 文件头）——
+// 不进 RPC 目录（ws 控制面公开方法），仅供 hub 与 studio 目标端/leader 端消费。
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 查看链路私有方法名（信封 method 字段值）。 */
+export const VIEW_WIRE = {
+  /**
+   * 节点 → hub：查看同意开关上报（req 信封，hub 直接 res 确认 {ok:true}）。
+   * 节点 hello 后与开关变更时上行；hub 存内存态 per-nodeId，默认 true（spec §5.5）；
+   * 断线清除回默认（RM2-9），重连由节点重报。
+   */
+  consent: 'view.consent',
+  /**
+   * 目标节点 → hub：已订阅会话的尾部增量（req 信封，hub 组装 view.appended
+   * evt 定向推订阅端 leader，并 res {ok:true} 确认）。
+   */
+  tail: 'view.tail',
+} as const;
+
+/** view.consent 载荷：allowed=false 时 hub 对该节点的 view.* 请求一律 forbidden。 */
+export interface ViewConsentPayload { allowed: boolean }
+
+/** view.tail 载荷：该会话新 message_events 批（hub 原样组装进 view.appended）。 */
+export interface ViewTailPayload { sessionId: string; events: ViewMessage[] }

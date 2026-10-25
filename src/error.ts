@@ -14,3 +14,16 @@ export type RpcErrorCode =
   | 'conflict';
 
 export interface RpcErrorPayload { code: RpcErrorCode; message: string }
+
+/** 错误码全集（运行时成员校验用，T13——透传方按表校验未知码；与上方 union 一一对应，只增不改义）。 */
+export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
+  'unauthorized',
+  'bad_request',
+  'proto_version_mismatch',
+  'unknown_method',
+  'internal',
+  'forbidden',
+  'node_offline',
+  'not_found',
+  'conflict',
+];

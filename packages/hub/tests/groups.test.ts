@@ -381,11 +381,14 @@ type Connected = Awaited<ReturnType<typeof connect>>;
     a.ws.close();
   });
 
-  it('未注册的 leader-only 方法（view.*）照旧 unknown_method；mirror/task.* 已注册（M2c/M2d）空载荷 → bad_request（task.list 空 → 本组空清单）', async () => {
+  it('未注册方法照旧 unknown_method；view.*/mirror/task.* 已注册（M2c/M2d/M2e）空载荷 → bad_request（task.list 空 → 本组空清单）', async () => {
     const a = await connect('un-a');
+    const ghost = await callRpc(a, 'no.such.method', {});
+    expect(errCode(ghost)).toBe('unknown_method');
+    // view 域已注册（M2e T13）：空载荷先过守卫提取器（返 null 放行）→ handler bad_request
     for (const method of [RPC.view.workspace, RPC.view.subscribe]) {
       const res = await callRpc(a, method, {});
-      expect(errCode(res)).toBe('unknown_method');
+      expect(errCode(res)).toBe('bad_request');
     }
     const mirror = await callRpc(a, RPC.workspace.mirror, {});
     expect(errCode(mirror)).toBe('bad_request');

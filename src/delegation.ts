@@ -16,6 +16,9 @@ export interface DelegationTask {
   title: string;
   prompt: string;
   agentSlug?: string;
+  /** HITL 权限档位（M2.1 T10b，0.1.3）：readonly/sandbox/confirm 三值枚举，缺省合法
+   *  （0.1.2 载荷向后兼容）；hub 侧非法值剥除透传（未知容忍先例 modelBinding）。 */
+  permissionTier?: 'readonly' | 'sandbox' | 'confirm';
 }
 
 export interface TaskDelegateReq {

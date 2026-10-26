@@ -1,6 +1,6 @@
 {
   "name": "momo-hub-protocol",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "momo-hub 与 momo-studio 之间的协议与类型单源（studio 经 git tag 依赖消费；spec 2026-10-23 M0）",
   "license": "AGPL-3.0-only",
   "main": "./dist/index.js",

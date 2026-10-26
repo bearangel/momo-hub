@@ -77,6 +77,9 @@ const REASON_MAX = 512;
 const EXCERPT_MAX = 512;
 const SLUG_MAX = 64;              // S1 SLUG_MAX
 
+/** permissionTier 合法档位（M2.1 T10b，与协议包 DelegationTask.permissionTier 枚举同源）。 */
+const PERMISSION_TIERS: readonly DelegationTask['permissionTier'][] = ['readonly', 'sandbox', 'confirm'];
+
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
 const textEncoder = new TextEncoder();
 
@@ -105,6 +108,11 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
     const slug = optBoundedStr(raw.agentSlug, SLUG_MAX);
     if (slug === null) return null;
     task.agentSlug = slug;
+  }
+  // permissionTier（M2.1 T10b）：三值枚举校验，非法值剥除不抛（未知容忍先例
+  // modelBinding——档位缺省语义在目标侧，hub 不因坏档位拒整张任务书）
+  if (raw.permissionTier !== undefined && (PERMISSION_TIERS as readonly string[]).includes(raw.permissionTier as string)) {
+    task.permissionTier = raw.permissionTier as DelegationTask['permissionTier'];
   }
   return task;
 }

@@ -110,9 +110,10 @@ function ledgerRow(taskId: string): LedgerRow | undefined {
   return db.prepare('SELECT * FROM delegations WHERE task_id = ?').get(taskId) as LedgerRow | undefined;
 }
 
-function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string } = {}): Record<string, unknown> {
+function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string; permissionTier?: unknown } = {}): Record<string, unknown> {
   const task: Record<string, unknown> = { title: opts.title ?? '修登录 bug', prompt: opts.prompt ?? '请修复登录失败问题' };
   if (opts.agentSlug !== undefined) task.agentSlug = opts.agentSlug;
+  if (opts.permissionTier !== undefined) task.permissionTier = opts.permissionTier;
   return { groupId, targetNodeId, workspaceName: opts.workspaceName ?? 'ws-t', task };
 }
 
@@ -198,6 +199,44 @@ describe('task.delegate 全链', () => {
     expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
       title: '修登录 bug', prompt: '请修复登录失败问题',
     });
+    leader.ws.close(); target.ws.close();
+  });
+
+  // ── permissionTier 透传（M2.1 T10b：HITL 权限档位随任务书定向到目标节点）──
+
+  it('permissionTier 合法三值（readonly/sandbox/confirm）均透传——assigned 载荷 task 含原值', async () => {
+    const { leader, target, groupId } = await setupGroup('deltier');
+    for (const tier of ['readonly', 'sandbox', 'confirm'] as const) {
+      const res = await callRpc(leader, RPC.task.delegate,
+        delegateReq(groupId, target.nodeId, { workspaceName: `ws-tier-${tier}`, permissionTier: tier }));
+      expect(res.kind === 'res' && res.ok, `档位 ${tier} 应受理`).toBe(true);
+      const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+        && (e.payload as { workspaceName: string }).workspaceName === `ws-tier-${tier}`);
+      expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
+        title: '修登录 bug', prompt: '请修复登录失败问题', permissionTier: tier,
+      });
+    }
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('permissionTier 非法值丢弃不抛（未知容忍，先例 modelBinding）：assigned 载荷不含该键，title/prompt/agentSlug 完好', async () => {
+    const { leader, target, groupId } = await setupGroup('deltbad');
+    for (const bad of ['foo', 123] as const) {
+      const res = await callRpc(leader, RPC.task.delegate,
+        delegateReq(groupId, target.nodeId, {
+          workspaceName: 'ws-tier-bad', agentSlug: 'coder-pro',
+          title: '排查崩溃', prompt: '分析 dump 定位根因', permissionTier: bad,
+        }));
+      // 丢弃 ≠ 拒绝：委派照常受理（零授权缺省语义在目标侧，hub 只剥非法档位）
+      expect(res.kind === 'res' && res.ok, `非法值 ${JSON.stringify(bad)} 应丢弃而非拒绝`).toBe(true);
+      const taskId = (resPayload(res) as { taskId: string }).taskId;
+      const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+        && (e.payload as { taskId: string }).taskId === taskId);
+      expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
+        title: '排查崩溃', prompt: '分析 dump 定位根因', agentSlug: 'coder-pro',
+      });
+      expect((assigned.payload as { task: Record<string, unknown> }).task).not.toHaveProperty('permissionTier');
+    }
     leader.ws.close(); target.ws.close();
   });
 });

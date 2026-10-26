@@ -77,8 +77,12 @@ export interface TaskReportPayload {
   progress?: TaskReportProgress;
 }
 
-/** 进度拍：委派会话 message_events 尾部摘要（excerpt 为截断文本）。 */
+/** 进度拍：委派会话 message_events 尾部摘要（excerpt 为截断文本）。
+ *  kind 可选标注（M2.1 T11b，0.1.4）：'waiting-input' = 目标侧 agent 正等待
+ *  用户确认（写授权卡等）——leader 看板据此切「等待节点确认」态。hub 侧白名单
+ *  + 枚举校验，非法值剥除不抛（先例 permissionTier/modelBinding）。 */
 export interface TaskReportProgress {
   lastSeq: number;
   excerpt: string;
+  kind?: 'waiting-input';
 }

@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.1.4（2026-10-26）
+
+委派进度 kind 可选字段透传（M2.1 T11b 等待信号）：进度段 `TaskReportProgress.kind` 与事件 `TaskProgressEvent.kind` 增可选单值枚举 `'waiting-input'`（缺省合法，0.1.3 载荷向后兼容）——目标节点上报「agent 正等待用户确认（写授权卡等）」时随进度拍直达 leader 推送面（迁移拍与同态进度拍均透传），leader 看板据此切「等待节点确认」态。hub `parseReportPayload` 白名单收该字段 + 枚举校验，非法值剥除不抛（先例 permissionTier v0.1.3/modelBinding），修复 studio T11 委派链路 kind 被 hub 白名单剥离的断点。
+
 ## 0.1.3（2026-10-26）
 
 委派载荷 permissionTier 可选字段透传（M2.1 权限档位 HITL，评审 P1 裁定 (a)）：任务书 `DelegationTask.permissionTier` 增三值枚举 `readonly`/`sandbox`/`confirm`（缺省合法，0.1.2 载荷向后兼容）；hub `parseDelegationTask` 白名单收该字段 + 枚举校验——合法值随 `task.assigned` 定向透传目标节点，非法值剥除不抛（未知容忍先例 modelBinding，任务书其余字段照常受理）。修复 studio T10 委派链路档位被 hub 白名单剥除的断点。

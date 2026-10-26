@@ -37,6 +37,34 @@ const MIGRATIONS: readonly string[] = [
      published_at INTEGER NOT NULL,
      PRIMARY KEY (slug, version)
    )`,
+  // v3（M2 工作组三表，spec 2026-10-24 §4 SQL 逐字；快照/委派表随 M2c/d 追加）
+  `CREATE TABLE IF NOT EXISTS groups (
+     id TEXT PRIMARY KEY, name TEXT NOT NULL, leader_node_id TEXT NOT NULL, created_at INTEGER NOT NULL
+   );
+   CREATE TABLE IF NOT EXISTS group_members (
+     group_id TEXT NOT NULL, node_id TEXT NOT NULL, joined_at INTEGER NOT NULL,
+     PRIMARY KEY (group_id, node_id)
+   );
+   CREATE TABLE IF NOT EXISTS group_invites (
+     code TEXT PRIMARY KEY, group_id TEXT NOT NULL, created_at INTEGER NOT NULL, revoked INTEGER NOT NULL DEFAULT 0
+   )`,
+  // v4（M2c 快照表——spec §4 SQL 逐字 + UNIQUE(workspace_name, version)：
+  // 同 workspaceName+version 不可变（C4 同款双层 409 的库层兜底）。
+  // 迁移不可变纪律：不改写已应用的 v3 串，只追加新条目（delegations 随 M2d 再追加）。
+  `CREATE TABLE IF NOT EXISTS workspace_snapshots_meta (
+     snapshot_id TEXT PRIMARY KEY, workspace_name TEXT NOT NULL, version TEXT NOT NULL,
+     by_node TEXT NOT NULL, checksum TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL,
+     UNIQUE (workspace_name, version)
+   )`,
+  // v5（M2d 委派账本——spec §4 SQL 逐字）。status 六态；迁移合法性由 hub
+  // canTransition 单点校验（Review Focus #3），库层只存终值不设约束。
+  `CREATE TABLE IF NOT EXISTS delegations (
+     task_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, workspace_name TEXT NOT NULL,
+     target_node_id TEXT NOT NULL, by_node_id TEXT NOT NULL, title TEXT NOT NULL,
+     status TEXT NOT NULL,            -- pending|running|done|failed|interrupted|cancelled
+     session_id TEXT,                 -- 目标节点回填
+     created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+   )`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

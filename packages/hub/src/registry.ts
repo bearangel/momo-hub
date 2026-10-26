@@ -1,6 +1,6 @@
 // 在线节点注册表：nodeId → 连接。广播 evt 信封。
 import type { WebSocket } from 'ws';
-import { encodeEnvelope, type EventEnvelope } from 'momo-hub-protocol';
+import { encodeEnvelope, type Envelope, type EventEnvelope } from 'momo-hub-protocol';
 
 export interface NodeConn { nodeId: string; nodeName: string; ws: WebSocket; alive: boolean }
 
@@ -34,5 +34,27 @@ export class NodeRegistry {
         // 连接已断：忽略——它会在 close 时被摘除
       }
     }
+  }
+
+  /**
+   * 定向投递（M2 spec §3.1）。语义（M2c sendTo 收口裁定 ①，上批评审 binding）：
+   * - 注册表查无目标 → 'offline'；
+   * - ws.send 走 callback 形态（ws 8：cb(err) 于 nextTick 回报）——CLOSING/CLOSED 等
+   *   「同步不抛、静默丢弃」的连接状态由回调 err 判 'offline'，杜绝向僵尸连接报 'sent'
+   *   的假阳性（委派链 M2d 同受益）；排队成功 → 'sent'。
+   * - 'sent' 仅代表已交付 socket 发送缓冲；对端进程崩溃等更深的丢失由上层协议兜底
+   *   （镜像两段式回执超时 / 委派进度对账）。
+   * 入参信封不限 evt——镜像链路的 mirror.apply（req）/ mirror.result（res）同走此口。
+   */
+  sendTo(nodeId: string, env: Envelope): Promise<'sent' | 'offline'> {
+    const c = this.byId.get(nodeId);
+    if (!c) return Promise.resolve('offline');
+    return new Promise((resolve) => {
+      try {
+        c.ws.send(encodeEnvelope(env), (err?: Error) => { resolve(err ? 'offline' : 'sent'); });
+      } catch {
+        resolve('offline'); // 同步抛（极端：socket 已销毁）——与回调 err 同判
+      }
+    });
   }
 }

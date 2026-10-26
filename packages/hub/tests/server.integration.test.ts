@@ -215,4 +215,24 @@ describe('hub ws 服务', () => {
     await s3.close();
     db3.close();
   });
+
+  it('鉴权失败连接不拖慢 close() 排空（liveSockets 即摘——T9 Minor#2）', async () => {
+    const db4 = openHubDatabase(mkdtempSync(join(tmpdir(), 'momo-hub-auth-')));
+    const id4 = ensureHubIdentity(db4);
+    const s4 = createHubServer({ db: db4, identity: id4 });
+    const url4 = await s4.listen(0, '127.0.0.1');
+
+    // 坏 token 升级 → 4401；客户端完成 close 握手（连接干净关闭）。但鉴权失败分支
+    // 早于 close 处理器注册——修复前该 socket 永驻 liveSockets，close() 排空拖满 500ms
+    const ws = new WebSocket(url4.replace(/^http/, 'ws') + '/ws', { headers: { authorization: 'Bearer nope' } });
+    const code = await new Promise<number>((resolve) => { ws.on('close', resolve); ws.on('error', () => undefined); });
+    expect(code).toBe(4401);
+
+    const t0 = Date.now();
+    await s4.close();
+    // 修复前：liveSockets 残留死 socket → drain 等满 500ms 上限；修复后即摘即返。
+    // 阈值 300ms 居中区分两形态（排空上限 500 固定，判定稳定）
+    expect(Date.now() - t0).toBeLessThan(300);
+    db4.close();
+  });
 });

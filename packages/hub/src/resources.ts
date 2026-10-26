@@ -83,7 +83,7 @@ export function normalizePublishManifest(raw: unknown): PublishManifestResult {
  *  multipart 的 write 回调；只有真正 read() 才会触发 busboy 的 `_read` → 释放回调 →
  *  底层请求体继续读完。少了这一步：请求体读不完 → socket 悬挂（连接不可复用、
  *  server.close() 挂起）。 */
-async function discardPartFile(file: Readable): Promise<void> {
+export async function discardPartFile(file: Readable): Promise<void> {
   try {
     const it = file[Symbol.asyncIterator]();
     for (;;) {
@@ -98,7 +98,7 @@ async function discardPartFile(file: Readable): Promise<void> {
 /** 读 manifest part（有界内存）：字段 part 取值，文件 part 逐块读，超限返回 null。
  *  超限后仍把流尾消费干净——中途弃流会销毁 part 流 → busboy 停读（背压）→ 请求体收不完
  *  → 连接悬挂（连接不可复用、服务关闭挂起）。 */
-async function readManifestPart(part: Multipart): Promise<string | null> {
+export async function readManifestPart(part: Multipart): Promise<string | null> {
   if (part.type === 'field') {
     if (part.valueTruncated) return null; // 字段被 multipart limits 截断 → 不可信
     // 字段 part 若声明 Content-Type: application/json，插件已把它解析成对象——回写成 JSON 文本再走统一解析。
@@ -121,12 +121,12 @@ async function readManifestPart(part: Multipart): Promise<string | null> {
   return overLimit ? null : Buffer.concat(chunks).toString('utf8');
 }
 
-/** package part 的字节流；字段 part 形态非法（非字符串/被截断）时返回 null → 400 invalid_manifest。
+/** payload/package part 的字节流；字段 part 形态非法（非字符串/被截断）时返回 null → 400 invalid_manifest。
  *  文件 part 走一层 PassThrough 包装：saveBlobStream 超限时管道会销毁源流——
  *  直接把 part.file 交出去，它会被销毁 → busboy 停读（背压）→ 请求体收不完 →
  *  socket 悬挂（连接不可复用、服务关闭挂起）。包装层在管道关闭时把底层 part 流继续
  *  drain 掉，保证请求能收尾、超限内容不落盘。 */
-function packageStream(part: Multipart): NodeJS.ReadableStream | null {
+export function packageStream(part: Multipart): NodeJS.ReadableStream | null {
   if (part.type !== 'file') {
     if (part.valueTruncated || typeof part.value !== 'string') return null;
     return Readable.from([Buffer.from(part.value, 'utf8')]);
@@ -141,11 +141,64 @@ function packageStream(part: Multipart): NodeJS.ReadableStream | null {
   return wrapper;
 }
 
-/** SQLite 唯一键冲突（resource_versions 的 (slug, version) 主键）——并发窗口兜底 409。 */
-function isUniqueViolation(err: unknown): boolean {
+/** SQLite 唯一键冲突（PRIMARY KEY / UNIQUE——publish 与快照共用的并发窗口兜底判定）。 */
+export function isUniqueViolation(err: unknown): boolean {
   if (typeof err !== 'object' || err === null) return false;
   const code = (err as { code?: unknown }).code;
   return code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE';
+}
+
+/** 两 part 收集结果：manifest 文本 + 未消费的 payload part（文件/字段形态皆可）。
+ *  - manifestText === null：manifest part 超限/不可信（→ 400）
+ *  - payloadPart === null：payload part 缺失（→ 400）
+ *  - payloadBeforeManifest：payload 先于可用 manifest 出现（含 manifest 缺失场景）→ 400 */
+export interface CollectTwoPartsResult {
+  manifestText: string | null;
+  payloadPart: Multipart | null;
+  payloadBeforeManifest: boolean;
+}
+
+/** manifest + payload 两 part 收集器（M1 publish 与 M2c 快照上传共用的 multipart
+ *  处理形态，drain 纪律内建）：manifest 必须先于 payload；未知 part 丢弃排干；
+ *  形态损坏（迭代器抛错）返回 null → 400。manifest 的字段级校验由调用方在收集后做。 */
+export async function collectManifestAndPayload(
+  iterator: AsyncIterator<Multipart>,
+  manifestField: string,
+  payloadField: string,
+): Promise<CollectTwoPartsResult | null> {
+  let manifestText: string | null = null;
+  let manifestSeen = false;
+  let payloadPart: Multipart | null = null;
+  let payloadBeforeManifest = false;
+  for (;;) {
+    let next: IteratorResult<Multipart>;
+    try {
+      next = await iterator.next();
+    } catch {
+      return null; // multipart 形态损坏
+    }
+    if (next.done) break;
+    const part = next.value;
+    if (part.fieldname === manifestField && !manifestSeen) {
+      manifestSeen = true;
+      manifestText = await readManifestPart(part);
+      continue;
+    }
+    if (part.fieldname === payloadField && payloadPart === null) {
+      // payload 先于可用 manifest（manifest 缺失 / 超 limit）→ 400：
+      // 当前 part 已被迭代器交出但未消费——必须在这里排干（busboy 停在当前 part
+      // → 请求体读不完 → 连接悬挂）。
+      if (!manifestSeen || manifestText === null) {
+        if (part.type === 'file') void discardPartFile(part.file);
+        payloadBeforeManifest = true;
+        break;
+      }
+      payloadPart = part;
+      break; // 交给调用方流式收包
+    }
+    if (part.type === 'file') void discardPartFile(part.file); // 未知/重复 part：丢弃
+  }
+  return { manifestText, payloadPart, payloadBeforeManifest };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -350,12 +403,10 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
 
     const iterator = req.parts();
 
-    // ③ 收 part：manifest 必须先于 package（契约：manifest 在前）——
-    //    manifest 不合法 → 400；package 缺失 → 400；multipart 解析炸 → 400。
-    let manifest: HubPublishManifest | null = null;
-    let manifestError: PublishErrorCode | null = null;
-    // 已从迭代器取出、但可能尚未被消费的 package part（早答路径需要把它排干）。
+    // ③ 收 part（共享收集器，drain 纪律内建）：manifest 必须先于 package（契约：manifest 在前）——
+    //    形态损坏 / manifest 超限 / package 先行或缺 manifest / 缺 package → 400。
     let packagePart: Multipart | null = null;
+    // 已从迭代器取出、但可能尚未被消费的 package part（早答路径需要把它排干）。
     // package 流已交给 saveBlobStream（包装层负责排干——不能两个消费方同时读一个流）。
     let packageHandedOff = false;
 
@@ -387,51 +438,30 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       return res;
     };
 
-    try {
-      for (;;) {
-        const next = await iterator.next();
-        if (next.done) break;
-        const part = next.value;
-        if (part.fieldname === 'manifest' && manifest === null && manifestError === null) {
-          const text = await readManifestPart(part);
-          if (text === null) { manifestError = 'invalid_manifest'; break; }
-          let parsed: unknown;
-          try {
-            parsed = JSON.parse(text);
-          } catch {
-            manifestError = 'invalid_manifest';
-            break;
-          }
-          const r = normalizePublishManifest(parsed);
-          if (!r.ok) { manifestError = r.error; break; }
-          manifest = r.manifest;
-          continue;
-        }
-        if (part.fieldname === 'package' && packagePart === null) {
-          if (manifest === null) {
-            // package 先于 manifest（或压根没有 manifest）→ 400。
-            // 当前 part 已被迭代器交出但未消费——必须在这里排干：否则 busboy 停在当前
-            // part → 请求体读不完 → 连接悬挂（与 409 预查早答路径同构）。
-            if (part.type === 'file') void discardPartFile(part.file);
-            manifestError = 'invalid_manifest';
-            break;
-          }
-          packagePart = part;
-          break; // 交给 saveBlobStream 流式收包
-        }
-        if (part.type === 'file') void discardPartFile(part.file); // 未知 part：丢弃
-      }
-    } catch {
-      return fail(400, 'invalid_manifest'); // multipart 形态损坏
+    const collected = await collectManifestAndPayload(iterator, 'manifest', 'package');
+    if (collected === null) return fail(400, 'invalid_manifest'); // multipart 形态损坏
+    packagePart = collected.payloadPart;
+    if (collected.payloadBeforeManifest || collected.manifestText === null || packagePart === null) {
+      return fail(400, 'invalid_manifest');
     }
-
-    if (manifestError !== null) return fail(400, manifestError);
-    if (manifest === null) return fail(400, 'invalid_manifest');
-    if (packagePart === null) return fail(400, 'invalid_manifest');
     // package 是字段 part 且值非字符串（插件预解析成对象）→ 形态非法 → 400
     // （杜绝 "[object Object]" 当 blob 落盘）。
     if (packagePart.type !== 'file' && (packagePart.valueTruncated || typeof packagePart.value !== 'string')) {
       return fail(400, 'invalid_manifest');
+    }
+
+    // manifest 文本 → 字段级校验（slug/version 单独成码，其余归 invalid_manifest）
+    let manifest: HubPublishManifest;
+    {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(collected.manifestText);
+      } catch {
+        return fail(400, 'invalid_manifest');
+      }
+      const r = normalizePublishManifest(parsed);
+      if (!r.ok) return fail(400, r.error);
+      manifest = r.manifest;
     }
 
     // ④ 版本不可变预查（C4 快路径）：已有同 slug+version → 409

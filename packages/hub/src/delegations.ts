@@ -26,7 +26,7 @@ import {
   EVT,
   type DelegationStatus, type DelegationTask, type EventEnvelope, type ResponseEnvelope,
   type RpcErrorPayload, type TaskAssignedEvent, type TaskProgressEvent, type TaskRecord,
-  type TaskReportPayload, type TaskTerminalEvent,
+  type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
@@ -79,6 +79,9 @@ const SLUG_MAX = 64;              // S1 SLUG_MAX
 
 /** permissionTier 合法档位（M2.1 T10b，与协议包 DelegationTask.permissionTier 枚举同源）。 */
 const PERMISSION_TIERS: readonly DelegationTask['permissionTier'][] = ['readonly', 'sandbox', 'confirm'];
+
+/** progress.kind 合法标注（M2.1 T11b，与协议包 TaskReportProgress.kind 枚举同源）。 */
+const PROGRESS_KINDS: readonly NonNullable<TaskReportProgress['kind']>[] = ['waiting-input'];
 
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
 const textEncoder = new TextEncoder();
@@ -142,6 +145,11 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
     const excerpt = typeof p.excerpt === 'string' && p.excerpt.length <= EXCERPT_MAX ? p.excerpt : null;
     if (excerpt === null) return null;
     out.progress = { lastSeq, excerpt };
+    // kind（M2.1 T11b）：单值枚举校验，非法值剥除不抛（先例 permissionTier——
+    // 等待标注的消费语义在 leader 侧，hub 不因坏标注拒整张进度拍）
+    if (p.kind !== undefined && (PROGRESS_KINDS as readonly string[]).includes(p.kind as string)) {
+      out.progress.kind = p.kind as TaskReportProgress['kind'];
+    }
   }
   return out;
 }
@@ -388,7 +396,9 @@ export class DelegationRouter {
   /** task.progress 直转（节流合并由目标侧负责——hub 不缓存不合并）。sessionId
    *  缺省（上报与账本均无）时转发空串，保 TaskProgressEvent 形态恒定。
    *  RM2-7：excerpt 空/缺省 → 占位「（无文本增量）」转发（leader 恒见非空摘要——
-   *  T10 目标侧恒非空是第一道保险，hub 兜底是第二道）。 */
+   *  T10 目标侧恒非空是第一道保险，hub 兜底是第二道）。
+   *  kind（M2.1 T11b）：目标侧等待标注原样透传 leader 推送面（缺省不带键——
+   *  0.1.3 载荷兼容）。 */
   private forwardProgress(row: DelegationRow, report: TaskReportPayload): void {
     const evt: EventEnvelope = {
       v: 1, kind: 'evt', method: EVT.taskProgress,
@@ -397,6 +407,7 @@ export class DelegationRouter {
         sessionId: row.session_id ?? '',
         lastSeq: report.progress?.lastSeq ?? 0,
         excerpt: report.progress?.excerpt || '（无文本增量）',
+        ...(report.progress?.kind !== undefined ? { kind: report.progress.kind } : {}),
       } satisfies TaskProgressEvent,
     };
     void this.registry.sendTo(row.by_node_id, evt);

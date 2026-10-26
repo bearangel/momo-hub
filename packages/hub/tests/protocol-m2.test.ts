@@ -181,10 +181,13 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     expect(noSlug.agentSlug).toBeUndefined();
   });
 
-  it('TaskProgressEvent：{taskId, sessionId, lastSeq, excerpt}', () => {
+  it('TaskProgressEvent：{taskId, sessionId, lastSeq, excerpt, kind?}', () => {
     const evt: TaskProgressEvent = { taskId: 't1', sessionId: 's1', lastSeq: 42, excerpt: '正在编辑…' };
     expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
     expect(Object.keys(evt).sort()).toEqual(['excerpt', 'lastSeq', 'sessionId', 'taskId']);
+    // kind 可选标注（M2.1 T11b）：缺省合法（0.1.3 载荷兼容）；置位仅 'waiting-input'
+    const waiting: TaskProgressEvent = { ...evt, kind: 'waiting-input' };
+    expect(Object.keys(waiting).sort()).toEqual(['excerpt', 'kind', 'lastSeq', 'sessionId', 'taskId']);
   });
 
   it('终态四事件共用形状：{taskId, reason?}', () => {

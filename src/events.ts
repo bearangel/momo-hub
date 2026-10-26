@@ -58,6 +58,9 @@ export interface TaskProgressEvent {
   sessionId: string;
   lastSeq: number;
   excerpt: string;
+  /** 等待标注（M2.1 T11b，0.1.4）：'waiting-input' = 目标侧等待用户确认——随
+   *  task.report 进度段透传；缺省 = 正常进度（0.1.3 载荷向后兼容）。 */
+  kind?: 'waiting-input';
 }
 
 /** 终态四件（completed/failed/interrupted/cancelled）共用形状：定向→leader + 账本状态机迁移。 */

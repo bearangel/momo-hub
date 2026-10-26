@@ -657,6 +657,60 @@ describe('上报健壮性', () => {
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// kind 透传（M2.1 T11b——目标侧 waiting-input 等待标注随进度拍直达 leader 推送面）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.report kind 透传（T11b）', () => {
+  it('kind 合法值（waiting-input）透传——迁移拍与进度拍的 task.progress 载荷均含 kind', async () => {
+    const { leader, target, groupId } = await setupGroup('delkind');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId));
+    // 迁移拍（pending→running）：kind 随转发
+    report(target.ws, taskId, {
+      status: 'running', sessionId: 'sess-k',
+      progress: { lastSeq: 1, excerpt: '开始执行', kind: 'waiting-input' },
+    });
+    const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress);
+    expect(prog.payload).toEqual({
+      taskId, sessionId: 'sess-k', lastSeq: 1, excerpt: '开始执行', kind: 'waiting-input',
+    });
+    // 进度拍（running→running 同态重复上报）：kind 同样透传（leader 看板等待态依据）
+    report(target.ws, taskId, {
+      status: 'running',
+      progress: { lastSeq: 3, excerpt: '等待用户确认写入', kind: 'waiting-input' },
+    });
+    const beat = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { lastSeq: number }).lastSeq === 3);
+    expect(beat.payload).toEqual({
+      taskId, sessionId: 'sess-k', lastSeq: 3, excerpt: '等待用户确认写入', kind: 'waiting-input',
+    });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('kind 非法值丢弃不抛（先例 permissionTier）：task.progress 载荷不含 kind 键，其余字段完好', async () => {
+    const { leader, target, groupId } = await setupGroup('delkbad');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId));
+    // 非法全集：未知串 / 非串值 / null——丢弃 ≠ 拒绝：进度拍照常受理转发
+    const bads: unknown[] = ['running', 42, null];
+    for (let i = 0; i < bads.length; i++) {
+      const lastSeq = i + 2;
+      report(target.ws, taskId, {
+        status: 'running', sessionId: 'sess-b',
+        progress: { lastSeq, excerpt: '进度正常', kind: bads[i] },
+      });
+      const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { lastSeq: number }).lastSeq === lastSeq);
+      expect(prog.payload, `非法值 ${JSON.stringify(bads[i])} 应丢弃而非拒绝`).toEqual({
+        taskId, sessionId: 'sess-b', lastSeq, excerpt: '进度正常',
+      });
+      expect(prog.payload).not.toHaveProperty('kind');
+    }
+    // 账本照常回填（丢弃不伤受理语义）
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', session_id: 'sess-b' });
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // 审计日志（§6 审计链——logger 形态）
 // ────────────────────────────────────────────────────────────────────────────
 

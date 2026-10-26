@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.1.3（2026-10-26）
+
+委派载荷 permissionTier 可选字段透传（M2.1 权限档位 HITL，评审 P1 裁定 (a)）：任务书 `DelegationTask.permissionTier` 增三值枚举 `readonly`/`sandbox`/`confirm`（缺省合法，0.1.2 载荷向后兼容）；hub `parseDelegationTask` 白名单收该字段 + 枚举校验——合法值随 `task.assigned` 定向透传目标节点，非法值剥除不抛（未知容忍先例 modelBinding，任务书其余字段照常受理）。修复 studio T10 委派链路档位被 hub 白名单剥除的断点。
+
 ## 0.1.2（2026-10-25）
 
 M2 分布式工作组定档（协议 1.2.0）：工作组内核——组 RPC（group.create/join/leave/list）+ leader 制 + `group.changed` 组内定向投递 + 成员离线广播收敛；快照存档与镜像两段式——workspace.snapshot HTTP 数据面上传（manifest 结构校验 + tar.gz ≤200MB + 校验和核对）与 `workspace.mirror` 受理即答 / `mirror.apply`→`mirror.receipt`→`mirror.result` 私有 wire 对账链（conflict 差异摘要确认，回执健壮性：伪造来源忽略 / 重复回执单次结算）；委派账本——delegate/cancel/list RPC + 状态机单点校验（`task.report` 私有 wire，pending/running/interrupted/done/failed/cancelled 迁移矩阵）+ 目标断连自动迁 interrupted + 续传窗口（interrupted→running 收）+ 审计日志；远程查看转发——view.workspace/files/messages/subscribe/unsubscribe 转发面 + `view.consent` 开关（默认 true / 断线清除回默认 / per-node 隔离）+ `view.tail`→`view.appended` 尾部定向（扇出 / 会话隔离 / 订阅随断开注销 / 存续期复检同组）；快照模型绑定可选段（`WorkspaceSnapshotConfig.modelBinding`——1.2.0 旧快照向后兼容，缺省合法）。已知限制（spec §9）：不做远端代发消息/远程写操作、文件树远程浏览、子节点反向配置推送（MC2）、委派编排/依赖图（单任务委派）、跨组路由/组间可见性、镜像增量合并（只做整体替换+差异摘要）、委派结果自动回收为本地产物（结果以会话消息流形态在查看面消费，拉取结果文件 M3+ 议）。

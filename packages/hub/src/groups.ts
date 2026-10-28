@@ -47,7 +47,8 @@ function groupRow(db: Database.Database, groupId: string): { id: string; name: s
     | undefined;
 }
 
-function isMember(db: Database.Database, groupId: string, nodeId: string): boolean {
+/** 组成员判定（M3.2 起导出：remote-view handleView 的 groupId 路径消费）。 */
+export function isMember(db: Database.Database, groupId: string, nodeId: string): boolean {
   return db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND node_id = ?').get(groupId, nodeId) !== undefined;
 }
 
@@ -76,8 +77,9 @@ function broadcastGroupChanged(
 
 /** leader-only 方法 → 载荷 groupId 提取器（db 供需查表回填的方法用）。映射先建全：
  *  task.cancel 按 taskId 查 delegations 回填（M2d T9）：未知 taskId 返 null 放行，
- *  由 handler 给 not_found。view 域六方法（M2e T13 回填）：payload 无 groupId，
- *  按 targetNodeId 归组——查「caller 为 leader 且 target 为成员」的组；查无
+ *  由 handler 给 not_found。view 域八方法（M2e T13 回填 + M3.2 两新方法）：载荷
+ *  可选 groupId 在场则优先（viewGroupExtractor——group.transfer 同模式），缺省按
+ *  targetNodeId 归组——查「caller 为 leader 且 target 为成员」的组；查无
  *  （非 leader / 不同组 / 载荷坏）返 null 放行，由 remote-view handler 兜底
  *  forbidden（同码同义，§3.3 防探测不细分）。
  */
@@ -109,6 +111,12 @@ const viewTargetGroup: LeaderOnlyExtractor = (p, db, callerNodeId) => {
   return commonGroupId(db, callerNodeId, targetNodeId) ?? null;
 };
 
+/** view 域提取器（M3.2 §2.2）：载荷可选 groupId 在场则优先（组存在性与 leader
+ *  身份由 checkGroupRole 后续校验——ghost groupId → not_found），缺省回落
+ *  viewTargetGroup 归组（commonGroupId 旧路径——1.2/1.3 调用者零变化）。 */
+const viewGroupExtractor: LeaderOnlyExtractor = (p, db, callerNodeId) =>
+  reqStr(p, 'groupId') ?? viewTargetGroup(p, db, callerNodeId);
+
 const LEADER_ONLY_METHODS: Record<string, LeaderOnlyExtractor> = {
   [RPC.group.transfer]: (p) => reqStr(p, 'groupId'),
   [RPC.workspace.mirror]: (p) => reqStr(p, 'groupId'),
@@ -131,12 +139,14 @@ const LEADER_ONLY_METHODS: Record<string, LeaderOnlyExtractor> = {
       | undefined;
     return row?.group_id ?? null;
   },
-  [RPC.view.workspace]: viewTargetGroup,
-  [RPC.view.sessions]: viewTargetGroup,
-  [RPC.view.messages]: viewTargetGroup,
-  [RPC.view.tasks]: viewTargetGroup,
-  [RPC.view.subscribe]: viewTargetGroup,
-  [RPC.view.unsubscribe]: viewTargetGroup,
+  [RPC.view.workspace]: viewGroupExtractor,
+  [RPC.view.sessions]: viewGroupExtractor,
+  [RPC.view.messages]: viewGroupExtractor,
+  [RPC.view.tasks]: viewGroupExtractor,
+  [RPC.view.subscribe]: viewGroupExtractor,
+  [RPC.view.unsubscribe]: viewGroupExtractor,
+  [RPC.view.workspaces]: viewGroupExtractor,
+  [RPC.view.files]: viewGroupExtractor,
 };
 
 /**

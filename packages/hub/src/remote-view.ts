@@ -1,13 +1,14 @@
 // hub 远程查看转发层（M2e spec 2026-10-24 §3.1「远程查看」/§3.2 view.appended/
-// §5.5 双层同意/§8 RF#1 + T13）——leader-only 六方法定向转发 + consent 内存态 +
-// 尾部订阅登记 + 断开双侧注销。
+// §5.5 双层同意/§8 RF#1 + T13；M3.2 增 workspaces/files 两方法与 groupId 路径）——
+// leader-only 八方法定向转发 + consent 内存态 + 尾部订阅登记 + 断开双侧注销。
 //
 // ▲ wire 约定（本任务定义；协议单源在协议包 src/remote-view.ts 的 VIEW_WIRE）：
 // 1) view.consent（节点 → hub，req 信封，hub 直接 res {ok:true} 确认）：
 //    payload={allowed:boolean}；节点 hello 后与开关变更时上行；hub 存内存态
 //    per-nodeId，默认 true（spec §5.5 默认开）；断线清除回默认 true——
 //    裁定 RM2-9：不残留陈旧 false，重连由节点重报覆盖。
-// 2) view.* 六方法（leader → hub → 目标节点）：hub 以 req 信封「原 method +
+// 2) view.* 八方法（leader → hub → 目标节点；M3.2 增 workspaces/files）：hub 以
+//    req 信封「原 method +
 //    新 id」转发目标，leader 的原始请求挂起；目标以 res 信封回（id=转发 id
 //    关联）——hub 按挂起请求表把结果透传 leader（ok 载荷等值 / 错误码保序——
 //    目标错误码在 RpcErrorCode 枚举内原码原文透传，未知码回 internal 兜底）。
@@ -32,7 +33,7 @@ import {
   type ViewAppendedEvent, type ViewMessage, type ViewTailPayload,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
-import { commonGroupId, type GroupHandlerContext, type RpcOutcome } from './groups';
+import { commonGroupId, isMember, type GroupHandlerContext, type RpcOutcome } from './groups';
 import { logger } from './logger';
 
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
@@ -130,11 +131,11 @@ export class RemoteViewRouter {
   }
 
   /**
-   * view.* 六方法统一入口（leader-only 与「leader 和 target 同组」由外围守卫提取器
+   * view.* 八方法统一入口（leader-only 与「leader 和 target 同组」由外围守卫提取器
    * 预校验；此处同款查询兜底覆盖提取器返 null 的全部情形）。校验序：载荷形态 →
-   * 同组（forbidden）→ consent（forbidden，unsubscribe 豁免）→ 定向转发（离线
-   * node_offline）→ 目标 res 透传。subscribe 成功后登记订阅；unsubscribe 本地
-   * 注销先行 + 尽力转发。
+   * 同组（forbidden；M3.2 起带 groupId 走 isMember 精确路径）→ consent（forbidden，
+   * unsubscribe 豁免）→ 定向转发（离线 node_offline）→ 目标 res 透传。subscribe
+   * 成功后登记订阅；unsubscribe 本地注销先行 + 尽力转发。
    */
   async handleView(ctx: GroupHandlerContext, method: string, payload: unknown): Promise<RpcOutcome> {
     const targetNodeId = optBoundedStr(reqStr(payload, 'targetNodeId'), NODE_ID_MAX);
@@ -147,7 +148,15 @@ export class RemoteViewRouter {
       return { ok: false, error: err('bad_request', 'sessionId 缺失或超长') };
     }
 
-    if (!commonGroupId(this.db, ctx.nodeId, targetNodeId)) {
+    // 同组校验双路径（M3.2 §2.2）：载荷带 groupId 时按该组精确判定 isMember(groupId,
+    // target)——组存在性与 leader 身份已由 checkGroupRole 提取器先行（groupId 优先
+    // 回填）；缺省回落 commonGroupId（「caller 为 leader 且 target 为成员」公共组，
+    // MC6 多组任意取旧——1.2/1.3 调用者零变化，歧义由显式 groupId 消除）。
+    const groupId = reqStr(payload, 'groupId');
+    const sameGroup = groupId !== null
+      ? isMember(this.db, groupId, targetNodeId)
+      : commonGroupId(this.db, ctx.nodeId, targetNodeId) !== undefined;
+    if (!sameGroup) {
       return { ok: false, error: err('forbidden', '仅组长可远程查看目标节点（需与其同组）') };
     }
 
@@ -276,7 +285,7 @@ export class RemoteViewRouter {
   }
 }
 
-/** 上行 res 分流判定：method 为 view.* 六方法（协议公开目录）即归本路由对账。 */
+/** 上行 res 分流判定：method 为 view.* 八方法（协议公开目录）即归本路由对账。 */
 export function isViewRpcMethod(method: string): boolean {
   return (Object.values(RPC.view) as readonly string[]).includes(method);
 }

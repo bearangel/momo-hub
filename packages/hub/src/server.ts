@@ -96,12 +96,14 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const app = fastify({ logger: false });
   void app.register(websocket);
   // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域四方法（M3.1 增
-  // task.answer）+ M2e 查看域八方法（六公开 view.* + 私有上行 view.consent/view.tail）。
+  // task.answer）+ M2e 查看域十方法（八公开 view.*〔M3.2 增 workspaces/files〕+
+  // 私有上行 view.consent/view.tail）。
   // workspace.snapshots/task.list 无组角色限制不进 LEADER_ONLY_METHODS 守卫直通；
-  // workspace.mirror/task.delegate/task.cancel/task.answer/view.* 六方法 leader-only
+  // workspace.mirror/task.delegate/task.cancel/task.answer/view.* 八方法 leader-only
   // 由守卫层校验（task.cancel/task.answer 提取器按 taskId 查 delegations 回填
-  // groupId——M2d T9 / M3.1 回填；view.* 提取器按 targetNodeId 查「leader 与 target
-  // 同组」——M2e T13 回填）；view.consent/view.tail 为节点上行（非 leader-only），不进守卫。
+  // groupId——M2d T9 / M3.1 回填；view.* 提取器载荷 groupId 优先、缺省按
+  // targetNodeId 查「leader 与 target 同组」——M2e T13 回填 + M3.2 groupId 路径）；
+  // view.consent/view.tail 为节点上行（非 leader-only），不进守卫。
   const viewHandler = (method: string): GroupHandler => (ctx, payload) => viewRouter.handleView(ctx, method, payload);
   const RPC_HANDLERS: Record<string, GroupHandler> = {
     ...GROUP_HANDLERS,
@@ -117,6 +119,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     [RPC.view.tasks]: viewHandler(RPC.view.tasks),
     [RPC.view.subscribe]: viewHandler(RPC.view.subscribe),
     [RPC.view.unsubscribe]: viewHandler(RPC.view.unsubscribe),
+    [RPC.view.workspaces]: viewHandler(RPC.view.workspaces),
+    [RPC.view.files]: viewHandler(RPC.view.files),
     [VIEW_WIRE.consent]: (ctx, payload) => viewRouter.handleConsent(ctx, payload),
     [VIEW_WIRE.tail]: (ctx, payload) => viewRouter.handleTail(ctx, payload),
   };
@@ -172,7 +176,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         if (env.kind === 'evt') return; // 上行 evt 忽略（M0 语义不变）
         if (env.kind === 'res') {
           // 上行 res 按 method 分流：task.report → 委派上报（M2d）；task.answer →
-          // 代答转发对账（M3.1，id=转发 id 关联）；view.* 六方法 → 查看转发对账
+          // 代答转发对账（M3.1，id=转发 id 关联）；view.* 八方法 → 查看转发对账
           // （M2e，id=转发 id 关联）；其余 → 镜像回执（M2c，唯一其余合法项）。
           // 未匹配（迟到/重复/伪造/未知 method）由各路由器静默忽略。
           // hello 前的 res 不可能有对账项，一并忽略。

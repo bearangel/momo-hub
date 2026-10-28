@@ -243,16 +243,16 @@ async function rawHub(snapshotMaxBytes?: number): Promise<{
 // ── 迁移（workspace_snapshots_meta——v3 组表同批余下表，spec §4 SQL 逐字）─────────
 
 describe('迁移：workspace_snapshots_meta', () => {
-  it('schema_version=8；表存在；重开幂等；(workspace_name, version) 库层唯一（C4 并发兜底）', () => {
+  it('schema_version=9；表存在；重开幂等；(workspace_name, version) 库层唯一（C4 并发兜底）', () => {
     const dir = mkdtempSync(join(tmpdir(), 'momo-hub-snap-mig-'));
     const d1: Database.Database = openHubDatabase(dir);
-    expect((d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('8');
+    expect((d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('9');
     expect(d1.prepare(
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_snapshots_meta'`,
     ).get()).toEqual({ name: 'workspace_snapshots_meta' });
     d1.close();
     const d2 = openHubDatabase(dir);
-    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('8');
+    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('9');
     d2.close();
 
     // 库层唯一键：同 workspace_name+version 二次插入必炸（409 兜底机制的根基）

@@ -1,6 +1,6 @@
-// protocol 1.2.0/1.3.0/1.4.0 工作组与远程代答/远端可见性契约测试（spec
-// 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
-// 2026-10-29 M3.2 §2.1）：
+// protocol 1.2.0/1.3.0/1.4.0/1.5.0 工作组与远程代答/远端可见性/资源生命周期契约测试
+// （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
+// 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -62,16 +62,17 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.4.0 与 1.1.0/1.2.0/1.3.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.4.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.4.0');
+describe('版本 1.5.0 与 1.1.0/1.2.0/1.3.0/1.4.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.5.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.5.0');
   });
 
-  it('1.1.0 ↔ 1.4.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.4.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.4.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.4.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.4.0')).toBe(false);
+  it('1.1.0 ↔ 1.5.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.5.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.5.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.5.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.5.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.5.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -613,6 +614,45 @@ describe('validateSnapshotManifest 好例', () => {
     const out = validateSnapshotManifest(validManifest());
     expect(out).not.toBeNull();
     expect(out?.config).not.toHaveProperty('modelBinding');
+  });
+});
+
+describe('validateSnapshotManifest resources[].version?（1.5.0 M3.4 B13）', () => {
+  it('三格之缺省：引用项不带 version → 合法且不落字段（1.4 旧 manifest 零变化）', () => {
+    const out = validateSnapshotManifest(validManifest());
+    expect(out?.resources[0]).toEqual({ type: 'agent', slug: 'coder-pro' });
+    expect(out?.resources[0]).not.toHaveProperty('version');
+  });
+
+  it('三格之在场：合法 version 透传保留（版本钉死——目标节点按该版本安装）', () => {
+    const m = validManifest();
+    m.resources[0] = { ...m.resources[0], version: '1.2.3' };
+    const out = validateSnapshotManifest(m);
+    expect(out?.resources[0]).toEqual({ type: 'agent', slug: 'coder-pro', version: '1.2.3' });
+  });
+
+  it('三格之非法：越字符集 / 空串 / 非字符串 → null（S1 白名单，version 拼下载路径同强度校验）', () => {
+    const base = validManifest();
+    expect(validateSnapshotManifest({ ...base, resources: [{ type: 'agent', slug: 'a', version: '1.0 x' }] })).toBeNull();
+    expect(validateSnapshotManifest({ ...base, resources: [{ type: 'agent', slug: 'a', version: '1.0.0/../x' }] })).toBeNull();
+    expect(validateSnapshotManifest({ ...base, resources: [{ type: 'agent', slug: 'a', version: '' }] })).toBeNull();
+    expect(validateSnapshotManifest({ ...base, resources: [{ type: 'agent', slug: 'a', version: 123 }] })).toBeNull();
+  });
+
+  it('剥除断言范围显式排除 version：已知透传字段不剥除，未知字段 extra 仍剥除', () => {
+    const base = validManifest();
+    const out = validateSnapshotManifest({
+      ...base,
+      resources: [{ type: 'agent', slug: 'coder-pro', version: '2.0.0', extra: 1 }],
+    });
+    expect(out?.resources[0]).toEqual({ type: 'agent', slug: 'coder-pro', version: '2.0.0' });
+    expect(out?.resources[0]).not.toHaveProperty('extra');
+  });
+
+  it('METHOD_REQUIRED_MINOR 无 M3.4 门槛登记：全表无 minor≥5 条目（本组全部为可选字段/事件，无需能力协商）', () => {
+    for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
+      expect(minor, `方法 ${method}`).toBeLessThan(5);
+    }
   });
 });
 

@@ -137,6 +137,7 @@ describe('类型与 HubCatalog round-trip（RM1-1）', () => {
   it('HubResourceMeta/HubCatalog JSON round-trip 结构不变', () => {
     const catalog: HubCatalog = {
       version: '1',
+      revision: 7,
       updatedAt: '2026-10-24T00:00:00.000Z',
       items: [validMeta()],
     };
@@ -146,7 +147,7 @@ describe('类型与 HubCatalog round-trip（RM1-1）', () => {
   });
 
   it('validateHubCatalog：合法目录归一化通过；items 空数组合法', () => {
-    const catalog: HubCatalog = { version: '1', updatedAt: '2026-10-24T00:00:00.000Z', items: [] };
+    const catalog: HubCatalog = { version: '1', revision: 3, updatedAt: '2026-10-24T00:00:00.000Z', items: [] };
     expect(validateHubCatalog(catalog)).toEqual(catalog);
     const withItem: HubCatalog = { ...catalog, items: [validMeta()] };
     expect(validateHubCatalog(withItem)).toEqual(withItem);
@@ -198,7 +199,27 @@ describe('类型与 HubCatalog round-trip（RM1-1）', () => {
 
   it('validateHubCatalog：未知顶层字段容忍', () => {
     const catalog = { ...{ version: '1', updatedAt: 't', items: [] }, nextField: true };
-    expect(validateHubCatalog(catalog)).toEqual({ version: '1', updatedAt: 't', items: [] });
+    expect(validateHubCatalog(catalog)).toEqual({ version: '1', revision: 0, updatedAt: 't', items: [] });
+  });
+});
+
+describe('HubCatalog.revision（1.5.0 M3.4 B10）', () => {
+  const base = { version: '1', updatedAt: 't', items: [] } as const;
+
+  it('在场：非负整数 → round-trip 保留', () => {
+    expect(validateHubCatalog({ ...base, revision: 42 })).toEqual({ ...base, revision: 42 });
+    expect(validateHubCatalog({ ...base, revision: 0 })).toEqual({ ...base, revision: 0 });
+  });
+
+  it('缺省：旧 hub（1.4）不发送 → 容错归一 0（字段新增非破坏，studio 消费侧防御）', () => {
+    expect(validateHubCatalog({ ...base })).toEqual({ ...base, revision: 0 });
+  });
+
+  it('非法：字符串 / 负数 / 非整数 / NaN → null', () => {
+    expect(validateHubCatalog({ ...base, revision: '7' })).toBeNull();
+    expect(validateHubCatalog({ ...base, revision: -1 })).toBeNull();
+    expect(validateHubCatalog({ ...base, revision: 1.5 })).toBeNull();
+    expect(validateHubCatalog({ ...base, revision: Number.NaN })).toBeNull();
   });
 });
 
@@ -219,5 +240,14 @@ describe('EVT 目录扩展（spec M1 §3.3）', () => {
       at: 1_700_000_000_000,
     };
     expect(Object.keys(evt).sort()).toEqual(['at', 'author', 'name', 'slug', 'type', 'version']);
+  });
+
+  it('resourceUnpublished 常量稳定（1.5.0 M3.4 B12 新增）', () => {
+    expect(EVT.resourceUnpublished).toBe('resource.unpublished');
+  });
+
+  it('ResourceUnpublishedEvent 形状 {slug, by, at}', () => {
+    const evt = { slug: 'coder-pro', by: 'workstation-1', at: 1_700_000_000_000 };
+    expect(Object.keys(evt).sort()).toEqual(['at', 'by', 'slug']);
   });
 });

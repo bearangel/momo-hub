@@ -10,7 +10,7 @@ import { PassThrough, Readable } from 'node:stream';
 import {
   EVT, PROTOCOL_VERSION, isValidHubSlug, isValidHubVersion, validateHubManifest,
   type HubCatalog, type HubPublishManifest, type HubResourceMeta, type HubResourceType,
-  type ResourcePublishedEvent,
+  type ResourcePublishedEvent, type ResourceUnpublishedEvent,
 } from 'momo-hub-protocol';
 import { BlobTooLargeError, openBlob, saveBlobStream } from './blobs';
 import { verifyDeviceToken } from './auth';
@@ -229,6 +229,22 @@ interface CatalogVersionRow {
   published_at: number;
 }
 
+// ── 目录修订号（M3.4 B10，hub_meta.catalog_revision）─────────────────────────
+// publish / unpublish 同事务单调 +1；catalog 响应携带。hub_meta 表 v1 已存在，
+// v7 迁移只 INSERT 初值 '1'（键在场由迁移保证，读侧缺行兜底同初值语义）。
+
+/** 读当前目录修订号。 */
+function readCatalogRevision(db: Database.Database): number {
+  const row = db.prepare(`SELECT value FROM hub_meta WHERE key = 'catalog_revision'`)
+    .get() as { value: string } | undefined;
+  return row ? Number(row.value) : 1;
+}
+
+/** 目录修订号 +1（必须在调用方事务内执行——与墓碑/版本行变更同事务原子）。 */
+function bumpCatalogRevision(db: Database.Database): void {
+  db.prepare(`UPDATE hub_meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'catalog_revision'`).run();
+}
+
 /** 请求 origin（downloadUrl 组装用，RM1-11 信任收敛）：
  *  - 配置了 publicOrigin（运维显式声明的公网 origin）→ 独占使用，不看任何请求头
  *  - 未配置 → 用请求自身的协议 + Host 头（直暴形态）
@@ -336,7 +352,12 @@ export function compareVersions(a: string, b: string): number {
   return comparePrerelease(va.pre, vb.pre);
 }
 
-/** 组装 hub 目录（spec §3.2 HubCatalog；v0.1.5 M2.3 T2b latest semver 语义）。
+/** 组装 hub 目录（spec §3.2 HubCatalog；v0.1.5 M2.3 T2b latest semver 语义；
+ *  M3.4 增墓碑过滤与修订号）。
+ *  - 墓碑过滤：unpublished_at IS NOT NULL（已撤回）的资源不出目录（版本行/blob 不删，
+ *    下载端点天然保留历史版本——roadmap 裁定）
+ *  - revision：hub_meta 持久化修订号（publish/unpublish 同事务 +1；非 updatedAt
+ *    现打时戳——那是每次请求都变的展示值，不是修订号）
  *  - latest 判定：per-slug 取 versions 全集【semver max】（H1：乱序发布低版本不回退 latest）。
  *    不再读 resources.latest_version 列——该列降级为内部「最近发布」记录（发布 upsert 照写，
  *    零 schema 变更），目录输出与它脱钩，旧数据（列持低值）天然自愈。
@@ -349,6 +370,7 @@ export function buildHubCatalog(db: Database.Database, origin: string): HubCatal
   const itemRows = db.prepare(`
     SELECT slug, type, name, author, description, readme, tags_json, category, icon_emoji
     FROM resources
+    WHERE unpublished_at IS NULL
   `).all() as CatalogItemRow[];
 
   // 版本行全量（一次查询，按 slug 分组——避免逐项 N+1），入序 published_at 新→旧作同分兜底
@@ -392,7 +414,7 @@ export function buildHubCatalog(db: Database.Database, origin: string): HubCatal
   }
   // 目录按发布时间倒序（新的在前）——同毫秒以 slug 兜底，保证顺序确定
   items.sort((a, b) => (b.publishedAt - a.publishedAt) || a.slug.localeCompare(b.slug));
-  return { version: PROTOCOL_VERSION, updatedAt: new Date().toISOString(), items };
+  return { version: PROTOCOL_VERSION, revision: readCatalogRevision(db), updatedAt: new Date().toISOString(), items };
 }
 
 export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRouteOpts): void {
@@ -575,6 +597,9 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     const insertVersion = db.prepare(`
       INSERT INTO resource_versions (slug, version, checksum, size_bytes, published_by, published_at)
       VALUES (?, ?, ?, ?, ?, ?)`);
+    // M3.4：清墓碑（同 slug 重发布恢复目录可见）+ revision++——与版本行落库同事务原子。
+    // 新 slug 时清墓碑影响 0 行（INSERT 未置 unpublished_at，天然可见），无害。
+    const clearTombstone = db.prepare('UPDATE resources SET unpublished_at = NULL WHERE slug = ?');
     const tx = db.transaction(() => {
       upsertResource.run({
         slug: manifest.slug,
@@ -589,6 +614,8 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
         latest_version: manifest.version,
       });
       insertVersion.run(manifest.slug, manifest.version, checksum, sizeBytes, node.name, publishedAt);
+      clearTombstone.run(manifest.slug);
+      bumpCatalogRevision(db);
     });
     try {
       tx();
@@ -628,5 +655,53 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     // 尾随 part 排干：package 之后若还有 part，未消费会让 busboy 背压停读 → 连接悬挂
     void drainParts();
     return res;
+  });
+
+  // 资源撤回（spec M3.4 §2.2.3）：Bearer 鉴权，与 publish 同信任模型——任何注册节点
+  // 可撤（leader-only 治理记为设计边界延后）。body {slug}。
+  // - 404：无此资源（resources 表无该 slug 行）
+  // - 幂等：已撤回再撤 = 200 且无状态变化（不 bump revision、不广播）
+  // - 效果 = 墓碑置位 + revision++（同事务）+ resource.unpublished 广播
+  // - 不删版本行/blob：历史版本下载端点保留（roadmap 裁定）
+  app.post('/resources/unpublish', async (req, reply) => {
+    const { db } = opts;
+    const auth = req.headers.authorization ?? '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    const node = token ? verifyDeviceToken(db, token) : null;
+    if (!node) return reply.code(401).send({ error: 'unauthorized' });
+
+    const body = req.body as { slug?: unknown };
+    if (typeof body?.slug !== 'string' || body.slug.length > SLUG_MAX || !isValidHubSlug(body.slug)) {
+      return reply.code(400).send({ error: 'invalid_slug' });
+    }
+    const slug = body.slug;
+    const exists = db.prepare('SELECT 1 FROM resources WHERE slug = ?').get(slug);
+    if (exists === undefined) return reply.code(404).send({ error: 'not_found' });
+
+    const at = Date.now();
+    // 条件 UPDATE 自带幂等：墓碑已置位（unpublished_at IS NOT NULL）→ 0 行受影响 → 不 bump
+    const setTombstone = db.prepare(
+      'UPDATE resources SET unpublished_at = ? WHERE slug = ? AND unpublished_at IS NULL');
+    const tx = db.transaction((): boolean => {
+      const r = setTombstone.run(at, slug);
+      if (r.changes === 0) return false; // 幂等路径：已撤回，无状态变化
+      bumpCatalogRevision(db);
+      return true;
+    });
+    const newlyUnpublished = tx();
+
+    // 广播失败不得推翻已提交的撤回（DB 已落库）——只记日志（publish 同款纪律）
+    if (newlyUnpublished) {
+      try {
+        opts.registry.broadcast(EVT.resourceUnpublished, {
+          slug,
+          by: node.name,
+          at,
+        } satisfies ResourceUnpublishedEvent);
+      } catch (err) {
+        logger.warn('撤回事件广播失败（撤回已入库）', { slug, err });
+      }
+    }
+    return reply.send({ ok: true, slug, revision: readCatalogRevision(db) });
   });
 }

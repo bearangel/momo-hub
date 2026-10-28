@@ -72,6 +72,11 @@ const MIGRATIONS: readonly string[] = [
    ALTER TABLE delegations ADD COLUMN answer_decision TEXT;
    ALTER TABLE delegations ADD COLUMN answer_message TEXT;
    ALTER TABLE delegations ADD COLUMN answered_at INTEGER`,
+  // v7（M3.4 资源生命周期，spec §2.2.1）：resources 墓碑列（撤回 = 目录不可见，
+  // 版本行/blob 不删——历史版本下载保留）+ 目录修订号初值（publish/unpublish 同事务
+  // 单调 +1）。hub_meta 表 v1 已存在——此处只 INSERT catalog_revision 键，勿重建表。
+  `ALTER TABLE resources ADD COLUMN unpublished_at INTEGER;
+   INSERT INTO hub_meta (key, value) VALUES ('catalog_revision', '1') ON CONFLICT(key) DO NOTHING`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

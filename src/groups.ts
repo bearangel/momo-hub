@@ -151,10 +151,13 @@ export interface SnapshotManifest {
   config: WorkspaceSnapshotConfig;
 }
 
-/** 资源引用条目：M1 资源仓 slug（内嵌 custom 定义走 config.agentMembers，不占引用位）。 */
+/** 资源引用条目：M1 资源仓 slug（内嵌 custom 定义走 config.agentMembers，不占引用位）。
+ *  version?（1.5.0 B13）：版本钉死——在场时目标节点按该版本安装（而非 latest）；
+ *  缺省合法（1.4 旧 manifest 零变化，仍走 latest 语义）。 */
 export interface SnapshotResourceRef {
   type: HubResourceType;
   slug: string;
+  version?: string;
 }
 
 /** 配置段：§5.2 全清单（agent 定义/成员/团队/MCP/skill/插件/provider 引用/偏好）。 */
@@ -252,7 +255,12 @@ function resourceRefsFrom(raw: unknown): SnapshotResourceRef[] | null {
   for (const item of raw) {
     if (!isRecord(item) || !isResourceType(item.type)) return null;
     if (!isBoundedSlug(item.slug)) return null;
-    out.push({ type: item.type, slug: item.slug });
+    // version?（1.5.0）：缺省合法（1.4 旧 manifest 零变化）；在场必须过 S1 白名单
+    // （version 会拼进下载路径，与顶层 version 同强度校验）。
+    if (item.version !== undefined && (!isStr(item.version) || !isValidHubVersion(item.version))) return null;
+    const ref: SnapshotResourceRef = { type: item.type, slug: item.slug };
+    if (item.version !== undefined) ref.version = item.version;
+    out.push(ref);
   }
   return out;
 }

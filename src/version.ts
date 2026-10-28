@@ -1,4 +1,8 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.5.0（M3.4 资源生命周期）：快照引用 SnapshotResourceRef.version?（B13 版本钉死，可选
+// 透传）+ 目录 HubCatalog.revision（B10 持久化修订号）+ resource.unpublished 撤回事件（B12）
+// ——全部为可选字段/事件，无新 RPC 方法、无 METHOD_REQUIRED_MINOR 门槛登记（事件与字段对
+// 旧节点天然宽容：未知事件忽略、未知字段剥除），major 不动。
 // 1.4.0（M3.2 远端可见性）：view.workspaces（远端空间清单）/ view.files（只读
 // 文件树）两 RPC + 全部 view.* 请求可选 groupId（缺省 commonGroupId 旧路径）+
 // view.files 限额常量——全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
@@ -7,7 +11,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.4.0';
+export const PROTOCOL_VERSION = '1.5.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

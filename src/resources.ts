@@ -28,6 +28,12 @@ export interface HubResourceMeta {
 
 export interface HubCatalog {
   version: string;
+  /**
+   * 目录持久化修订号（1.5.0 M3.4 B10）：每次 publish/unpublish 同事务单调 +1。
+   * 必填新字段——本 hub（1.5+）恒发送；旧 hub（1.4）不会发送它，消费方容错缺省 0
+   * 且不以此判变（仅展示/日志，权威失效仍靠事件 + 全量拉取）。
+   */
+  revision: number;
   updatedAt: string;
   items: HubResourceMeta[];
 }
@@ -147,17 +153,22 @@ function validateHubMeta(raw: unknown): HubResourceMeta | null {
   };
 }
 
-/** HubCatalog 结构校验（裁定 RM1-1）：顶层 version/updatedAt/items +
- *  items 逐项全字段校验。非法返回 null（T9 catalog 消费侧防御）。 */
+/** HubCatalog 结构校验（裁定 RM1-1）：顶层 version/revision/updatedAt/items +
+ *  items 逐项全字段校验。非法返回 null（T9 catalog 消费侧防御）。
+ *  revision（1.5.0）：旧 hub（1.4）不发送 → 容错归一为 0（字段新增非破坏）；
+ *  在场则必须是非负整数（修订号计数器语义）。 */
 export function validateHubCatalog(raw: unknown): HubCatalog | null {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
   const c = raw as Record<string, unknown>;
   if (!isStr(c.version) || !isStr(c.updatedAt) || !Array.isArray(c.items)) return null;
+  if (c.revision !== undefined
+    && (typeof c.revision !== 'number' || !Number.isInteger(c.revision) || c.revision < 0)) return null;
+  const revision = c.revision ?? 0;
   const items: HubResourceMeta[] = [];
   for (const item of c.items) {
     const meta = validateHubMeta(item);
     if (meta === null) return null;
     items.push(meta);
   }
-  return { version: c.version, updatedAt: c.updatedAt, items };
+  return { version: c.version, revision, updatedAt: c.updatedAt, items };
 }

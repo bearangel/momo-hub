@@ -42,6 +42,9 @@ METHOD_REQUIRED_MINOR[RPC.task.answer] = 3;
 // 覆盖同模式）——1.3 客户端调它由分发守卫回 unsupported_method{method,
 // requiredMinor:4} 可读降级；既有 view 六方法仍为基线 2（groupId 可选字段
 // 缺省不触发门槛，旧调用零变化）。
+// M3.4（1.5.0）：无新 RPC 方法、无门槛登记——本组全部为可选字段/事件
+// （SnapshotResourceRef.version? / HubCatalog.revision / resource.unpublished），
+// 对旧节点天然宽容（未知事件忽略、未知字段剥除），无需能力协商。
 METHOD_REQUIRED_MINOR[RPC.view.workspaces] = 4;
 METHOD_REQUIRED_MINOR[RPC.view.files] = 4;
 

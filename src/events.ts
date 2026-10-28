@@ -7,6 +7,8 @@ export const EVT = {
   nodeOnline: 'node.online',
   nodeOffline: 'node.offline',
   resourcePublished: 'resource.published',
+  // M3.4（1.5.0）新增：资源撤回（目录不可见，历史版本下载保留）
+  resourceUnpublished: 'resource.unpublished',
   // M2（1.2.0）新增九事件（spec 2026-10-24 M2 §3.2）
   groupChanged: 'group.changed',
   taskAssigned: 'task.assigned',
@@ -33,6 +35,15 @@ export interface ResourcePublishedEvent {
   name: string;
   version: string;
   author: string;
+  at: number;
+}
+
+/** resource.unpublished（1.5.0 M3.4 B12）：撤回成功后广播全部在线节点——
+ *  目录过滤墓碑项、已装节点不受影响、历史版本下载端点保留。
+ *  by = 执行撤回的鉴权节点名（信任根在 hub，与 publish 的 author 同口径）。 */
+export interface ResourceUnpublishedEvent {
+  slug: string;
+  by: string;
   at: number;
 }
 

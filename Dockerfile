@@ -12,7 +12,9 @@ RUN pnpm build
 
 FROM node:24-alpine
 WORKDIR /app
-ENV NODE_ENV=production MOMO_HUB_DATA_DIR=/data
+# MOMO_HUB_HOST=0.0.0.0：容器内必须监听全部网卡，宿主端口映射（-p）才能转发进来
+# （宿主直接部署的默认回环 127.0.0.1 不适用于容器网络命名空间）
+ENV NODE_ENV=production MOMO_HUB_DATA_DIR=/data MOMO_HUB_HOST=0.0.0.0
 COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages/hub/node_modules ./packages/hub/node_modules

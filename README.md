@@ -21,6 +21,15 @@ MOMO_HUB_PORT=8787 MOMO_HUB_DATA_DIR=~/.momo-hub node packages/hub/dist/index.js
 
 启动成功后横幅会打印三行：监听地址、hub id（节点标识）与加入凭证（enrollment token）。`GET /health` 可探活，返回 `{"ok":true,"hubId":"…"}`。
 
+默认只监听回环地址 `127.0.0.1`（仅本机可接入）。需要跨主机接入时显式配置监听地址：
+
+```bash
+MOMO_HUB_HOST=0.0.0.0   # 监听全部网卡（启动日志会 WARN 提示跨主机接入风险）
+MOMO_HUB_HOST=192.168.1.10  # 或指定网卡 IP / 主机名；非法值回退 127.0.0.1 并 WARN
+```
+
+端口由 `MOMO_HUB_PORT` 配置（默认 8787），行为不变。
+
 ### Docker 运行
 
 ```bash
@@ -40,7 +49,7 @@ example.com {
 }
 ```
 
-momo-hub 自身只监听 HTTP（默认 `0.0.0.0:8787`），TLS 终结交给反代。
+momo-hub 自身只监听 HTTP（默认 `127.0.0.1:8787`；反代部署时设 `MOMO_HUB_HOST=0.0.0.0` 让宿主网卡可达），TLS 终结交给反代。
 
 反代后 hub 看到的仍是内网 HTTP，catalog 里的下载地址默认按请求的 Host 拼——要让 studio 拿到公网 https 地址，配置公网 origin：
 

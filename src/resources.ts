@@ -11,7 +11,7 @@ export interface HubResourceMeta {
   slug: string;
   type: HubResourceType;
   name: string;
-  version: string; // 最新版本
+  version: string; // 最新版本（v0.1.5 起 = versions 全集 semver 最大，非「最近发布」）
   author: string; // 发布节点名
   description: string;
   readme: string;
@@ -23,7 +23,7 @@ export interface HubResourceMeta {
   checksum: string; // sha256 hex，强制非空（C2）
   sizeBytes: number;
   publishedAt: number;
-  versions: string[]; // 全部版本号，新→旧
+  versions: string[]; // 全部版本号，semver 降序（最大在前；v0.1.5 前为发布时序新→旧）
 }
 
 export interface HubCatalog {

@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.1.5（2026-10-28）
+
+资源目录 latest 语义 semver 化（M2.3 T2b / 裁定书 p1-0 H1/H2，零协议字段与 schema 变更）：`buildHubCatalog` 的 per-slug latest 由「最近发布（时序）」改为 versions 全集 **semver max**——乱序发布低版本（2.0.0 后发 1.5.0）不再回退 latest 与 downloadUrl；`versions` 数组改 semver 降序（保持 `versions[0] == version` 不变式，同分兜底发布时序新→旧）；checksum/sizeBytes/publishedAt 取 semver max 版本行。hub 内私有 `compareVersions`（数值段比较防 '10'<'2' 字典序陷阱 / 缺段容忍 1.0==1.0.0 / 非法段按 0 / 预发布低于正式版 / build metadata 忽略；studio 侧 T2 另有单源镜像，双仓语义一致由 studio 契约测试锁）。`resources.latest_version` 列与发布 upsert **不动**（降级为内部「最近发布」记录，旧数据天然自愈）；协议包 `HubResourceMeta.version/versions` 注释语义随更（RM-M23-1 轻回报）。
+
 ## 0.1.4（2026-10-26）
 
 委派进度 kind 可选字段透传（M2.1 T11b 等待信号）：进度段 `TaskReportProgress.kind` 与事件 `TaskProgressEvent.kind` 增可选单值枚举 `'waiting-input'`（缺省合法，0.1.3 载荷向后兼容）——目标节点上报「agent 正等待用户确认（写授权卡等）」时随进度拍直达 leader 推送面（迁移拍与同态进度拍均透传），leader 看板据此切「等待节点确认」态。hub `parseReportPayload` 白名单收该字段 + 枚举校验，非法值剥除不抛（先例 permissionTier v0.1.3/modelBinding），修复 studio T11 委派链路 kind 被 hub 白名单剥离的断点。

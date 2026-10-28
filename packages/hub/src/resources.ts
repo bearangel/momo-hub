@@ -205,7 +205,8 @@ export async function collectManifestAndPayload(
 // 资源目录与下载（spec 2026-10-24 M1 §3.1/§3.2 + T6 对齐口径）
 // ────────────────────────────────────────────────────────────────────────────
 
-/** 目录项来源行：resources JOIN「最新发布」版本行（LEFT JOIN——缺版本行则该项不成项）。 */
+/** 目录项来源行：resources 表元数据列（v0.1.5 起 latest 判定与该表 latest_version 列脱钩——
+ *  列降级为内部「最近发布」记录，目录 latest 改为 versions 全集 semver max，见 buildHubCatalog）。 */
 interface CatalogItemRow {
   slug: string;
   type: HubResourceType;
@@ -216,11 +217,16 @@ interface CatalogItemRow {
   tags_json: string;
   category: string;
   icon_emoji: string;
-  latest_version: string;
-  checksum: string | null;
-  size_bytes: number | null;
-  published_by: string | null;
-  published_at: number | null;
+}
+
+/** 版本行全量来源（目录 latest/versions 的唯一数据面，v0.1.5）。 */
+interface CatalogVersionRow {
+  slug: string;
+  version: string;
+  checksum: string;
+  size_bytes: number;
+  published_by: string;
+  published_at: number;
 }
 
 /** 请求 origin（downloadUrl 组装用，RM1-11 信任收敛）：
@@ -271,40 +277,105 @@ function parseTags(tagsJson: string): string[] {
   }
 }
 
-/** 组装 hub 目录（spec §3.2 HubCatalog）。
- *  - items：resources JOIN「最近发布」的版本行（latest_version 存的就是最近一次发布的版本）
- *  - versions：该 slug 的全部版本号，新→旧（published_at 倒序，同毫秒以 rowid 兜底）
+// ── semver 比较（v0.1.5 T2b hub 私有实现；M2.3 裁定书 p1-0 §4.2）─────────────
+// studio 侧 T2 另有单源镜像实现——双仓不共享代码（跨仓零依赖），语义一致性由
+// studio 契约测试锁。宽松容忍策略（对齐 S1 VERSION_PATTERN 宽超集的现实数据）：
+// 数值段比较（防 '10'<'2' 字典序陷阱）/ 缺段按 0（1.0 == 1.0.0）/ 非法段按 0
+// （'1.x.0' == '1.0.0'）/ 预发布低于正式版（1.0.0-alpha < 1.0.0）/ build metadata 忽略。
+
+/** 拆出 build metadata（+）与预发布（-）：比较只看主段与预发布标识。 */
+function splitVersion(v: string): { main: string[]; pre: string | null } {
+  const noBuild = v.split('+', 1)[0]!;
+  const dash = noBuild.indexOf('-');
+  return dash >= 0
+    ? { main: noBuild.slice(0, dash).split('.'), pre: noBuild.slice(dash + 1) }
+    : { main: noBuild.split('.'), pre: null };
+}
+
+/** 数值段解析：缺段/非纯数字段按 0（宽松容忍，不抛）。 */
+function numericSegment(seg: string | undefined): number {
+  if (seg === undefined || !/^[0-9]+$/.test(seg)) return 0;
+  return Number(seg);
+}
+
+/** 预发布标识符比较（semver 优先级规则）：逐标识符——纯数值者数值比较且低于字母标识符，
+ *  字母标识符 ASCII 字典序；前缀全等者短的低。 */
+function comparePrerelease(a: string, b: string): number {
+  const idsA = a.split('.');
+  const idsB = b.split('.');
+  const len = Math.max(idsA.length, idsB.length);
+  for (let i = 0; i < len; i++) {
+    const x = idsA[i];
+    const y = idsB[i];
+    if (x === undefined) return -1;
+    if (y === undefined) return 1;
+    if (x === y) continue;
+    const nx = /^[0-9]+$/.test(x);
+    const ny = /^[0-9]+$/.test(y);
+    if (nx && ny) return Number(x) < Number(y) ? -1 : 1;
+    if (nx !== ny) return nx ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  return 0;
+}
+
+/** semver 比较：a < b 负 / a > b 正 / 相等 0。语义契约见块首注释。 */
+export function compareVersions(a: string, b: string): number {
+  const va = splitVersion(a);
+  const vb = splitVersion(b);
+  const len = Math.max(va.main.length, vb.main.length);
+  for (let i = 0; i < len; i++) {
+    const sa = numericSegment(va.main[i]);
+    const sb = numericSegment(vb.main[i]);
+    if (sa !== sb) return sa < sb ? -1 : 1;
+  }
+  // 主段全等：无预发布 > 有预发布（semver 优先级）
+  if (va.pre === null && vb.pre === null) return 0;
+  if (va.pre === null) return 1;
+  if (vb.pre === null) return -1;
+  return comparePrerelease(va.pre, vb.pre);
+}
+
+/** 组装 hub 目录（spec §3.2 HubCatalog；v0.1.5 M2.3 T2b latest semver 语义）。
+ *  - latest 判定：per-slug 取 versions 全集【semver max】（H1：乱序发布低版本不回退 latest）。
+ *    不再读 resources.latest_version 列——该列降级为内部「最近发布」记录（发布 upsert 照写，
+ *    零 schema 变更），目录输出与它脱钩，旧数据（列持低值）天然自愈。
+ *  - items：meta 取 semver max 版本行（checksum/sizeBytes/publishedAt/downloadUrl 版本段）
+ *  - versions：该 slug 全部版本号，semver 降序（H2，保持 versions[0]==version 不变式）；
+ *    semver 同分兜底 published_at 新→旧（Array.sort 稳定，入序已是该序）
  *  - downloadUrl：按请求 origin 拼绝对地址（反代场景天然正确）
  *  - author 直映射 resources.author（= 鉴权节点名，R-M1-8）；verificationStatus 恒 'unverified'（表无该列） */
 export function buildHubCatalog(db: Database.Database, origin: string): HubCatalog {
   const itemRows = db.prepare(`
-    SELECT r.slug, r.type, r.name, r.author, r.description, r.readme, r.tags_json, r.category,
-           r.icon_emoji, r.latest_version,
-           v.checksum, v.size_bytes, v.published_by, v.published_at
-    FROM resources r
-    LEFT JOIN resource_versions v ON v.slug = r.slug AND v.version = r.latest_version
+    SELECT slug, type, name, author, description, readme, tags_json, category, icon_emoji
+    FROM resources
   `).all() as CatalogItemRow[];
 
-  // versions：全量版本号新→旧（一次查询全取，按 slug 分组——避免逐项 N+1）
+  // 版本行全量（一次查询，按 slug 分组——避免逐项 N+1），入序 published_at 新→旧作同分兜底
   const versionRows = db.prepare(
-    'SELECT slug, version FROM resource_versions ORDER BY published_at DESC, rowid DESC',
-  ).all() as Array<{ slug: string; version: string }>;
-  const versionsBySlug = new Map<string, string[]>();
+    'SELECT slug, version, checksum, size_bytes, published_by, published_at FROM resource_versions ORDER BY published_at DESC, rowid DESC',
+  ).all() as CatalogVersionRow[];
+  const versionsBySlug = new Map<string, CatalogVersionRow[]>();
   for (const row of versionRows) {
     const list = versionsBySlug.get(row.slug);
-    if (list) list.push(row.version);
-    else versionsBySlug.set(row.slug, [row.version]);
+    if (list) list.push(row);
+    else versionsBySlug.set(row.slug, [row]);
+  }
+  for (const list of versionsBySlug.values()) {
+    list.sort((x, y) => compareVersions(y.version, x.version)); // 降序：semver max 落在 [0]
   }
 
   const items: HubResourceMeta[] = [];
   for (const row of itemRows) {
-    // 最新版本行缺失（数据不一致）→ 该项不成项（无 checksum/sizeBytes 不可用）
-    if (row.checksum === null || row.size_bytes === null || row.published_at === null) continue;
+    const versions = versionsBySlug.get(row.slug);
+    // 版本行缺失（数据不一致）→ 该项不成项（无 checksum/sizeBytes 不可用）
+    if (versions === undefined || versions.length === 0) continue;
+    const latest = versions[0]!;
     items.push({
       slug: row.slug,
       type: row.type,
       name: row.name,
-      version: row.latest_version,
+      version: latest.version,
       author: row.author,
       description: row.description,
       readme: row.readme,
@@ -312,11 +383,11 @@ export function buildHubCatalog(db: Database.Database, origin: string): HubCatal
       category: row.category,
       iconEmoji: row.icon_emoji,
       verificationStatus: 'unverified',
-      downloadUrl: `${origin}/resources/${row.slug}/${row.latest_version}/download`,
-      checksum: row.checksum,
-      sizeBytes: row.size_bytes,
-      publishedAt: row.published_at,
-      versions: versionsBySlug.get(row.slug) ?? [row.latest_version],
+      downloadUrl: `${origin}/resources/${row.slug}/${latest.version}/download`,
+      checksum: latest.checksum,
+      sizeBytes: latest.size_bytes,
+      publishedAt: latest.published_at,
+      versions: versions.map((v) => v.version),
     });
   }
   // 目录按发布时间倒序（新的在前）——同毫秒以 slug 兜底，保证顺序确定

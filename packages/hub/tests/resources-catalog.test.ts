@@ -1,6 +1,6 @@
 // hub 资源目录与下载端点契约锁（spec 2026-10-24 M1 §3.1/§3.2/§3.3/§5 + T6 对齐口径）——
 // 真实 listen + 真 fetch + 真 ws（无 mock）：
-// ① publish 两个版本 → catalog 字段逐项断言（latest_version / versions 新→旧 /
+// ① publish 两个版本 → catalog 字段逐项断言（latest（semver max，v0.1.5）/ versions 降序 /
 //    downloadUrl 按请求 origin 组装 / checksum / sizeBytes / publishedAt / author /
 //    verificationStatus）+ catalog 整体过 validateHubCatalog（协议单源校验）
 // ② download 流 sha256 复算 == X-Checksum-Sha256 头 == DB 值，X-Published-By == published_by
@@ -205,11 +205,11 @@ describe('GET /resources/catalog', () => {
     expect(meta.verificationStatus).toBe('unverified');
     // author 直映射 resources.author（= 鉴权节点名，R-M1-8）
     expect(meta.author).toBe('publisher-node');
-    // latest = 最近发布（时序）
+    // latest = semver max（本用例发布序递增，恰为最近发布版；乱序语义锁见 resources-latest-semver.test.ts）
     expect(meta.version).toBe('2.0.0');
-    // versions 新→旧
+    // versions semver 降序
     expect(meta.versions).toEqual(['2.0.0', '1.0.0']);
-    // checksum / sizeBytes 取最新版本行（服务端自算值）
+    // checksum / sizeBytes 取 semver max 版本行（服务端自算值）
     const v2 = versionRow('catalog-res', '2.0.0');
     expect(meta.checksum).toBe(sha256(PAYLOAD_V2));
     expect(meta.checksum).toBe(v2?.['checksum']);

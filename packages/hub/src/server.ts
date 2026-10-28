@@ -10,7 +10,8 @@ import os from 'node:os';
 import path from 'node:path';
 import type { WebSocket } from 'ws';
 import {
-  EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, VIEW_WIRE, encodeEnvelope, isCompatible, parseEnvelope,
+  EVT, METHOD_REQUIRED_MINOR, PROTOCOL_VERSION, RPC, TASK_WIRE, VIEW_WIRE, encodeEnvelope,
+  isCompatible, minorOf, parseEnvelope,
   type HelloReq, type RpcErrorPayload,
 } from 'momo-hub-protocol';
 import type { HubIdentity } from './identity';
@@ -60,7 +61,14 @@ function deriveDataDir(db: Database.Database): string {
 // 会话自持有连接：conn 只认本 socket 那一条 NodeConn。
 // 绝不回注册表按 nodeId 反查——同 nodeId 并存两条连接时（重连未摘旧的），
 // 反查拿到的是「最后一条」连接，旧连接的 pong/心跳标记会串到新连接上造成假杀。
-interface Session { nodeId: string; nodeName: string; helloDone: boolean; conn: NodeConn | null }
+interface Session {
+  nodeId: string;
+  nodeName: string;
+  helloDone: boolean;
+  conn: NodeConn | null;
+  /** hello 上报的对端协议版本（M3.0 能力协商：分发层 minor 门槛守卫的判定输入；内存态，不落库）。 */
+  peerProtoVer: string;
+}
 
 export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const { db, identity } = opts;
@@ -146,7 +154,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         return;
       }
 
-      const session: Session = { nodeId: node.nodeId, nodeName: node.name, helloDone: false, conn: null };
+      const session: Session = { nodeId: node.nodeId, nodeName: node.name, helloDone: false, conn: null, peerProtoVer: '' };
       const helloTimer = setTimeout(() => socket.close(4403, 'hello_timeout'), helloTimeoutMs);
 
       const sendRes = (id: string, method: string, ok: boolean, payload: unknown): void => {
@@ -184,6 +192,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             }
             clearTimeout(helloTimer);
             session.helloDone = true;
+            session.peerProtoVer = ver;
             // 注册表条目与会话持有的是同一个 NodeConn 引用：
             // ka tick / pong 只经 session.conn 改 alive，不经注册表反查。
             const conn: NodeConn = { nodeId: session.nodeId, nodeName: session.nodeName, ws: socket, alive: true };
@@ -209,6 +218,20 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             const handler = RPC_HANDLERS[env.method];
             if (!handler) {
               sendRes(env.id, env.method, false, errPayload('unknown_method', env.method));
+              return;
+            }
+            // minor 门槛守卫（M3.0 §3.1 能力协商）：入表方法低于其 requiredMinor 时以
+            // unsupported_method 可读降级（载荷带 method/requiredMinor，message 含双方版本）。
+            // 未登记者视为基线 2；M3.0 全表=2，1.2 节点（minorOf=2）永不触发——对现状零行为变化。
+            const requiredMinor = METHOD_REQUIRED_MINOR[env.method] ?? 2;
+            const peerMinor = minorOf(session.peerProtoVer);
+            if (peerMinor === null || peerMinor < requiredMinor) {
+              sendRes(env.id, env.method, false, {
+                code: 'unsupported_method',
+                message: `hub=${PROTOCOL_VERSION} 节点=${session.peerProtoVer}：方法 ${env.method} 需要协议 1.${requiredMinor} 及以上，请升级节点`,
+                method: env.method,
+                requiredMinor,
+              });
               return;
             }
             const guard = checkGroupRole(db, session.nodeId, env.method, env.payload);

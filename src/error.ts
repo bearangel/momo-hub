@@ -7,13 +7,21 @@ export type RpcErrorCode =
   | 'bad_request'
   | 'proto_version_mismatch'
   | 'unknown_method'
+  | 'unsupported_method'
   | 'internal'
   | 'forbidden'
   | 'node_offline'
   | 'not_found'
   | 'conflict';
 
-export interface RpcErrorPayload { code: RpcErrorCode; message: string }
+export interface RpcErrorPayload {
+  code: RpcErrorCode;
+  message: string;
+  /** unsupported_method 专用：被拒方法名。可选字段，接收端忽略未知字段（向后兼容）。 */
+  method?: string;
+  /** unsupported_method 专用：该方法所需最低协议 minor。可选字段，同上向后兼容。 */
+  requiredMinor?: number;
+}
 
 /** 错误码全集（运行时成员校验用，T13——透传方按表校验未知码；与上方 union 一一对应，只增不改义）。 */
 export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
@@ -21,6 +29,7 @@ export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
   'bad_request',
   'proto_version_mismatch',
   'unknown_method',
+  'unsupported_method',
   'internal',
   'forbidden',
   'node_offline',

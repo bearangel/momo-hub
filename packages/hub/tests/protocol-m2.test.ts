@@ -4,11 +4,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   EVT,
+  METHOD_REQUIRED_MINOR,
   MIRROR_WIRE,
   PROTOCOL_VERSION,
   RPC,
   TASK_WIRE,
   isCompatible,
+  minorOf,
+  protocolSupports,
   validateHubManifest,
   validateSnapshotManifest,
   type DelegationStatus,
@@ -76,6 +79,61 @@ describe('版本 1.2.0 与 1.1.0 兼容线', () => {
         verificationStatus: 'unverified',
       }),
     ).not.toBeNull();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// minor 门槛协商（M3.0 §3.1：minor = 向后兼容新增的能力分层）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('minorOf / protocolSupports 矩阵', () => {
+  it('minorOf：major.minor 取次段；缺段 / 非法 → null', () => {
+    expect(minorOf('1.2.0')).toBe(2);
+    expect(minorOf('1.11.3')).toBe(11);
+    expect(minorOf('0.9')).toBe(9);
+    expect(minorOf('1')).toBeNull();
+    expect(minorOf('x.y.z')).toBeNull();
+    expect(minorOf('')).toBeNull();
+  });
+
+  it('同 major：minor 高于 / 等于门槛 → true；低于门槛 → false', () => {
+    expect(protocolSupports('1.3.0', 2)).toBe(true);
+    expect(protocolSupports('1.2.0', 2)).toBe(true);
+    expect(protocolSupports('1.2.9', 2)).toBe(true);
+    expect(protocolSupports('1.1.0', 2)).toBe(false);
+    expect(protocolSupports('1.2.0', 3)).toBe(false);
+  });
+
+  it('跨 major 一律 false（major 门槛仍由 hello 闸门单独把守）', () => {
+    expect(protocolSupports('2.2.0', 2)).toBe(false);
+    expect(protocolSupports('0.3.0', 2)).toBe(false);
+  });
+
+  it('非法版本串 false（major/minor 任一解析失败的 null 传播）', () => {
+    expect(protocolSupports('', 2)).toBe(false);
+    expect(protocolSupports('garbage', 2)).toBe(false);
+    expect(protocolSupports('1', 1)).toBe(false);
+  });
+
+  it('METHOD_REQUIRED_MINOR：M3.0 全表=2（1.2 基线）——hub 分发守卫对 1.2 节点零行为变化的锚点', () => {
+    const entries = Object.entries(METHOD_REQUIRED_MINOR);
+    expect(entries.length).toBeGreaterThan(0);
+    for (const [method, minor] of entries) {
+      expect(minor, `方法 ${method}`).toBe(2);
+    }
+    // 现存方法面全量登记（含私有上行 view.consent/view.tail）
+    for (const method of [
+      RPC.hello, RPC.ping,
+      ...Object.values(RPC.group),
+      ...Object.values(RPC.workspace),
+      ...Object.values(RPC.task),
+      ...Object.values(RPC.view),
+      'view.consent', 'view.tail',
+    ]) {
+      expect(METHOD_REQUIRED_MINOR[method], `方法 ${method}`).toBe(2);
+    }
+    // 未登记者视为基线 2（约定：消费方 fallback ?? 2）
+    expect(METHOD_REQUIRED_MINOR['future.method']).toBeUndefined();
   });
 });
 

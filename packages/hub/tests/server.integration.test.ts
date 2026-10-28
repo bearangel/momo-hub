@@ -24,8 +24,9 @@ function enroll(name: string): { nodeId: string; deviceToken: string } {
   throw new Error('enroll 失败');
 }
 
-/** 便捷客户端：自动过 hello，收集全部信封（deviceToken/inbox 一并暴露给用例），支持条件等待。 */
-function connect(name: string) {
+/** 便捷客户端：自动过 hello，收集全部信封（deviceToken/inbox 一并暴露给用例），支持条件等待。
+ *  protoVer 可注入（M3.0 三态：模拟 1.1.0 低版本 / 1.9.0 高版本节点过 hello）。 */
+function connect(name: string, protoVer: string = PROTOCOL_VERSION) {
   return new Promise<{ ws: WebSocket; nodeId: string; deviceToken: string; inbox: Envelope[]; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
     const cred = enroll(name);
     const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${cred.deviceToken}` } });
@@ -36,9 +37,9 @@ function connect(name: string) {
       if (!e) return;
       inbox.push(e);
       const i = waiters.findIndex((w) => w.match(e));
-      if (i >= 0) waiters.splice(i, 1)[0]!.resolve(e);
+      if (i >= 0) waiters.splice(i, 1)[0].resolve(e);
     });
-    ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer: PROTOCOL_VERSION, nodeName: name }))));
+    ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer, nodeName: name }))));
     ws.on('error', reject);
     const next = (match: (e: Envelope) => boolean): Promise<Envelope> =>
       new Promise((res) => { const hit = inbox.find(match); if (hit) return res(hit); waiters.push({ match, resolve: res }); });
@@ -143,6 +144,39 @@ describe('hub ws 服务', () => {
     const closed = new Promise<number>((res) => { a.ws.on('close', res); a.ws.on('error', () => undefined); });
     a.ws.send('not-an-envelope');
     expect(await closed).toBe(4400);
+  });
+
+  it('minor 门槛三态：1.1.0 节点调 task.list → unsupported_method 结构化载荷（M3.0 §3.1）', async () => {
+    const peer = await connect('node-minor-11', '1.1.0');
+    // hello 通过（major 相同），基础方法不受门槛影响
+    peer.ws.send(encodeEnvelope(makeRequest(RPC.ping, { ts: 7 })));
+    const pong = await peer.next((e) => e.kind === 'res' && e.method === RPC.ping);
+    expect(pong.kind === 'res' && pong.ok).toBe(true);
+    // 入表方法（requiredMinor=2）低于节点 minor(1) → 可读降级
+    peer.ws.send(encodeEnvelope(makeRequest(RPC.task.list, {})));
+    const err = await peer.next((e) => e.kind === 'res' && e.method === RPC.task.list);
+    expect(err.kind === 'res' && err.ok).toBe(false);
+    const payload = (err.kind === 'res' ? err.payload : null) as
+      { code: string; message: string; method?: string; requiredMinor?: number } | null;
+    expect(payload?.code).toBe('unsupported_method');
+    expect(payload?.method).toBe('task.list');
+    expect(payload?.requiredMinor).toBe(2);
+    expect(payload?.message).toContain('hub=1.2.0');
+    expect(payload?.message).toContain('节点=1.1.0');
+    expect(payload?.message).toContain('task.list');
+    peer.ws.close();
+  });
+
+  it('minor 门槛三态：1.2.0 与 1.9.0 节点调 task.list 正常（无 unsupported_method）', async () => {
+    for (const ver of ['1.2.0', '1.9.0']) {
+      const peer = await connect(`node-minor-${ver.replace(/\./g, '-')}`, ver);
+      peer.ws.send(encodeEnvelope(makeRequest(RPC.task.list, {})));
+      const res = await peer.next((e) => e.kind === 'res' && e.method === RPC.task.list);
+      expect(res.kind === 'res' && res.ok, `节点 ${ver} task.list 应正常受理`).toBe(true);
+      const payload = res.kind === 'res' ? res.payload as { code?: string } : null;
+      expect(payload?.code, `节点 ${ver} 不应收 unsupported_method`).not.toBe('unsupported_method');
+      peer.ws.close();
+    }
   });
 
   it('心跳判死：半开连接（不再读 socket）两周期后被踢 → 他人收到 node.offline', async () => {

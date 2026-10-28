@@ -26,7 +26,7 @@
 | 期 | 主题 | 协议影响 | 依赖 | 工作量 | 核心交付 |
 |---|---|---|---|---|---|
 | **M3.0** ✅ 已交付（hub v0.1.6 / studio alpha.36 / main `48f3b4e1`，oracle MERGE READY，CI 三连绿） | 收官清理与协议前置 | hub minor（能力协商字段，可选） | 无 | **S**（1–2 天） | 6 项债务 + **能力协商/最低 minor 门槛**（F7，M3.1/M3.2 的前置） |
-| **M3.1** | HITL L2 远程代答 | **minor 1.3.0**（`task.answer` RPC + `task.waiting` 事件 + `waiting` 态 + 决策列） | M3.0 | **M**（4–6 天） | leader 卡片代答 → 直达 worker 授权处置；超时/幂等/审计；代答权 = 同组 leader |
+| **M3.1** ✅ 已交付（hub v0.1.7 协议 1.3.0 / studio alpha.37 / main `ac756a32`，oracle MERGE READY，UC 6/6） | HITL L2 远程代答 | **minor 1.3.0**（`task.answer` RPC + `task.waiting` 事件 + `waiting` 态 + 决策列） | M3.0 | **M**（4–6 天） | leader 卡片代答 → 直达 worker 授权处置；超时/幂等/审计；代答权 = 同组 leader |
 | **M3.2** | 远端可见性补全 | **minor**（`view.workspaces` + `view.files`；`view.*` 载荷加 `groupId`） | M3.0；F9 复用 | **M**（4–6 天） | 远端空间枚举 + 文件树浏览（只读）；多组归属歧义消除 |
 | **M3.3** | 任务编排与依赖 | studio 为主（可选 minor：依赖元数据透传） | M3.1（等待/失败语义复用） | **L**（7–10 天） | `parent_id`/`depends_on` + DAG 视图 + 批量 IPC + 阻塞态 |
 | **M3.4** | 资源生命周期与版本对齐 | **minor**（manifest `resources[].version` 可选 + 撤回语义） | M3.2（远端可见性） | **M/L**（5–8 天） | B13 镜像按版本对齐 + B12 撤回/下架 + 目录缓存失效链 |

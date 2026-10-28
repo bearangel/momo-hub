@@ -1,5 +1,6 @@
-// protocol 1.2.0/1.3.0 工作组与远程代答契约测试（spec 2026-10-24 M2 §3.1/§3.2/§3.3
-// + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1）：
+// protocol 1.2.0/1.3.0/1.4.0 工作组与远程代答/远端可见性契约测试（spec
+// 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
+// 2026-10-29 M3.2 §2.1）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -11,6 +12,9 @@ import {
   RPC,
   RPC_ERROR_CODES,
   TASK_WIRE,
+  VIEW_FILES_ENTRIES_MAX,
+  VIEW_FILES_PATH_MAX,
+  VIEW_FILES_READ_MAX,
   isCompatible,
   minorOf,
   protocolSupports,
@@ -39,11 +43,17 @@ import {
   type TaskReportPayload,
   type TaskTerminalEvent,
   type ViewAppendedEvent,
+  type ViewFileEntry,
+  type ViewFilesReq,
+  type ViewFilesRes,
   type ViewMessagePage,
   type ViewOverview,
   type ViewSessionPage,
   type ViewSubscribeReq,
   type ViewSubscribeRes,
+  type ViewWorkspaceSummary,
+  type ViewWorkspacesReq,
+  type ViewWorkspacesRes,
   type WorkspaceMirroredEvent,
   type WorkspaceSnapshotMeta,
 } from 'momo-hub-protocol';
@@ -52,15 +62,16 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.3.0 与 1.1.0/1.2.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.3.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.3.0');
+describe('版本 1.4.0 与 1.1.0/1.2.0/1.3.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.4.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.4.0');
   });
 
-  it('1.1.0 ↔ 1.3.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.3.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.3.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.3.0')).toBe(false);
+  it('1.1.0 ↔ 1.4.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.4.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.4.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.4.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.4.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -120,13 +131,18 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1', 1)).toBe(false);
   });
 
-  it('METHOD_REQUIRED_MINOR：M3.0 全表=2 基线，唯 task.answer=3（M3.1 显式覆盖）', () => {
+  it('METHOD_REQUIRED_MINOR：M3.0 全表=2 基线，唯 task.answer=3（M3.1）与 view.workspaces/view.files=4（M3.2）显式覆盖', () => {
+    const explicit: Record<string, number> = {
+      [RPC.task.answer]: 3,
+      [RPC.view.workspaces]: 4,
+      [RPC.view.files]: 4,
+    };
     const entries = Object.entries(METHOD_REQUIRED_MINOR);
     expect(entries.length).toBeGreaterThan(0);
     for (const [method, minor] of entries) {
-      expect(minor, `方法 ${method}`).toBe(method === RPC.task.answer ? 3 : 2);
+      expect(minor, `方法 ${method}`).toBe(explicit[method] ?? 2);
     }
-    // 现存方法面全量登记（含私有上行 view.consent/view.tail）
+    // 现存方法面全量登记（含私有上行 view.consent/view.tail 与 M3.2 两新方法）
     for (const method of [
       RPC.hello, RPC.ping,
       ...Object.values(RPC.group),
@@ -135,7 +151,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
       ...Object.values(RPC.view),
       'view.consent', 'view.tail',
     ]) {
-      expect(METHOD_REQUIRED_MINOR[method], `方法 ${method}`).toBe(method === RPC.task.answer ? 3 : 2);
+      expect(METHOD_REQUIRED_MINOR[method], `方法 ${method}`).toBe(explicit[method] ?? 2);
     }
     // 未登记者视为基线 2（约定：消费方 fallback ?? 2）
     expect(METHOD_REQUIRED_MINOR['future.method']).toBeUndefined();
@@ -171,7 +187,7 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
     });
   });
 
-  it('RPC.view 六方法', () => {
+  it('RPC.view 八方法（M3.2 增 workspaces/files）', () => {
     expect(RPC.view).toEqual({
       workspace: 'view.workspace',
       sessions: 'view.sessions',
@@ -179,6 +195,8 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
       tasks: 'view.tasks',
       subscribe: 'view.subscribe',
       unsubscribe: 'view.unsubscribe',
+      workspaces: 'view.workspaces',
+      files: 'view.files',
     });
   });
 });
@@ -475,6 +493,52 @@ describe('远程查看类型 round-trip', () => {
     const res: ViewSubscribeRes = { ok: true };
     expect(JSON.parse(JSON.stringify(req))).toEqual(req);
     expect(res.ok).toBe(true);
+  });
+
+  it('M3.2 既有六方法 req 可选 groupId：缺省不带键（旧形状零变化）；在场合法', () => {
+    const reqs: ViewSubscribeReq[] = [
+      { targetNodeId: 'node-b', sessionId: 's1' },
+      { targetNodeId: 'node-b', sessionId: 's1', groupId: 'g1' },
+    ];
+    for (const req of reqs) expect(JSON.parse(JSON.stringify(req))).toEqual(req);
+    // 缺省（1.2/1.3 旧调用形状）不得携带 groupId 键
+    expect(reqs[0]).not.toHaveProperty('groupId');
+    expect(reqs[1].groupId).toBe('g1');
+  });
+
+  it('M3.2 新类型：ViewWorkspacesReq/Res + ViewWorkspaceSummary 投影白名单三字段', () => {
+    const req: ViewWorkspacesReq = { targetNodeId: 'node-b' };
+    const withGroup: ViewWorkspacesReq = { targetNodeId: 'node-b', groupId: 'g1' };
+    expect(JSON.parse(JSON.stringify(req))).toEqual(req);
+    expect(req).not.toHaveProperty('groupId');
+    expect(withGroup.groupId).toBe('g1');
+    const summary: ViewWorkspaceSummary = { id: 'w1', name: 'ws-a', description: '主力' };
+    // 白名单键集锁：id/name/description——多一个键即破坏投影契约（防本机路径泄漏）
+    expect(Object.keys(summary).sort()).toEqual(['description', 'id', 'name']);
+    const res: ViewWorkspacesRes = { workspaces: [summary] };
+    expect(JSON.parse(JSON.stringify(res))).toEqual(res);
+  });
+
+  it('M3.2 新类型：ViewFilesReq（op 两态 + path?/groupId?）+ ViewFilesRes（list/read 两态）round-trip', () => {
+    const listReq: ViewFilesReq = { targetNodeId: 'node-b', workspaceName: 'ws-a', op: 'list' };
+    const readReq: ViewFilesReq = { targetNodeId: 'node-b', workspaceName: 'ws-a', op: 'read', path: 'docs/a.md', groupId: 'g1' };
+    expect(JSON.parse(JSON.stringify(listReq))).toEqual(listReq);
+    expect(listReq).not.toHaveProperty('path');
+    expect(JSON.parse(JSON.stringify(readReq))).toEqual(readReq);
+
+    const entry: ViewFileEntry = { name: 'docs', isDirectory: true, size: 0 };
+    expect(Object.keys(entry).sort()).toEqual(['isDirectory', 'name', 'size']);
+    const list: ViewFilesRes = { entries: [{ name: 'a.md', isDirectory: false, size: 12 }], truncated: false };
+    const read: ViewFilesRes = { content: Buffer.from('hi', 'utf8').toString('base64'), size: 2, truncated: true };
+    for (const res of [list, read]) expect(JSON.parse(JSON.stringify(res))).toEqual(res);
+    // read.content 为 base64——解码回原文（wire 语义锁）
+    expect(Buffer.from((read as { content: string }).content, 'base64').toString('utf8')).toBe('hi');
+  });
+
+  it('M3.2 限额常量锁：path 512 / entries 500 / read 256KB（与 TAIL_CONTENT_MAX 同值）', () => {
+    expect(VIEW_FILES_PATH_MAX).toBe(512);
+    expect(VIEW_FILES_ENTRIES_MAX).toBe(500);
+    expect(VIEW_FILES_READ_MAX).toBe(256 * 1024);
   });
 });
 

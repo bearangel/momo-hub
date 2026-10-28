@@ -1,11 +1,13 @@
 // hub 远程查看转发层契约锁（M2e spec 2026-10-24 §3.1「远程查看」/§3.2 view.appended/
-// §5.5 双层同意/§8 RF#1 + T13）——真 socket 三客户端（leader + 目标节点 + 组外者）
-// 全真 wire 语义：六方法转发矩阵（透传响应/错误码保序/id 关联不串答）/ consent
-// 生命周期（默认 true / false forbidden / 重报覆盖 / 断线清除回默认——RM2-9）/
-// view.tail → view.appended 定向（多 leader 扇出 / 会话隔离 / 无订阅丢弃+日志）/
-// 订阅生命周期（subscribe 幂等 / unsubscribe 注销 / leader 与目标断开双侧自动
-// 注销——RF#1 断开后零泄漏）/ 守卫矩阵（非 leader / 非同组 / consent false /
-// 离线 / 在途断开结算 / 伪造应答）/ view.consent 上行处理（形状校验 / 未知节点拒）。
+// §5.5 双层同意/§8 RF#1 + T13；M3.2 增 workspaces/files 与 groupId 双路径）——
+// 真 socket 三客户端（leader + 目标节点 + 组外者）全真 wire 语义：八方法转发矩阵
+// （透传响应/错误码保序/id 关联不串答）/ consent 生命周期（默认 true / false
+// forbidden / 重报覆盖 / 断线清除回默认——RM2-9）/ view.tail → view.appended 定向
+// （多 leader 扇出 / 会话隔离 / 无订阅丢弃+日志）/ 订阅生命周期（subscribe 幂等 /
+// unsubscribe 注销 / leader 与目标断开双侧自动注销——RF#1 断开后零泄漏）/ 守卫矩阵
+// （非 leader / 非同组 / consent false / 离线 / 在途断开结算 / 伪造应答）/ 
+// view.consent 上行处理（形状校验 / 未知节点拒）/ M3.2 groupId 双路径（同组过 /
+// 跨组 forbidden / 守卫先行 / 缺省回落旧形状零变化）。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -139,7 +141,8 @@ function viewReq(method: string, targetNodeId: string, extra: Record<string, unk
   return { targetNodeId, ...extra };
 }
 
-// 六方法样本载荷（hub 只校验 targetNodeId，其余字段逐字节透传——目标端权威校验）
+// 八方法样本载荷（hub 只校验 targetNodeId，其余字段逐字节透传——目标端权威校验；
+// M3.2 增 workspaces/files 两行：reply 用新响应形状走同一透传矩阵）
 const SAMPLES: Array<{ method: string; req: (t: string) => Record<string, unknown>; reply: Record<string, unknown> }> = [
   { method: RPC.view.workspace, req: (t) => viewReq(RPC.view.workspace, t, { workspaceName: 'ws-a' }), reply: { overview: { name: 'ws-a', description: '', sessionCount: 2 } } },
   { method: RPC.view.sessions, req: (t) => viewReq(RPC.view.sessions, t, { workspaceName: 'ws-a', beforeSeq: 10, limit: 20 }), reply: { sessions: [{ sessionId: 's1', title: 't', lastSeq: 5, updatedAt: 1 }] } },
@@ -147,14 +150,16 @@ const SAMPLES: Array<{ method: string; req: (t: string) => Record<string, unknow
   { method: RPC.view.tasks, req: (t) => viewReq(RPC.view.tasks, t, { workspaceName: 'ws-a' }), reply: { tasks: [{ taskId: 't1', title: 'x', status: 'done', updatedAt: 1 }] } },
   { method: RPC.view.subscribe, req: (t) => viewReq(RPC.view.subscribe, t, { sessionId: 's1' }), reply: { ok: true } },
   { method: RPC.view.unsubscribe, req: (t) => viewReq(RPC.view.unsubscribe, t, { sessionId: 's1' }), reply: { ok: true } },
+  { method: RPC.view.workspaces, req: (t) => viewReq(RPC.view.workspaces, t), reply: { workspaces: [{ id: 'w1', name: 'ws-a', description: '主力' }] } },
+  { method: RPC.view.files, req: (t) => viewReq(RPC.view.files, t, { workspaceName: 'ws-a', op: 'list' }), reply: { entries: [{ name: 'notes', isDirectory: true, size: 0 }], truncated: false } },
 ];
 
 // ────────────────────────────────────────────────────────────────────────────
-// 六方法转发矩阵
+// 八方法转发矩阵
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('六方法转发矩阵', () => {
-  it('六方法全转发：req 信封原 method + 新 id + 载荷逐字节透传；目标 res 透传 leader（ok 载荷等值）', async () => {
+describe('八方法转发矩阵', () => {
+  it('八方法全转发：req 信封原 method + 新 id + 载荷逐字节透传；目标 res 透传 leader（ok 载荷等值）', async () => {
     const { leader, target, outsider } = await setupGroup('fwd');
     for (const s of SAMPLES) {
       const { env, res } = callRpcEnv(leader, s.method, s.req(target.nodeId));
@@ -220,7 +225,7 @@ describe('六方法转发矩阵', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('consent 生命周期', () => {
-  it('默认 true：未上报即可查看；上报 false → 五个数据/订阅方法 forbidden 且零转发；unsubscribe 不受阻断（清理路径豁免）；重报 true 恢复', async () => {
+  it('默认 true：未上报即可查看；上报 false → 七个数据/订阅方法（含 M3.2 两新方法）forbidden 且零转发；unsubscribe 不受阻断（清理路径豁免）；重报 true 恢复', async () => {
     const { leader, target } = await setupGroup('cons');
     // 默认 true：一次成功转发为证
     const ok1 = callRpcEnv(leader, RPC.view.tasks, viewReq(RPC.view.tasks, target.nodeId));
@@ -231,9 +236,13 @@ describe('consent 生命周期', () => {
     const rep = await reportConsent(target, false);
     expect(rep.kind === 'res' && rep.ok).toBe(true);
 
-    const blocked = [RPC.view.workspace, RPC.view.sessions, RPC.view.messages, RPC.view.tasks, RPC.view.subscribe];
+    // 新方法自动受同一 consent 门（M3.2 零新增 consent 面——handleView 通用路径）
+    const blocked = [RPC.view.workspace, RPC.view.sessions, RPC.view.messages, RPC.view.tasks, RPC.view.subscribe, RPC.view.workspaces, RPC.view.files];
     for (const m of blocked) {
-      const r = await callRpc(leader, m, viewReq(m, target.nodeId, m === RPC.view.messages || m === RPC.view.subscribe ? { sessionId: 's' } : {}));
+      const extra = m === RPC.view.messages || m === RPC.view.subscribe
+        ? { sessionId: 's' }
+        : m === RPC.view.files ? { workspaceName: 'ws-a', op: 'list' as const } : {};
+      const r = await callRpc(leader, m, viewReq(m, target.nodeId, extra));
       expect(errOf(r).code, m).toBe('forbidden');
     }
     await settle();
@@ -518,15 +527,18 @@ describe('守卫矩阵', () => {
     leader.ws.close(); target.ws.close(); outsider.ws.close();
   });
 
-  it('离线守卫：五方法 → node_offline；unsubscribe 离线仍 ok（本地注销已完成，豁免转发）', async () => {
+  it('离线守卫：七方法（含 M3.2 两新方法）→ node_offline；unsubscribe 离线仍 ok（本地注销已完成，豁免转发）', async () => {
     const { leader, target } = await setupGroup('goff');
     target.ws.close();
     await leader.next((e) => e.kind === 'evt' && e.method === EVT.nodeOffline
       && (e.payload as { nodeId: string }).nodeId === target.nodeId);
 
-    const five = [RPC.view.workspace, RPC.view.sessions, RPC.view.messages, RPC.view.tasks, RPC.view.subscribe];
-    for (const m of five) {
-      const r = await callRpc(leader, m, viewReq(m, target.nodeId, m === RPC.view.messages || m === RPC.view.subscribe ? { sessionId: 's' } : {}));
+    const seven = [RPC.view.workspace, RPC.view.sessions, RPC.view.messages, RPC.view.tasks, RPC.view.subscribe, RPC.view.workspaces, RPC.view.files];
+    for (const m of seven) {
+      const extra = m === RPC.view.messages || m === RPC.view.subscribe
+        ? { sessionId: 's' }
+        : m === RPC.view.files ? { workspaceName: 'ws-a', op: 'list' as const } : {};
+      const r = await callRpc(leader, m, viewReq(m, target.nodeId, extra));
       expect(errOf(r).code, m).toBe('node_offline');
     }
     const unsub = await callRpc(leader, RPC.view.unsubscribe, viewReq(RPC.view.unsubscribe, target.nodeId, { sessionId: 's' }));
@@ -699,6 +711,75 @@ describe('T13 评审收口', () => {
     const fwd = await awaitForwarded(target, RPC.view.subscribe);
     replyTarget(target, fwd, true, { ok: true });
     expect(resPayload(await sub.res)).toEqual({ ok: true });
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// M3.2 groupId 双路径（提取器 groupId 优先 + handleView isMember / 缺省回落）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('M3.2 groupId 双路径', () => {
+  it('带 groupId 同组 → 照常转发（载荷含 groupId 逐字节透传）；缺省（不带字段）→ commonGroupId 旧路径照常——旧调用形状零变化', async () => {
+    const { leader, target, groupId } = await setupGroup('m32gid');
+    // 带 groupId：同组精确路径，载荷原样透传
+    const withG = callRpcEnv(leader, RPC.view.tasks, viewReq(RPC.view.tasks, target.nodeId, { groupId }));
+    const fwd1 = await awaitForwarded(target, RPC.view.tasks);
+    expect(fwd1.payload).toEqual(viewReq(RPC.view.tasks, target.nodeId, { groupId }));
+    replyTarget(target, fwd1, true, { tasks: [] });
+    expect((await withG.res).kind === 'res' && (await withG.res).ok).toBe(true);
+
+    // 缺省：旧调用形状（无 groupId 字段）零变化——载荷原样转发
+    const noG = callRpcEnv(leader, RPC.view.tasks, viewReq(RPC.view.tasks, target.nodeId));
+    const fwd2 = await awaitForwarded(target, RPC.view.tasks, [fwd1.id]);
+    expect(fwd2.payload).toEqual(viewReq(RPC.view.tasks, target.nodeId));
+    expect(fwd2.payload).not.toHaveProperty('groupId');
+    replyTarget(target, fwd2, true, { tasks: [] });
+    expect((await noG.res).kind === 'res' && (await noG.res).ok).toBe(true);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('MC6 多组消歧：leader 两组均含 target——groupId 显式指到新组也过（isMember 命中；commonGroupId 本会任意取旧组）', async () => {
+    const { leader, target, groupId: g1 } = await setupGroup('m32multi');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-m32multi-2' });
+    const g2 = (resPayload(created) as { groupId: string }).groupId;
+    const invited = await callRpc(leader, RPC.group.invite, { groupId: g2 });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+
+    const probe = callRpcEnv(leader, RPC.view.workspaces, viewReq(RPC.view.workspaces, target.nodeId, { groupId: g2 }));
+    const fwd = await awaitForwarded(target, RPC.view.workspaces);
+    expect(fwd.payload).toEqual(viewReq(RPC.view.workspaces, target.nodeId, { groupId: g2 }));
+    replyTarget(target, fwd, true, { workspaces: [] });
+    expect((await probe.res).kind === 'res' && (await probe.res).ok).toBe(true);
+    void g1; // g1 为 commonGroupId 会命中的旧组——本用例证 groupId 显式选组不被旧路径覆盖
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('带 groupId 跨组 → forbidden：named 组无 target 成员（commonGroupId 本可命中旧组——若仍走旧路径则误放行），且零转发', async () => {
+    const { leader, target, groupId: g1 } = await setupGroup('m32cross');
+    // leader 再建一组但 target 不入组——commonGroupId(leader, target) 仍命中 g1
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-m32cross-2' });
+    const g2 = (resPayload(created) as { groupId: string }).groupId;
+    const r = await callRpc(leader, RPC.view.tasks, viewReq(RPC.view.tasks, target.nodeId, { groupId: g2 }));
+    expect(errOf(r).code).toBe('forbidden');
+    await settle();
+    expect(target.inbox.filter((e) => e.kind === 'req' && e.method === RPC.view.tasks)).toHaveLength(0);
+    // 对照：同 groupId=有 target 的旧组照常过
+    const ok = callRpcEnv(leader, RPC.view.tasks, viewReq(RPC.view.tasks, target.nodeId, { groupId: g1 }));
+    const fwd = await awaitForwarded(target, RPC.view.tasks);
+    replyTarget(target, fwd, true, { tasks: [] });
+    expect((await ok.res).kind === 'res' && (await ok.res).ok).toBe(true);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('守卫层先行：非 leader 成员带 groupId 调 → forbidden；groupId 指向不存在组 → not_found（组存在性先于 leader 校验）', async () => {
+    const { leader, target, groupId } = await setupGroup('m32guard');
+    // 成员（非 leader）带 groupId 调（含自看）——提取器命中该组，leader 校验失败
+    const byMember = await callRpc(target, RPC.view.workspaces, viewReq(RPC.view.workspaces, target.nodeId, { groupId }));
+    expect(errOf(byMember).code).toBe('forbidden');
+    // leader 指向 ghost 组——组存在性校验先行
+    const ghost = await callRpc(leader, RPC.view.workspaces, viewReq(RPC.view.workspaces, target.nodeId, { groupId: 'group-ghost' }));
+    expect(errOf(ghost).code).toBe('not_found');
     leader.ws.close(); target.ws.close();
   });
 });

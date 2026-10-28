@@ -161,7 +161,7 @@ describe('hub ws 服务', () => {
     expect(payload?.code).toBe('unsupported_method');
     expect(payload?.method).toBe('task.list');
     expect(payload?.requiredMinor).toBe(2);
-    expect(payload?.message).toContain('hub=1.3.0');
+    expect(payload?.message).toContain('hub=1.4.0');
     expect(payload?.message).toContain('节点=1.1.0');
     expect(payload?.message).toContain('task.list');
     peer.ws.close();
@@ -201,6 +201,39 @@ describe('hub ws 服务', () => {
       expect(res.kind === 'res' && res.ok, `节点 ${ver} 应过 minor 守卫`).toBe(false);
       expect((res.kind === 'res' ? res.payload as { code: string } : null)?.code,
         `节点 ${ver} 应到达 handler（not_found）而非守卫拦截`).toBe('not_found');
+      peer.ws.close();
+    }
+  });
+
+  it('minor 门槛三态（M3.2）：1.3.0 节点调 view.files/view.workspaces → unsupported_method{method, requiredMinor:4}', async () => {
+    const peer = await connect('node-minor-13-m32', '1.3.0');
+    for (const m of [RPC.view.files, RPC.view.workspaces]) {
+      peer.ws.send(encodeEnvelope(makeRequest(m, { targetNodeId: 'node-x' })));
+      const err = await peer.next((e) => e.kind === 'res' && e.method === m);
+      expect(err.kind === 'res' && err.ok, m).toBe(false);
+      const payload = (err.kind === 'res' ? err.payload : null) as
+        { code: string; message: string; method?: string; requiredMinor?: number } | null;
+      expect(payload?.code, m).toBe('unsupported_method');
+      expect(payload?.method).toBe(m);
+      expect(payload?.requiredMinor).toBe(4);
+      expect(payload?.message).toContain('需要协议 1.4');
+    }
+    // 既有六方法不受新门槛影响（requiredMinor 仍 2）——1.3 节点照常进 handler
+    peer.ws.send(encodeEnvelope(makeRequest(RPC.view.tasks, { targetNodeId: 'node-x' })));
+    const old = await peer.next((e) => e.kind === 'res' && e.method === RPC.view.tasks);
+    expect((old.kind === 'res' ? old.payload as { code: string } : null)?.code,
+      '1.3 节点调既有 view 六方法应进 handler（forbidden）而非守卫拦截').toBe('forbidden');
+    peer.ws.close();
+  });
+
+  it('minor 门槛三态（M3.2）：1.4.0/1.9.0 节点过守卫进 handler（无组 target → forbidden 而非 unsupported_method）', async () => {
+    for (const ver of ['1.4.0', '1.9.0']) {
+      const peer = await connect(`node-minor-m32-${ver.replace(/\./g, '-')}`, ver);
+      peer.ws.send(encodeEnvelope(makeRequest(RPC.view.files, { targetNodeId: 'node-ghost', workspaceName: 'w', op: 'list' })));
+      const res = await peer.next((e) => e.kind === 'res' && e.method === RPC.view.files);
+      expect(res.kind === 'res' && res.ok, `节点 ${ver} 应过 minor 守卫`).toBe(false);
+      expect((res.kind === 'res' ? res.payload as { code: string } : null)?.code,
+        `节点 ${ver} 应到达 handler（forbidden）而非守卫拦截`).toBe('forbidden');
       peer.ws.close();
     }
   });

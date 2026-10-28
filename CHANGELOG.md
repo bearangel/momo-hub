@@ -2,7 +2,7 @@
 
 ## 0.1.5（2026-10-28）
 
-资源目录 latest 语义 semver 化（M2.3 T2b / 裁定书 p1-0 H1/H2，零协议字段与 schema 变更）：`buildHubCatalog` 的 per-slug latest 由「最近发布（时序）」改为 versions 全集 **semver max**——乱序发布低版本（2.0.0 后发 1.5.0）不再回退 latest 与 downloadUrl；`versions` 数组改 semver 降序（保持 `versions[0] == version` 不变式，同分兜底发布时序新→旧）；checksum/sizeBytes/publishedAt 取 semver max 版本行。hub 内私有 `compareVersions`（数值段比较防 '10'<'2' 字典序陷阱 / 缺段容忍 1.0==1.0.0 / 非法段按 0 / 预发布低于正式版 / build metadata 忽略；studio 侧 T2 另有单源镜像，双仓语义一致由 studio 契约测试锁）。`resources.latest_version` 列与发布 upsert **不动**（降级为内部「最近发布」记录，旧数据天然自愈）；协议包 `HubResourceMeta.version/versions` 注释语义随更（RM-M23-1 轻回报）。
+资源目录 latest 语义 semver 化（M2.3 T2b / 裁定书 p1-0 H1/H2，零协议字段与 schema 变更）：`buildHubCatalog` 的 per-slug latest 由「最近发布（时序）」改为 versions 全集 **semver max**——乱序发布低版本（2.0.0 后发 1.5.0）不再回退 latest 与 downloadUrl；`versions` 数组改 semver 降序（保持 `versions[0] == version` 不变式，同分兜底发布时序新→旧）；checksum/sizeBytes/publishedAt 取 semver max 版本行。hub 内私有 `compareVersions`（数值段比较防 '10'<'2' 字典序陷阱 / 缺段容忍 1.0==1.0.0 / 非法段按 0 / 预发布低于正式版 / build metadata 忽略；studio 侧 T2 另有单源镜像，双仓语义一致由 studio 契约测试锁）。`resources.latest_version` 列与发布 upsert **不动**（降级为内部「最近发布」记录，旧数据天然自愈）；协议包 `HubResourceMeta.version/versions` 注释语义随更（RM-M23-1 轻回报）。目录 `items` 的排序键为 **semver-max 版本行的 publishedAt**（低版本晚发布时排序语义较此前「最近发布行」轻微变化；确定性、无消费方依赖）。
 
 ## 0.1.4（2026-10-26）
 

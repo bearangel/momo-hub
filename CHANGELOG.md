@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.1.6（2026-10-28）
+
+M3.0 收官清理与协议前置（协议版本仍 1.2.0，零 wire 破坏）——T1 方法级 minor 门槛协商：协议包新增 `minorOf` / `protocolSupports`（minor 定位为「向后兼容新增」的能力分层，major 相同且 peer minor ≥ 门槛即支持）与 `METHOD_REQUIRED_MINOR` 方法表（现存全量方法含 view.consent/view.tail 登记为 2，即 1.2 基线；未登记者视为 2）；错误码新增 `unsupported_method`（入表但 minor 不够 = unsupported，未入表 = unknown，语义不漂移），`RpcErrorPayload` 增可选 `method`/`requiredMinor` 字段（接收端忽略未知字段向后兼容）；hub 分发层在 hello 通过后按连接内存态 protoVer 对入表方法做 minor 守卫，不达标返回结构化 `{method, requiredMinor}` 载荷、message 含双方版本与方法名（如 `hub=1.2.0 节点=1.1.0：方法 task.list 需要协议 1.2 及以上，请升级节点`）——为 M3.1/M3.2 新增 RPC 铺可读降级管道，M3.0 全表=2 对 1.2 节点零行为变化（既有 unknown_method/4400/4402/4403 错误形状锁逐字节不动）。T4 监听地址硬化：新增 `MOMO_HUB_HOST` 环境变量（默认回环 `127.0.0.1` 防疏忽暴露到局域网；显式 `0.0.0.0` 生效但启动日志 WARN 提示跨主机接入风险；非法值回退默认并 WARN；端口 `MOMO_HUB_PORT` 行为不变），Docker 镜像显式 `ENV MOMO_HUB_HOST=0.0.0.0` 保持容器端口映射语义，README 运行段与反代段同步更新。
+
 ## 0.1.5（2026-10-28）
 
 资源目录 latest 语义 semver 化（M2.3 T2b / 裁定书 p1-0 H1/H2，零协议字段与 schema 变更）：`buildHubCatalog` 的 per-slug latest 由「最近发布（时序）」改为 versions 全集 **semver max**——乱序发布低版本（2.0.0 后发 1.5.0）不再回退 latest 与 downloadUrl；`versions` 数组改 semver 降序（保持 `versions[0] == version` 不变式，同分兜底发布时序新→旧）；checksum/sizeBytes/publishedAt 取 semver max 版本行。hub 内私有 `compareVersions`（数值段比较防 '10'<'2' 字典序陷阱 / 缺段容忍 1.0==1.0.0 / 非法段按 0 / 预发布低于正式版 / build metadata 忽略；studio 侧 T2 另有单源镜像，双仓语义一致由 studio 契约测试锁）。`resources.latest_version` 列与发布 upsert **不动**（降级为内部「最近发布」记录，旧数据天然自愈）；协议包 `HubResourceMeta.version/versions` 注释语义随更（RM-M23-1 轻回报）。目录 `items` 的排序键为 **semver-max 版本行的 publishedAt**（低版本晚发布时排序语义较此前「最近发布行」轻微变化；确定性、无消费方依赖）。

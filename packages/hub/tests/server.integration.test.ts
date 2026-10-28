@@ -179,6 +179,32 @@ describe('hub ws 服务', () => {
     }
   });
 
+  it('minor 门槛三态（M3.1）：1.2.0 节点调 task.answer → unsupported_method{method, requiredMinor:3}', async () => {
+    const peer = await connect('node-minor-12-ans', '1.2.0');
+    peer.ws.send(encodeEnvelope(makeRequest(RPC.task.answer, { taskId: 't', decision: 'approve' })));
+    const err = await peer.next((e) => e.kind === 'res' && e.method === RPC.task.answer);
+    expect(err.kind === 'res' && err.ok).toBe(false);
+    const payload = (err.kind === 'res' ? err.payload : null) as
+      { code: string; message: string; method?: string; requiredMinor?: number } | null;
+    expect(payload?.code).toBe('unsupported_method');
+    expect(payload?.method).toBe('task.answer');
+    expect(payload?.requiredMinor).toBe(3);
+    expect(payload?.message).toContain('需要协议 1.3');
+    peer.ws.close();
+  });
+
+  it('minor 门槛三态（M3.1）：1.3.0/1.9.0 节点过守卫进 handler（bogus taskId → not_found；handler 行为由 delegations.test 覆盖）', async () => {
+    for (const ver of ['1.3.0', '1.9.0']) {
+      const peer = await connect(`node-minor-ans-${ver.replace(/\./g, '-')}`, ver);
+      peer.ws.send(encodeEnvelope(makeRequest(RPC.task.answer, { taskId: 'no-such-task', decision: 'approve' })));
+      const res = await peer.next((e) => e.kind === 'res' && e.method === RPC.task.answer);
+      expect(res.kind === 'res' && res.ok, `节点 ${ver} 应过 minor 守卫`).toBe(false);
+      expect((res.kind === 'res' ? res.payload as { code: string } : null)?.code,
+        `节点 ${ver} 应到达 handler（not_found）而非守卫拦截`).toBe('not_found');
+      peer.ws.close();
+    }
+  });
+
   it('心跳判死：半开连接（不再读 socket）两周期后被踢 → 他人收到 node.offline', async () => {
     // 用注入 keepaliveIntervalMs=100 的独立实例
     const db2 = openHubDatabase(mkdtempSync(join(tmpdir(), 'momo-hub-ka-')));

@@ -1,11 +1,14 @@
-// hub 委派账本与 task.* RPC 契约锁（M2d spec §3.1/§3.2/§4/§6 + T9 + MC1/MC5）——
+// hub 委派账本与 task.* RPC 契约锁（M2d spec §3.1/§3.2/§4/§6 + T9 + MC1/MC5；
+// M3.1 waiting 态与 task.answer 远程代答，spec 2026-10-28 §3.1/§3.2）——
 // 真 socket 双客户端（leader + 目标节点）全真 wire 语义：
-// canTransition 状态机全迁移矩阵（36 对，Review Focus #3）/ delegate 全链
+// canTransition 状态机全迁移矩阵（49 对，Review Focus #3）/ delegate 全链
 // （task.assigned 六字段定向 + 账本 pending）/ 离线拒派（裁定①）/ cancel 三态
 // + 终态 conflict（裁定②）/ task.report 状态机 wire 矩阵（合法迁移 + 全非法拒
 // ——账本不动、连接不炸）/ interrupted 自动迁移（断连）与续传（MC5）/ declined
 // 与 local_session_lost 附因 / task.list 过滤 / leader+同组守卫矩阵 / 上报
-// 健壮性（未知 id / 伪造来源 / 异形载荷 / ok=false）/ 审计日志。
+// 健壮性（未知 id / 伪造来源 / 异形载荷 / ok=false）/ 审计日志 / waiting 触发
+// 三规则（kind 迁移 / 同类拍 / 无 kind 解除）/ task.answer 全错误码 + 双校验 +
+// 幂等 + worker 门槛 + 转发超时 + task.answered 事件形状。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,7 +22,7 @@ import { canTransition, DELEGATION_STATUSES } from '../src/delegations';
 import { logger } from '../src/logger';
 import {
   EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, encodeEnvelope, makeRequest, parseEnvelope,
-  type DelegationStatus, type Envelope,
+  type DelegationStatus, type Envelope, type RequestEnvelope,
 } from 'momo-hub-protocol';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'momo-hub-dele-'));
@@ -42,7 +45,7 @@ afterAll(async () => {
 
 // ── 工具（mirror.test.ts 同款客户端骨架）────────────────────────────────────
 
-function connect(name: string) {
+function connect(name: string, protoVer: string = PROTOCOL_VERSION) {
   return new Promise<{ ws: WebSocket; nodeId: string; inbox: Envelope[]; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
     const cred = enrollNode(db, identity.enrollmentToken, name);
     if ('error' in cred) throw new Error('enroll 失败');
@@ -56,7 +59,8 @@ function connect(name: string) {
       const i = waiters.findIndex((w) => w.match(e));
       if (i >= 0) waiters.splice(i, 1)[0]!.resolve(e);
     });
-    ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer: PROTOCOL_VERSION, nodeName: name }))));
+    // protoVer 可注入（M3.1：模拟 1.2 低版本 worker 过 hello——node_unsupported 用例）
+    ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer, nodeName: name }))));
     ws.on('error', reject);
     const next = (match: (e: Envelope) => boolean): Promise<Envelope> =>
       new Promise((res) => { const hit = inbox.find(match); if (hit) return res(hit); waiters.push({ match, resolve: res }); });
@@ -131,6 +135,37 @@ function report(ws: WebSocket, taskId: string, payload: Record<string, unknown>,
 }
 
 const settle = (ms = 200): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** 委派驱入 waiting（M3.1 触发规则：running 后带 kind='waiting-input' 上报）。 */
+async function driveToWaiting(leader: Client, target: Client, groupId: string, pref: string): Promise<string> {
+  const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: `ws-${pref}` }));
+  report(target.ws, taskId, { status: 'running', sessionId: `sess-${pref}`, progress: { lastSeq: 1, excerpt: '开跑' } });
+  await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+    && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 1);
+  report(target.ws, taskId, { status: 'running', progress: { lastSeq: 2, excerpt: '等待授权', kind: 'waiting-input' } });
+  await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+    && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 2);
+  expect(ledgerRow(taskId)?.status).toBe('waiting');
+  return taskId;
+}
+
+/** worker（target）应答 hub 转发的 task.answer req：先锁转发载荷形状，再按 id 回 res。
+ *  excludeIds：同任务多次转发时排除已消费的信封（inbox 只增不减，须显式去重——
+ *  remote-view awaitForwarded 同款）。 */
+async function workerAnswer(
+  target: Client,
+  expectPayload: Record<string, unknown>,
+  reply: { ok: boolean; payload: unknown },
+  excludeIds: string[] = [],
+): Promise<void> {
+  const fwd = await target.next(
+    (e) => e.kind === 'req' && e.method === RPC.task.answer && !excludeIds.includes(e.id)) as RequestEnvelope;
+  excludeIds.push(fwd.id);
+  expect(fwd.payload).toEqual(expectPayload);
+  target.ws.send(encodeEnvelope({
+    v: 1, kind: 'res', id: fwd.id, method: RPC.task.answer, ok: reply.ok, payload: reply.payload,
+  }));
+}
 
 // ────────────────────────────────────────────────────────────────────────────
 // 状态机纯函数矩阵（Review Focus #3——7×7=49 对全覆盖，M3.1 增 waiting 行列）
@@ -714,6 +749,396 @@ describe('task.report kind 透传（T11b）', () => {
     }
     // 账本照常回填（丢弃不伤受理语义）
     expect(ledgerRow(taskId)).toMatchObject({ status: 'running', session_id: 'sess-b' });
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// waiting 态触发（M3.1 §3.1——acceptReport 三规则 + 出边行为）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('waiting 态触发（acceptReport 三规则）', () => {
+  it('规则一：running + kind=waiting-input → 迁移 waiting（审计「委派进入等待」+ 进度照转）；pending 直入 running 不落 waiting', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, groupId } = await setupGroup('wt1');
+      // pending → running 携带 kind：正常迁移到 running（waiting 只从 running 进）
+      const tFirst = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-wt-a' }));
+      report(target.ws, tFirst, {
+        status: 'running', sessionId: 'sess-wt-a',
+        progress: { lastSeq: 1, excerpt: '开局即等', kind: 'waiting-input' },
+      });
+      await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === tFirst);
+      expect(ledgerRow(tFirst)?.status).toBe('running');
+
+      // running + kind → waiting
+      report(target.ws, tFirst, {
+        status: 'running', progress: { lastSeq: 3, excerpt: '等写授权', kind: 'waiting-input' },
+      });
+      const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === tFirst && (e.payload as { lastSeq: number }).lastSeq === 3);
+      expect(prog.payload).toEqual({
+        taskId: tFirst, sessionId: 'sess-wt-a', lastSeq: 3, excerpt: '等写授权', kind: 'waiting-input',
+      });
+      expect(ledgerRow(tFirst)?.status).toBe('waiting');
+      expect(infoSpy.mock.calls.some(([msg, meta]) =>
+        msg === '委派进入等待' && (meta as { taskId: string }).taskId === tFirst)).toBe(true);
+      leader.ws.close(); target.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('规则二：waiting + 同类 kind 上报 = 进度拍（账本不动、进度照转、无迁移审计）', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, groupId } = await setupGroup('wt2');
+      const taskId = await driveToWaiting(leader, target, groupId, 'wt2');
+      const waitLogs = infoSpy.mock.calls.filter(([msg, meta]) =>
+        (msg === '委派进入等待' || msg === '委派等待解除' || msg === '委派状态迁移')
+        && (meta as { taskId: string }).taskId === taskId);
+
+      report(target.ws, taskId, {
+        status: 'running', progress: { lastSeq: 9, excerpt: '等待中拍进度', kind: 'waiting-input' },
+      });
+      const beat = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 9);
+      expect(beat.payload).toEqual({
+        taskId, sessionId: 'sess-wt2', lastSeq: 9, excerpt: '等待中拍进度', kind: 'waiting-input',
+      });
+      expect(ledgerRow(taskId)?.status).toBe('waiting');
+      expect(infoSpy.mock.calls.filter(([msg, meta]) =>
+        (msg === '委派进入等待' || msg === '委派等待解除' || msg === '委派状态迁移')
+        && (meta as { taskId: string }).taskId === taskId)).toHaveLength(waitLogs.length);
+      leader.ws.close(); target.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('规则三：waiting + 无 kind 上报 → 迁回 running（审计「委派等待解除」）；此后 done 收（waiting→done 终态出边）', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, groupId } = await setupGroup('wt3');
+      const taskId = await driveToWaiting(leader, target, groupId, 'wt3');
+      report(target.ws, taskId, { status: 'running', progress: { lastSeq: 10, excerpt: '继续跑' } });
+      const prog = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 10);
+      expect((prog.payload as { kind?: string }).kind).toBeUndefined();
+      expect(ledgerRow(taskId)?.status).toBe('running');
+      expect(infoSpy.mock.calls.some(([msg, meta]) =>
+        msg === '委派等待解除' && (meta as { taskId: string }).taskId === taskId)).toBe(true);
+
+      // 再入等待后直接 done：waiting→done 合法（迁移表出边）
+      report(target.ws, taskId, { status: 'running', progress: { lastSeq: 11, excerpt: '又等', kind: 'waiting-input' } });
+      await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 11);
+      expect(ledgerRow(taskId)?.status).toBe('waiting');
+      report(target.ws, taskId, { status: 'done' });
+      const done = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskCompleted
+        && (e.payload as { taskId: string }).taskId === taskId);
+      expect(done.payload).toEqual({ taskId });
+      expect(ledgerRow(taskId)?.status).toBe('done');
+      leader.ws.close(); target.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('worker 断开时 waiting → interrupted（onNodeOffline 卡死回收口径）', async () => {
+    const { leader, target, groupId } = await setupGroup('wt4');
+    const taskId = await driveToWaiting(leader, target, groupId, 'wt4');
+    target.ws.close();
+    const int = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskInterrupted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(int.payload).toEqual({ taskId });
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+    leader.ws.close();
+  });
+
+  it('task.list 支持 waiting 过滤', async () => {
+    const { leader, target, groupId } = await setupGroup('wt5');
+    const tWait = await driveToWaiting(leader, target, groupId, 'wt5');
+    const tRun = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-wt5-b' }));
+    report(target.ws, tRun, { status: 'running', sessionId: 'sess-wt5-b' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === tRun);
+    const waitingOnly = await callRpc(leader, RPC.task.list, { groupId, status: 'waiting' });
+    expect(resPayload(waitingOnly)).toMatchObject({
+      tasks: [{ taskId: tWait, status: 'waiting', answeredBy: null, answerDecision: null, answerMessage: null, answeredAt: null }],
+    });
+    const runningOnly = await callRpc(leader, RPC.task.list, { groupId, status: 'running' });
+    expect((resPayload(runningOnly) as { tasks: Array<{ taskId: string }> }).tasks.map((t) => t.taskId)).toEqual([tRun]);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// task.answer 远程代答（M3.1 §3.2 六步全路径）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.answer 远程代答', () => {
+  it('approve 全链：转发载荷精确（message 透传）→ 决策四列落账（状态不动）→ task.answered 定向 leader 四字段 → 审计「委派已代答」', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, outsider, groupId } = await setupGroup('ans1');
+      const taskId = await driveToWaiting(leader, target, groupId, 'ans1');
+
+      const resP = callRpc(leader, RPC.task.answer, { taskId, decision: 'approve', message: '准了，放开写' });
+      await workerAnswer(target, { taskId, decision: 'approve', message: '准了，放开写' },
+        { ok: true, payload: { disposition: 'granted', sessionId: 'sess-ans1' } });
+      const res = await resP;
+      expect(res.kind === 'res' && res.ok).toBe(true);
+      expect(resPayload(res)).toEqual({ disposition: 'granted' });
+
+      // 状态单源铁律：代答不迁移 waiting（worker 下一拍无 kind 才回 running）
+      expect(ledgerRow(taskId)).toMatchObject({
+        status: 'waiting',
+        answered_by: leader.nodeId, answer_decision: 'approve',
+        answer_message: '准了，放开写', session_id: 'sess-ans1',
+      });
+      expect(ledgerRow(taskId)?.answered_at).toBeGreaterThan(0);
+
+      const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskAnswered);
+      expect(evt.payload).toEqual({ taskId, decision: 'approve', by: leader.nodeId, disposition: 'granted' });
+      // 定向：target/outsider 不收 task.answered
+      await settle();
+      expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAnswered)).toHaveLength(0);
+      expect(outsider.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAnswered)).toHaveLength(0);
+
+      expect(infoSpy.mock.calls.some(([msg, meta]) =>
+        msg === '委派已代答' && (meta as { taskId: string }).taskId === taskId
+        && (meta as { disposition: string }).disposition === 'granted')).toBe(true);
+
+      // 语义闭环：worker 收到批准后下一拍无 kind → 回 running
+      report(target.ws, taskId, { status: 'running', progress: { lastSeq: 20, excerpt: '原地重执行' } });
+      await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 20);
+      expect(ledgerRow(taskId)?.status).toBe('running');
+      leader.ws.close(); target.ws.close(); outsider.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('deny 向：无 message 转发载荷不含该键；决策列 deny + message null', async () => {
+    const { leader, target, groupId } = await setupGroup('ans2');
+    const taskId = await driveToWaiting(leader, target, groupId, 'ans2');
+    const resP = callRpc(leader, RPC.task.answer, { taskId, decision: 'deny' });
+    await workerAnswer(target, { taskId, decision: 'deny' }, { ok: true, payload: { disposition: 'denied' } });
+    const res = await resP;
+    expect(resPayload(res)).toEqual({ disposition: 'denied' });
+    expect(ledgerRow(taskId)).toMatchObject({
+      status: 'waiting', answered_by: leader.nodeId,
+      answer_decision: 'deny', answer_message: null,
+    });
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskAnswered);
+    expect(evt.payload).toEqual({ taskId, decision: 'deny', by: leader.nodeId, disposition: 'denied' });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('错误码矩阵：not_found / not_waiting（message 含当前状态）/ forbidden（跨组 leader 与非 leader 同码）/ bad_request（缺 taskId / 坏 decision / message 超限）', async () => {
+    const { leader, target, outsider, groupId } = await setupGroup('ans3');
+    const taskId = await driveToWaiting(leader, target, groupId, 'ans3');
+    // 跨组 leader：另建一组，其 leader 代答本组任务 → forbidden（同码防探测）
+    const otherLeader = await connect('ans3-other-leader');
+    await callRpc(otherLeader, RPC.group.create, { groupName: 'Team-ans3-other' });
+
+    const ghost = await callRpc(leader, RPC.task.answer, { taskId: 'no-such-task', decision: 'approve' });
+    expect(errOf(ghost).code).toBe('not_found');
+
+    // not_waiting：running 态（未带 kind 上报）代答 → message 含当前状态
+    const tRun = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-ans3-b' }));
+    report(target.ws, tRun, { status: 'running', sessionId: 's' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === tRun);
+    const notWaiting = await callRpc(leader, RPC.task.answer, { taskId: tRun, decision: 'approve' });
+    const nwErr = errOf(notWaiting);
+    expect(nwErr.code).toBe('not_waiting');
+    expect(nwErr.message).toContain('running');
+
+    const byTarget = await callRpc(target, RPC.task.answer, { taskId, decision: 'approve' });
+    expect(errOf(byTarget).code).toBe('forbidden');
+    const byOutsider = await callRpc(outsider, RPC.task.answer, { taskId, decision: 'approve' });
+    expect(errOf(byOutsider).code).toBe('forbidden');
+    const byOtherLeader = await callRpc(otherLeader, RPC.task.answer, { taskId, decision: 'approve' });
+    expect(errOf(byOtherLeader).code).toBe('forbidden');
+
+    const bads: Array<{ name: string; payload: Record<string, unknown> }> = [
+      { name: '缺 taskId', payload: { decision: 'approve' } },
+      { name: '坏 decision', payload: { taskId, decision: 'maybe' } },
+      { name: 'decision 非串', payload: { taskId, decision: 1 } },
+      { name: 'message 超长（>512）', payload: { taskId, decision: 'approve', message: 'm'.repeat(513) } },
+      { name: 'message 非串', payload: { taskId, decision: 'approve', message: 42 } },
+    ];
+    for (const c of bads) {
+      const res = await callRpc(leader, RPC.task.answer, c.payload);
+      expect(errOf(res).code, `用例：${c.name}`).toBe('bad_request');
+    }
+    // 全部错误路径账本不动
+    expect(ledgerRow(taskId)).toMatchObject({
+      status: 'waiting', answered_by: null, answer_decision: null, answer_message: null, answered_at: null,
+    });
+    leader.ws.close(); target.ws.close(); outsider.ws.close(); otherLeader.ws.close();
+  });
+
+  it('node_unsupported：worker peer 1.2.0 → 不转发（target 无 task.answer req），message 带 worker 版本', async () => {
+    const { leader, groupId } = await setupGroup('ans4');
+    const legacyTarget = await connect('ans4-legacy-target', '1.2.0');
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(legacyTarget, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+
+    const taskId = await delegateOk(leader, delegateReq(groupId, legacyTarget.nodeId, { workspaceName: 'ws-ans4' }));
+    report(legacyTarget.ws, taskId, { status: 'running', sessionId: 'sess-ans4' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId);
+    report(legacyTarget.ws, taskId, { status: 'running', progress: { lastSeq: 2, excerpt: '等', kind: 'waiting-input' } });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 2);
+    expect(ledgerRow(taskId)?.status).toBe('waiting');
+
+    const res = await callRpc(leader, RPC.task.answer, { taskId, decision: 'approve' });
+    const err = errOf(res);
+    expect(err.code).toBe('node_unsupported');
+    expect(err.message).toContain('1.2.0');
+    await settle();
+    expect(legacyTarget.inbox.filter((e) => e.kind === 'req' && e.method === RPC.task.answer)).toHaveLength(0);
+    expect(ledgerRow(taskId)?.answered_at).toBeNull();
+    leader.ws.close(); legacyTarget.ws.close();
+  });
+
+  it('node_offline：worker 断开（等待委派已自动迁 interrupted——onNodeOffline 口径）后账本回写 waiting 复现防御窗 → node_offline', async () => {
+    const { leader, target, groupId } = await setupGroup('ans5');
+    const taskId = await driveToWaiting(leader, target, groupId, 'ans5');
+    target.ws.close();
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskInterrupted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+    // 防御窗模拟：真实链路里 close 处理器同步迁移，此处回写 waiting 复现
+    // 「状态未及迁移 + 注册表已摘」的竞态——node_offline 分支的可达路径
+    db.prepare("UPDATE delegations SET status = 'waiting' WHERE task_id = ?").run(taskId);
+
+    const res = await callRpc(leader, RPC.task.answer, { taskId, decision: 'approve' });
+    expect(errOf(res).code).toBe('node_offline');
+    expect(ledgerRow(taskId)?.answered_at).toBeNull();
+    leader.ws.close();
+  });
+
+  it('answer_timeout（注入 100ms）：worker 收到转发不答 → answer_timeout 且决策列不动；迟到的重复应答静默忽略', async () => {
+    const server2 = createHubServer({ db, identity, dataDir, answerForwardTimeoutMs: 100 });
+    const base2 = await server2.listen(0, '127.0.0.1');
+    const wsUrl2 = base2.replace(/^http/, 'ws') + '/ws';
+    try {
+      const connect2 = async (name: string): Promise<Client> => new Promise((resolve, reject) => {
+        const cred = enrollNode(db, identity.enrollmentToken, name);
+        if ('error' in cred) throw new Error('enroll 失败');
+        const ws = new WebSocket(wsUrl2, { headers: { authorization: `Bearer ${cred.deviceToken}` } });
+        const inbox: Envelope[] = [];
+        const waiters: Array<{ match: (e: Envelope) => boolean; resolve: (e: Envelope) => void }> = [];
+        ws.on('message', (data) => {
+          const e = parseEnvelope(String(data));
+          if (!e) return;
+          inbox.push(e);
+          const i = waiters.findIndex((w) => w.match(e));
+          if (i >= 0) waiters.splice(i, 1)[0]!.resolve(e);
+        });
+        ws.on('open', () => ws.send(encodeEnvelope(makeRequest(RPC.hello, { protoVer: PROTOCOL_VERSION, nodeName: name }))));
+        ws.on('error', reject);
+        const next = (match: (e: Envelope) => boolean): Promise<Envelope> =>
+          new Promise((res) => { const hit = inbox.find(match); if (hit) return res(hit); waiters.push({ match, resolve: res }); });
+        void next((e) => e.kind === 'res' && e.method === RPC.hello).then((h) => {
+          if (h.kind !== 'res' || !h.ok) reject(new Error('hello 失败'));
+          else resolve({ ws, nodeId: cred.nodeId, inbox, next });
+        });
+      });
+      const leader2 = await connect2('ans6-leader');
+      const target2 = await connect2('ans6-target');
+      const created = await callRpc(leader2, RPC.group.create, { groupName: 'Team-ans6' });
+      const groupId2 = (resPayload(created) as { groupId: string }).groupId;
+      const invited = await callRpc(leader2, RPC.group.invite, { groupId: groupId2 });
+      await callRpc(target2, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+
+      const taskId = await driveToWaiting(leader2, target2, groupId2, 'ans6');
+      const res = await callRpc(leader2, RPC.task.answer, { taskId, decision: 'approve' });
+      expect(errOf(res).code).toBe('answer_timeout');
+      // 账本不动，可重试
+      expect(ledgerRow(taskId)).toMatchObject({ status: 'waiting', answered_at: null });
+      // worker 恰收到一次转发
+      const fwd = target2.inbox.find((e) => e.kind === 'req' && e.method === RPC.task.answer);
+      expect(fwd).toBeDefined();
+      expect(target2.inbox.filter((e) => e.kind === 'req' && e.method === RPC.task.answer)).toHaveLength(1);
+      // 迟到应答：pending 已结算摘除，静默忽略（不炸连接）
+      if (fwd?.kind === 'req') {
+        target2.ws.send(encodeEnvelope({
+          v: 1, kind: 'res', id: fwd.id, method: RPC.task.answer, ok: true, payload: { disposition: 'granted' },
+        }));
+      }
+      await settle(150);
+      expect(ledgerRow(taskId)?.answered_at).toBeNull();
+      leader2.ws.close(); target2.ws.close();
+    } finally {
+      await server2.close();
+    }
+  });
+
+  it('幂等：重复 answer 不拒——worker 自报 stale 时 res ok 且决策列记最新、审计与 task.answered 逐次', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, groupId } = await setupGroup('ans7');
+      const taskId = await driveToWaiting(leader, target, groupId, 'ans7');
+      const seenForwards: string[] = [];
+
+      const first = callRpc(leader, RPC.task.answer, { taskId, decision: 'approve', message: '第一次' });
+      await workerAnswer(target, { taskId, decision: 'approve', message: '第一次' },
+        { ok: true, payload: { disposition: 'granted' } }, seenForwards);
+      expect(resPayload(await first)).toEqual({ disposition: 'granted' });
+      const firstAt = ledgerRow(taskId)?.answered_at;
+
+      // 第二次（不同决策）：worker 已无 pending 自报 stale
+      const second = callRpc(leader, RPC.task.answer, { taskId, decision: 'deny', message: '第二次' });
+      await workerAnswer(target, { taskId, decision: 'deny', message: '第二次' },
+        { ok: true, payload: { disposition: 'stale' } }, seenForwards);
+      const res2 = await second;
+      expect(res2.kind === 'res' && res2.ok).toBe(true);
+      expect(resPayload(res2)).toEqual({ disposition: 'stale' });
+
+      // 决策列记最新（deny / 第二次 / answered_at 前移）
+      expect(ledgerRow(taskId)).toMatchObject({
+        status: 'waiting', answer_decision: 'deny', answer_message: '第二次',
+      });
+      expect(ledgerRow(taskId)?.answered_at).toBeGreaterThanOrEqual(firstAt ?? 0);
+
+      const evts = leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAnswered);
+      expect(evts).toHaveLength(2);
+      expect(evts[0]?.payload).toEqual({ taskId, decision: 'approve', by: leader.nodeId, disposition: 'granted' });
+      expect(evts[1]?.payload).toEqual({ taskId, decision: 'deny', by: leader.nodeId, disposition: 'stale' });
+      expect(infoSpy.mock.calls.filter(([msg, meta]) =>
+        msg === '委派已代答' && (meta as { taskId: string }).taskId === taskId)).toHaveLength(2);
+
+      // 代答后 task.list 决策字段带真实值
+      const listed = await callRpc(leader, RPC.task.list, { groupId, status: 'waiting' });
+      expect(resPayload(listed)).toMatchObject({
+        tasks: [{
+          taskId, status: 'waiting', answeredBy: leader.nodeId,
+          answerDecision: 'deny', answerMessage: '第二次',
+        }],
+      });
+      leader.ws.close(); target.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('worker 错误应答：未知错误码回 internal 兜底（view 模板）；决策列不动', async () => {
+    const { leader, target, groupId } = await setupGroup('ans8');
+    const taskId = await driveToWaiting(leader, target, groupId, 'ans8');
+    const resP = callRpc(leader, RPC.task.answer, { taskId, decision: 'approve' });
+    await workerAnswer(target, { taskId, decision: 'approve' },
+      { ok: false, payload: { code: 'weird_code', message: '随便什么' } });
+    const res = await resP;
+    expect(errOf(res).code).toBe('internal');
+    expect(ledgerRow(taskId)?.answered_at).toBeNull();
     leader.ws.close(); target.ws.close();
   });
 });

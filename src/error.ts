@@ -2,6 +2,9 @@
 // M2 新增四码（spec 2026-10-24 M2 §3.3）：forbidden（非 leader/查看被关/非本组成员）、
 // node_offline（定向投递目标离线）、not_found（taskId/snapshotId/sessionId 无效）、
 // conflict（镜像覆盖两段式确认）。
+// M3.1 新增三码（spec 2026-10-28 §3.1）：not_waiting（代答时任务非等待态）、
+// node_unsupported（定向目标协议 minor 低于方法门槛，载荷 message 带目标版本）、
+// answer_timeout（代答转发超时——账本不动，可重试）。
 export type RpcErrorCode =
   | 'unauthorized'
   | 'bad_request'
@@ -12,7 +15,10 @@ export type RpcErrorCode =
   | 'forbidden'
   | 'node_offline'
   | 'not_found'
-  | 'conflict';
+  | 'conflict'
+  | 'not_waiting'
+  | 'node_unsupported'
+  | 'answer_timeout';
 
 export interface RpcErrorPayload {
   code: RpcErrorCode;
@@ -35,4 +41,7 @@ export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
   'node_offline',
   'not_found',
   'conflict',
+  'not_waiting',
+  'node_unsupported',
+  'answer_timeout',
 ];

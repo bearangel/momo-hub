@@ -1,4 +1,5 @@
-// protocol 1.2.0 工作组契约测试（spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7）：
+// protocol 1.2.0/1.3.0 工作组与远程代答契约测试（spec 2026-10-24 M2 §3.1/§3.2/§3.3
+// + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -8,6 +9,7 @@ import {
   MIRROR_WIRE,
   PROTOCOL_VERSION,
   RPC,
+  RPC_ERROR_CODES,
   TASK_WIRE,
   isCompatible,
   minorOf,
@@ -28,6 +30,9 @@ import {
   type RpcErrorCode,
   type RpcErrorPayload,
   type SnapshotManifest,
+  type TaskAnswerReq,
+  type TaskAnswerRes,
+  type TaskAnsweredEvent,
   type TaskAssignedEvent,
   type TaskProgressEvent,
   type TaskRecord,
@@ -47,15 +52,15 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.2.0 与 1.1.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.2.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.2.0');
+describe('版本 1.3.0 与 1.1.0/1.2.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.3.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.3.0');
   });
 
-  it('1.1.0 ↔ 1.2.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.2.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.1.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.2.0')).toBe(false);
+  it('1.1.0 ↔ 1.3.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.3.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.3.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.3.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -115,11 +120,11 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1', 1)).toBe(false);
   });
 
-  it('METHOD_REQUIRED_MINOR：M3.0 全表=2（1.2 基线）——hub 分发守卫对 1.2 节点零行为变化的锚点', () => {
+  it('METHOD_REQUIRED_MINOR：M3.0 全表=2 基线，唯 task.answer=3（M3.1 显式覆盖）', () => {
     const entries = Object.entries(METHOD_REQUIRED_MINOR);
     expect(entries.length).toBeGreaterThan(0);
     for (const [method, minor] of entries) {
-      expect(minor, `方法 ${method}`).toBe(2);
+      expect(minor, `方法 ${method}`).toBe(method === RPC.task.answer ? 3 : 2);
     }
     // 现存方法面全量登记（含私有上行 view.consent/view.tail）
     for (const method of [
@@ -130,7 +135,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
       ...Object.values(RPC.view),
       'view.consent', 'view.tail',
     ]) {
-      expect(METHOD_REQUIRED_MINOR[method], `方法 ${method}`).toBe(2);
+      expect(METHOD_REQUIRED_MINOR[method], `方法 ${method}`).toBe(method === RPC.task.answer ? 3 : 2);
     }
     // 未登记者视为基线 2（约定：消费方 fallback ?? 2）
     expect(METHOD_REQUIRED_MINOR['future.method']).toBeUndefined();
@@ -157,8 +162,13 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
     expect(RPC.workspace).toEqual({ mirror: 'workspace.mirror', snapshots: 'workspace.snapshots' });
   });
 
-  it('RPC.task 三方法', () => {
-    expect(RPC.task).toEqual({ delegate: 'task.delegate', cancel: 'task.cancel', list: 'task.list' });
+  it('RPC.task 四方法（M3.1 增 answer）', () => {
+    expect(RPC.task).toEqual({
+      delegate: 'task.delegate',
+      cancel: 'task.cancel',
+      list: 'task.list',
+      answer: 'task.answer',
+    });
   });
 
   it('RPC.view 六方法', () => {
@@ -178,7 +188,7 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('RpcErrorCode 扩充', () => {
-  it('新增四码入枚举；既有五码不回退', () => {
+  it('M2 新增四码入枚举；既有五码不回退', () => {
     const codes: RpcErrorCode[] = [
       'unauthorized',
       'bad_request',
@@ -193,6 +203,17 @@ describe('RpcErrorCode 扩充', () => {
     expect(codes).toHaveLength(9);
     const payload: RpcErrorPayload = { code: 'forbidden', message: '非 leader' };
     expect(payload.code).toBe('forbidden');
+  });
+
+  it('M3.1 新增三码入枚举（not_waiting / node_unsupported / answer_timeout），既有十码不回退', () => {
+    const m31: RpcErrorCode[] = ['not_waiting', 'node_unsupported', 'answer_timeout'];
+    // 顺序锁：新三码追加在尾部（只增不改义——既有码相对位置不动）
+    expect(RPC_ERROR_CODES.slice(0, -3)).toEqual([
+      'unauthorized', 'bad_request', 'proto_version_mismatch', 'unknown_method',
+      'unsupported_method', 'internal', 'forbidden', 'node_offline', 'not_found', 'conflict',
+    ]);
+    expect(RPC_ERROR_CODES.slice(-3)).toEqual(m31);
+    expect(RPC_ERROR_CODES).toHaveLength(13);
   });
 });
 
@@ -209,6 +230,7 @@ describe('EVT 新增九事件目录', () => {
     expect(EVT.taskFailed).toBe('task.failed');
     expect(EVT.taskInterrupted).toBe('task.interrupted');
     expect(EVT.taskCancelled).toBe('task.cancelled');
+    expect(EVT.taskAnswered).toBe('task.answered');
     expect(EVT.viewAppended).toBe('view.appended');
     expect(EVT.workspaceMirrored).toBe('workspace.mirrored');
   });
@@ -339,9 +361,11 @@ describe('镜像类型 round-trip', () => {
 });
 
 describe('委派类型 round-trip', () => {
-  it('TaskRecord：status 六态枚举（账本状态机）', () => {
-    const statuses: DelegationStatus[] = ['pending', 'running', 'done', 'failed', 'interrupted', 'cancelled'];
-    expect(statuses).toHaveLength(6);
+  it('TaskRecord：status 七态枚举（账本状态机，M3.1 增 waiting）+ 代答留痕四可选字段', () => {
+    const statuses: DelegationStatus[] = [
+      'pending', 'running', 'waiting', 'done', 'failed', 'interrupted', 'cancelled',
+    ];
+    expect(statuses).toHaveLength(7);
     const rec: TaskRecord = {
       taskId: 't1',
       workspaceName: 'ws',
@@ -361,6 +385,39 @@ describe('委派类型 round-trip', () => {
       'updatedAt',
       'workspaceName',
     ]);
+    // M3.1 代答留痕：四字段全可选（未代答不带键——0.1.6 载荷向后兼容）
+    const answered: TaskRecord = {
+      ...rec,
+      status: 'waiting',
+      answeredBy: 'node-a',
+      answerDecision: 'approve',
+      answerMessage: '准了',
+      answeredAt: 1_700_000_000_002,
+    };
+    expect(JSON.parse(JSON.stringify(answered))).toEqual(answered);
+    expect(Object.keys(answered).sort()).toEqual([
+      'answerDecision', 'answerMessage', 'answeredAt', 'answeredBy',
+      'createdAt', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+    ]);
+  });
+
+  it('M3.1 代答三类型：TaskAnswerReq / TaskAnswerRes / TaskAnsweredEvent 形状', () => {
+    const req: TaskAnswerReq = { taskId: 't1', decision: 'approve' };
+    expect(JSON.parse(JSON.stringify(req))).toEqual(req);
+    expect(Object.keys(req).sort()).toEqual(['decision', 'taskId']);
+    const withMsg: TaskAnswerReq = { taskId: 't1', decision: 'deny', message: '不同意' };
+    expect(Object.keys(withMsg).sort()).toEqual(['decision', 'message', 'taskId']);
+    for (const disposition of ['granted', 'denied', 'stale'] as const) {
+      const res: TaskAnswerRes = { disposition };
+      expect(JSON.parse(JSON.stringify(res))).toEqual(res);
+    }
+    for (const decision of ['approve', 'deny'] as const) {
+      const evt: TaskAnsweredEvent = {
+        taskId: 't1', decision, by: 'node-a', disposition: 'granted',
+      };
+      expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
+      expect(Object.keys(evt).sort()).toEqual(['by', 'decision', 'disposition', 'taskId']);
+    }
   });
 
   it('TASK_WIRE.report 常量与 TaskReportPayload 形状（M2d T9 wire 约定锁）', () => {

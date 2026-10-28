@@ -15,6 +15,9 @@ export const EVT = {
   taskFailed: 'task.failed',
   taskInterrupted: 'task.interrupted',
   taskCancelled: 'task.cancelled',
+  // M3.1（1.3.0）新增：代答复核回执（定向→委派 leader）。刻意不做 task.waiting
+  // 双信号——leader 等待展示走 task.progress kind 通道（spec §3.4 裁定）。
+  taskAnswered: 'task.answered',
   viewAppended: 'view.appended',
   workspaceMirrored: 'workspace.mirrored',
 } as const;

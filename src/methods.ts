@@ -33,6 +33,11 @@ export const METHOD_REQUIRED_MINOR: Record<string, number> = Object.fromEntries(
     VIEW_WIRE.tail,
   ].map((method) => [method, 2]),
 );
+// M3.1（1.3.0）：task.answer 为首个 minor-3 方法——fromEntries 基线 2 之上显式
+// 覆盖。1.2 客户端调它由 hub 分发守卫回 unsupported_method（可读降级，载荷带
+// {method, requiredMinor:3}）；hub 转发前同样按目标 worker 连接的 peerProtoVer
+// 复核门槛（delegations.handleAnswer——低于 3 的 worker 不懂 task.answer 转发）。
+METHOD_REQUIRED_MINOR[RPC.task.answer] = 3;
 
 export type RpcMethodName =
   | 'hello'

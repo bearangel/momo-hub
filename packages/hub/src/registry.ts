@@ -2,7 +2,9 @@
 import type { WebSocket } from 'ws';
 import { encodeEnvelope, type Envelope, type EventEnvelope } from 'momo-hub-protocol';
 
-export interface NodeConn { nodeId: string; nodeName: string; ws: WebSocket; alive: boolean }
+/** peerProtoVer：hello 上报的对端协议版本（会话内存态，随连接生灭；M3.1 起
+ *  代答转发按目标连接版本复核方法门槛——delegations.handleAnswer）。 */
+export interface NodeConn { nodeId: string; nodeName: string; ws: WebSocket; alive: boolean; peerProtoVer: string }
 
 export class NodeRegistry {
   private byId = new Map<string, NodeConn>();

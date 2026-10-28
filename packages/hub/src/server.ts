@@ -41,6 +41,7 @@ export interface CreateHubServerOpts {
   helloTimeoutMs?: number;      // 默认 5000
   keepaliveIntervalMs?: number; // 默认 30000；判死 = 2 × interval
   viewForwardTimeoutMs?: number; // 查看转发超时注入（T13 评审 Important② 用例消费；默认 10s）
+  answerForwardTimeoutMs?: number; // 代答转发超时注入（M3.1；默认 10s）
   /** 公网 origin（RM1-11）：设置后 catalog 的 downloadUrl 独占使用该 origin；
    *  非法值在此抛错（启动即失败，不静默降级）。 */
   publicOrigin?: string;
@@ -80,8 +81,10 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const registry = new NodeRegistry();
   // 镜像路由器（两段式 pending 登记/回执对账——server 生命周期单例，随连接清理）
   const mirrorRouter = new MirrorRouter(db, registry);
-  // 委派路由器（账本状态机 + task.* RPC + 上行 report 对账——同为生命周期单例）
-  const delegationRouter = new DelegationRouter(db, registry);
+  // 委派路由器（账本状态机 + task.* RPC + 上行 report/answer 对账——同为生命周期单例）
+  const delegationRouter = new DelegationRouter(db, registry, {
+    ...(opts.answerForwardTimeoutMs !== undefined ? { answerTimeoutMs: opts.answerForwardTimeoutMs } : {}),
+  });
   // 远程查看路由器（M2e：六方法定向转发 + consent 内存态 + 订阅登记/断开注销）
   const viewRouter = new RemoteViewRouter(db, registry, {
     ...(opts.viewForwardTimeoutMs !== undefined ? { forwardTimeoutMs: opts.viewForwardTimeoutMs } : {}),
@@ -92,13 +95,13 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   const liveSockets = new Set<WebSocket>();
   const app = fastify({ logger: false });
   void app.register(websocket);
-  // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域三方法 +
-  // M2e 查看域八方法（六公开 view.* + 私有上行 view.consent/view.tail）。
+  // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域四方法（M3.1 增
+  // task.answer）+ M2e 查看域八方法（六公开 view.* + 私有上行 view.consent/view.tail）。
   // workspace.snapshots/task.list 无组角色限制不进 LEADER_ONLY_METHODS 守卫直通；
-  // workspace.mirror/task.delegate/task.cancel/view.* 六方法 leader-only 由守卫层
-  // 校验（task.cancel 提取器按 taskId 查 delegations 回填 groupId——M2d T9 回填；
-  // view.* 提取器按 targetNodeId 查「leader 与 target 同组」——M2e T13 回填）；
-  // view.consent/view.tail 为节点上行（非 leader-only），不进守卫。
+  // workspace.mirror/task.delegate/task.cancel/task.answer/view.* 六方法 leader-only
+  // 由守卫层校验（task.cancel/task.answer 提取器按 taskId 查 delegations 回填
+  // groupId——M2d T9 / M3.1 回填；view.* 提取器按 targetNodeId 查「leader 与 target
+  // 同组」——M2e T13 回填）；view.consent/view.tail 为节点上行（非 leader-only），不进守卫。
   const viewHandler = (method: string): GroupHandler => (ctx, payload) => viewRouter.handleView(ctx, method, payload);
   const RPC_HANDLERS: Record<string, GroupHandler> = {
     ...GROUP_HANDLERS,
@@ -107,6 +110,7 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     [RPC.task.delegate]: (ctx, payload) => delegationRouter.handleDelegate(ctx, payload),
     [RPC.task.cancel]: (ctx, payload) => delegationRouter.handleCancel(ctx, payload),
     [RPC.task.list]: (ctx, payload) => delegationRouter.handleList(ctx, payload),
+    [RPC.task.answer]: (ctx, payload) => delegationRouter.handleAnswer(ctx, payload),
     [RPC.view.workspace]: viewHandler(RPC.view.workspace),
     [RPC.view.sessions]: viewHandler(RPC.view.sessions),
     [RPC.view.messages]: viewHandler(RPC.view.messages),
@@ -167,12 +171,14 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         if (!env) { socket.close(4400, 'bad_envelope'); return; }
         if (env.kind === 'evt') return; // 上行 evt 忽略（M0 语义不变）
         if (env.kind === 'res') {
-          // 上行 res 按 method 分流：task.report → 委派上报（M2d）；view.* 六方法 →
-          // 查看转发对账（M2e，id=转发 id 关联）；其余 → 镜像回执（M2c，唯一其余
-          // 合法项）。未匹配（迟到/重复/伪造/未知 method）由各路由器静默忽略。
+          // 上行 res 按 method 分流：task.report → 委派上报（M2d）；task.answer →
+          // 代答转发对账（M3.1，id=转发 id 关联）；view.* 六方法 → 查看转发对账
+          // （M2e，id=转发 id 关联）；其余 → 镜像回执（M2c，唯一其余合法项）。
+          // 未匹配（迟到/重复/伪造/未知 method）由各路由器静默忽略。
           // hello 前的 res 不可能有对账项，一并忽略。
           if (session.helloDone) {
             if (env.method === TASK_WIRE.report) delegationRouter.acceptReport(session.nodeId, env);
+            else if (env.method === RPC.task.answer) delegationRouter.acceptAnswerRes(session.nodeId, env);
             else if (isViewRpcMethod(env.method)) viewRouter.acceptViewRes(session.nodeId, env);
             else mirrorRouter.acceptReceipt(session.nodeId, env);
           }
@@ -195,7 +201,8 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
             session.peerProtoVer = ver;
             // 注册表条目与会话持有的是同一个 NodeConn 引用：
             // ka tick / pong 只经 session.conn 改 alive，不经注册表反查。
-            const conn: NodeConn = { nodeId: session.nodeId, nodeName: session.nodeName, ws: socket, alive: true };
+            // peerProtoVer 随 conn 入注册表（M3.1：代答转发按目标连接版本复核门槛）。
+            const conn: NodeConn = { nodeId: session.nodeId, nodeName: session.nodeName, ws: socket, alive: true, peerProtoVer: ver };
             registry.add(conn);
             session.conn = conn;
             sendRes(env.id, RPC.hello, true, {

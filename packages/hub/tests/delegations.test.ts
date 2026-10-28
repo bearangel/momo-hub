@@ -104,6 +104,8 @@ interface LedgerRow {
   task_id: string; group_id: string; workspace_name: string; target_node_id: string;
   by_node_id: string; title: string; status: DelegationStatus;
   session_id: string | null; created_at: number; updated_at: number;
+  answered_by: string | null; answer_decision: string | null;
+  answer_message: string | null; answered_at: number | null;
 }
 
 function ledgerRow(taskId: string): LedgerRow | undefined {
@@ -131,24 +133,26 @@ function report(ws: WebSocket, taskId: string, payload: Record<string, unknown>,
 const settle = (ms = 200): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 // ────────────────────────────────────────────────────────────────────────────
-// 状态机纯函数矩阵（Review Focus #3——36 对全覆盖）
+// 状态机纯函数矩阵（Review Focus #3——7×7=49 对全覆盖，M3.1 增 waiting 行列）
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('canTransition 全迁移矩阵', () => {
   const LEGAL: Array<[DelegationStatus, DelegationStatus]> = [
     ['pending', 'running'], ['pending', 'failed'], ['pending', 'cancelled'], ['pending', 'interrupted'],
+    ['running', 'waiting'],
     ['running', 'done'], ['running', 'failed'], ['running', 'cancelled'], ['running', 'interrupted'],
+    ['waiting', 'running'], ['waiting', 'done'], ['waiting', 'failed'], ['waiting', 'cancelled'], ['waiting', 'interrupted'],
     ['interrupted', 'running'], ['interrupted', 'failed'], ['interrupted', 'cancelled'],
   ];
 
-  it('11 个合法对放行', () => {
+  it('17 个合法对放行（M3.1 增 running→waiting 与 waiting 五出边）', () => {
     for (const [from, to] of LEGAL) {
       expect(canTransition(from, to), `${from}→${to}`).toBe(true);
     }
-    expect(LEGAL).toHaveLength(11);
+    expect(LEGAL).toHaveLength(17);
   });
 
-  it('25 个非法对全拒（含自迁移与终态出场）', () => {
+  it('32 个非法对全拒（含自迁移、终态出场与 waiting 的非法组合——7×7 全覆盖）', () => {
     for (const from of DELEGATION_STATUSES) {
       for (const to of DELEGATION_STATUSES) {
         const legal = LEGAL.some(([f, t]) => f === from && t === to);
@@ -526,7 +530,11 @@ describe('task.list', () => {
     expect(tasks.map((t) => t.taskId).sort()).toEqual([t1, t2, t3].sort());
     const rec = tasks.find((t) => t.taskId === t2)!;
     expect(rec).toMatchObject({ workspaceName: 'ws-l2', targetNodeId: target.nodeId, status: 'running', title: '修登录 bug' });
-    expect(Object.keys(rec).sort()).toEqual(['createdAt', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName']);
+    // 键集锁（M3.1 扩四键）：代答留痕四字段恒在（未代答为 null）
+    expect(Object.keys(rec).sort()).toEqual([
+      'answerDecision', 'answerMessage', 'answeredAt', 'answeredBy',
+      'createdAt', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+    ]);
 
     // 状态过滤
     const runningOnly = await callRpc(leader, RPC.task.list, { groupId, status: 'running' });

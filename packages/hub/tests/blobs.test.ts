@@ -86,7 +86,7 @@ describe('迁移 v2（spec M1 §4 两表，逐字 SQL）', () => {
     const db = openHubDatabase(dir);
     // v1 即两条语句（hub_meta/nodes），追加 v2 两表后 4 条；M2b v3 组三表（单条多语句）
     // 后 5 条；M2c 快照表后 6 条
-    expect(db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '7' });
+    expect(db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '8' });
     db.prepare(
       "INSERT INTO resources (slug, type, name, author, latest_version) VALUES ('coder-pro', 'agent', 'Coder Pro', 'ws-1', '1.2.3')",
     ).run();
@@ -96,7 +96,7 @@ describe('迁移 v2（spec M1 §4 两表，逐字 SQL）', () => {
     db.close();
 
     const db2 = openHubDatabase(dir); // 迁移幂等：重开不重复执行、不丢数据
-    expect(db2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '7' });
+    expect(db2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '8' });
     expect(db2.prepare('SELECT COUNT(*) AS n FROM resources').get()).toEqual({ n: 1 });
     expect(db2.prepare('SELECT COUNT(*) AS n FROM resource_versions').get()).toEqual({ n: 1 });
     db2.close();

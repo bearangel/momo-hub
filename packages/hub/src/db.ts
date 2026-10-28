@@ -56,15 +56,22 @@ const MIGRATIONS: readonly string[] = [
      by_node TEXT NOT NULL, checksum TEXT NOT NULL, size_bytes INTEGER NOT NULL, created_at INTEGER NOT NULL,
      UNIQUE (workspace_name, version)
    )`,
-  // v5（M2d 委派账本——spec §4 SQL 逐字）。status 六态；迁移合法性由 hub
-  // canTransition 单点校验（Review Focus #3），库层只存终值不设约束。
+  // v5（M2d 委派账本——spec §4 SQL 逐字）。status 七态（M3.1 增 waiting，见 v6）；
+  // 迁移合法性由 hub canTransition 单点校验（Review Focus #3），库层只存终值不设约束。
   `CREATE TABLE IF NOT EXISTS delegations (
      task_id TEXT PRIMARY KEY, group_id TEXT NOT NULL, workspace_name TEXT NOT NULL,
      target_node_id TEXT NOT NULL, by_node_id TEXT NOT NULL, title TEXT NOT NULL,
-     status TEXT NOT NULL,            -- pending|running|done|failed|interrupted|cancelled
+     status TEXT NOT NULL,            -- pending|running|waiting(M3.1)|done|failed|interrupted|cancelled
      session_id TEXT,                 -- 目标节点回填
      created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
    )`,
+  // v6（M3.1 HITL L2 远程代答——决策四列，追加纪律）：waiting 态复用既有 status TEXT 列
+  // 不加列；决策列全 NULL 缺省（未代答），最新一次代答覆盖（worker 自报 stale 同样记）。
+  // 四列各自 ALTER（单条迁移一个 schema_version，v3 多语句同款）。
+  `ALTER TABLE delegations ADD COLUMN answered_by TEXT;
+   ALTER TABLE delegations ADD COLUMN answer_decision TEXT;
+   ALTER TABLE delegations ADD COLUMN answer_message TEXT;
+   ALTER TABLE delegations ADD COLUMN answered_at INTEGER`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

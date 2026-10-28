@@ -121,6 +121,16 @@ const LEADER_ONLY_METHODS: Record<string, LeaderOnlyExtractor> = {
       | undefined;
     return row?.group_id ?? null;
   },
+  // task.answer 同款 taskId 反查（M3.1）：代答权锚 delegations.group_id →
+  // groups.leader_node_id（与 cancel 一致）；未知 taskId 返 null 放行 → handler not_found。
+  [RPC.task.answer]: (p, db) => {
+    const taskId = reqStr(p, 'taskId');
+    if (!taskId) return null;
+    const row = db.prepare('SELECT group_id FROM delegations WHERE task_id = ?').get(taskId) as
+      | { group_id: string }
+      | undefined;
+    return row?.group_id ?? null;
+  },
   [RPC.view.workspace]: viewTargetGroup,
   [RPC.view.sessions]: viewTargetGroup,
   [RPC.view.messages]: viewTargetGroup,

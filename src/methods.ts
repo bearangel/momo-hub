@@ -38,6 +38,12 @@ export const METHOD_REQUIRED_MINOR: Record<string, number> = Object.fromEntries(
 // {method, requiredMinor:3}）；hub 转发前同样按目标 worker 连接的 peerProtoVer
 // 复核门槛（delegations.handleAnswer——低于 3 的 worker 不懂 task.answer 转发）。
 METHOD_REQUIRED_MINOR[RPC.task.answer] = 3;
+// M3.2（1.4.0）：view.workspaces/view.files 为 minor-4 方法（task.answer 显式
+// 覆盖同模式）——1.3 客户端调它由分发守卫回 unsupported_method{method,
+// requiredMinor:4} 可读降级；既有 view 六方法仍为基线 2（groupId 可选字段
+// 缺省不触发门槛，旧调用零变化）。
+METHOD_REQUIRED_MINOR[RPC.view.workspaces] = 4;
+METHOD_REQUIRED_MINOR[RPC.view.files] = 4;
 
 export type RpcMethodName =
   | 'hello'

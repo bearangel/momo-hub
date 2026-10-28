@@ -1,10 +1,13 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.4.0（M3.2 远端可见性）：view.workspaces（远端空间清单）/ view.files（只读
+// 文件树）两 RPC + 全部 view.* 请求可选 groupId（缺省 commonGroupId 旧路径）+
+// view.files 限额常量——全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.3.0（M3.1 HITL L2 远程代答）：task.answer RPC + waiting 一等态 + 决策列四字段
 //  + task.answered 事件 + not_waiting/node_unsupported/answer_timeout 三错误码——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.3.0';
+export const PROTOCOL_VERSION = '1.4.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

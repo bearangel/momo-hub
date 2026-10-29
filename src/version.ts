@@ -1,4 +1,9 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.7.0（M4.3 委派依赖透传）：DelegationTask 增可选 dependsOn?（leader 本地
+//  任务 id 清单，纯透传不校验存在性——本地 id 跨节点无意义，worker 零消费；
+//  hub 只做形状校验，非法整包拒）+ task.assigned 事件随 task 对象透传（既有
+//  结构零改动）——可选字段，无新 RPC 方法、无 METHOD_REQUIRED_MINOR 门槛登记
+//  （未知字段剥除对旧节点天然宽容，1.6 peer 调任何已登记方法不受影响），major 不动。
 // 1.6.0（M4.2 多组终态）：view 订阅组锚定（订阅记录存显式 groupId +
 //  view.appended 推送透传 groupId?）+ TaskRecord 增可选 groupId?（delegations
 //  .group_id 既有列直接投影，零迁移）——全部为可选字段，无新 RPC 方法、无
@@ -16,7 +21,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.6.0';
+export const PROTOCOL_VERSION = '1.7.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

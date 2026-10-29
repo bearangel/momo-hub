@@ -24,6 +24,13 @@ export interface DelegationTask {
   /** HITL 权限档位（M2.1 T10b，0.1.3）：readonly/sandbox/confirm 三值枚举，缺省合法
    *  （0.1.2 载荷向后兼容）；hub 侧非法值剥除透传（未知容忍先例 modelBinding）。 */
   permissionTier?: 'readonly' | 'sandbox' | 'confirm';
+  /** 依赖元数据（M4.3，1.7.0）：leader 本地任务 id 清单（如 T-x 形态）——语义裁定
+   *  （spec 2026-10-29 §2.1）：纯透传，仅展示/审计用途；hub 不校验存在性（leader
+   *  本地 id 对 hub 无意义——跨节点不可解析）；worker 零消费（依赖闸在 leader 侧
+   *  派发前置，blocked 不 delegate）。hub 只做形状校验（string 数组 ≤50 项、每项
+   *  ≤128 字符，非法整包拒 400——沿 manifest version? 三格模式）；随 task.assigned
+   *  事件过不持久化（同 brief 口径）；缺省不带键（1.6 载荷向后兼容）。 */
+  dependsOn?: string[];
 }
 
 export interface TaskDelegateReq {

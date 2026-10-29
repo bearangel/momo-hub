@@ -7,14 +7,14 @@
 
 ## 1. 候选池（六项，探查定案中）
 
-| # | 候选 | 已知事实（台账来源） | 判定/工作量 | ※ 待探查回填 |
-|---|---|---|---|---|
-| C1 | **commonGroupId 残余面** | M3.2 给 view.* 加了 groupId 显式路径，但**缺省回落仍走 commonGroupId 任意取一组**（ORDER BY created_at LIMIT 1）；「多组终态」未完成 | ？ | 全调用方清单 + 是否仍有不可表达组作用域的语义面 |
-| C2 | **协议错误码消费统一** | task.answer 链用 `[code] message` 前缀编码过 Electron IPC（#24427），view.* 族通道仍只传 message；humanizeViewError 按 message 子串匹配 | ？ | 通道枚举 + 统一面触及点（双仓） |
-| C3 | **委派依赖透传** | M3.3 裁定延后：`DelegationTaskBrief` 无依赖字段，外派任务不带 dependsOn 语义；`::` 语法外派路径不解析 | ？ | brief 形状 + worker 消费插入点；协议 minor 1.6.0 |
-| C4 | **撤回治理（leader-only）** | M3.4 裁定延后：unpublish 与 publish 同信任模型（任何注册节点）；owner 信息只在 resource_versions.published_by | ？ | 守卫接线 + 节点身份面；真实多租场景必要性 |
-| C5 | **e2e 回归沉淀** | M3.1 HITL 代答 / M3.3 依赖闸 / M3.4 撤回发布均只有单测+真机验收，**零 Playwright e2e** | ？ | e2e 清单 + 多实例 hub harness 原语有无 |
-| C6 | **票桶 P3 清偿** | M3.0 D1（资源库来源筛选计数滞后——pullNodes 只增不删 vs seedHubUpdates 对账）；ArchivePanel 测试缩进 | ？ | D1 根因 file:line + 修复面估计 |
+| # | 候选 | 探查定案（file:line） | 判定 / 工作量 |
+|---|---|---|---|
+| C1 | **多组终态** | commonGroupId 残余四点：def（groups.ts:94-106）/ viewTargetGroup 回落（:111，8 个 view.* 缺省路径）/ handleView 回落（remote-view.ts:158）/ **handleTail 订阅复检永远 commonGroupId（remote-view.ts:216）——订阅记录 (leader,target,sessionId) 不存 groupId，显式化也无法消除歧义，需扩订阅记录**。另有无组作用域语义面：presence 全局（hello onlineNodes + node.online/offline 全广播）、resource HTTP 面全局、**TaskRecord 无 groupId——委派板跨组聚合无法按组归属**（studio hub-delegation.store.ts:120 taskList() 无过滤）；WorkgroupView 无选中组时 groupId=null 静默回落 | **M4.2 做**，M：①订阅记录+协议可选字段（minor 1.6.0，M3.2 模式）②TaskRecord+groupId 可选字段（委派卡组归属）③presence 组过滤（组内可见性裁定时再定，可能裁关闭）。④⑤回落路径保留至调用方全显式化 |
+| C2 | **错误契约统一** | 仅 hub:taskAnswer 有 `[code]` 前缀（ipc.handlers.ts:115-119）；其余全部通道（group.*×6 / mirror / taskList/Delegate/Cancel / view.*×8 / submitRoutedTask / retryDispatch）裸抛 RpcRemoteError——Electron IPC 只保 message（#24427），code 全丢失。消费端脆匹配：humanizeViewError 按「已关闭本组查看/不在线/离线」子串（hub-view.store.ts:145-150，对 hub 措辞脆弱）；DelegatedTaskCard regex 前缀解析（:418-436）。统一面：全通道包裹 + renderer 共享解析 lib（error-prefix 双侧契约模式）+ humanizeViewError 改 code 驱动；**协议零改** | **M4.1 做**，S/M：纯 studio 侧；迁移逐通道 + 既有文案锁对齐 + 双侧契约测试 |
+| C3 | **委派依赖透传** | 插入点已定：协议 DelegationTask（hub src/delegation.ts:20-27）+ hub parse 白名单（delegations.ts:109-126，brief 不持久化只随 task.assigned 事件过 :274-277）+ studio dispatch-submit.ts:53-58/:139-148 + hub:taskDelegate 直通道（ipc.handlers.ts:91-103）+ retryDispatch。**语义裁定要点：dependsOn 是 leader 本地任务 id，跨节点无意义——应为 leader 侧派发闸（blocked 不 delegate）而非 worker 侧消费**；brief 字段仅作展示/审计透传 | **M4.3 做**，S/M：leader 侧闸（复用 M3.3 四闸模式）+ 协议可选字段（1.6.0 与 C1 同车）；worker 侧不消费 |
+| C4 | **撤回治理** | resources 无 owner 列（仅 resource_versions.published_by 存节点名，name 唯一可解析）；**resources 无组概念**——leader-only 需先建 resource↔group 关联（publish 带 groupId 或撤回时按发布节点所属组）+ 端点守卫；真实多租场景尚不存在 | **延后到 M4.4 开工前再裁**（默认倾向裁关闭：无真实场景，先做则需先定 resource 组归属模型——超出治理票据范围） |
+| C5 | **e2e 回归沉淀** | 8 spec 清单；hub-distribution.spec.ts **已有多实例原语**（launchApp×2 + mock hub WS + mock LLM + sendToNode/waitForNodeConn）——但 mock hub 无 task.answer/view.*/unpublished 处理；M3.1/3.3/3.4 零 e2e 覆盖确认；无共享 harness 模块。**裁定：沉淀两件**——①M3.3 依赖链 e2e（单实例零 hub 依赖，最高性价比）②M3.1 HITL 代答 e2e（mock hub 扩 task.answer）；M3.4 撤回 e2e **不做**（mock HTTP 面失真，单测+真机验收已覆盖，记裁定理由） | **M4.0 做**，M：两个 spec 文件（一新一扩） |
+| C6 | **票桶 P3** | D1 已修（`fb9ca5ea`：发布事件对称化重拉列表——根因 onResourcePublished 只记角标不 load 与撤回事件不对称）；缩进已修（`3b1ff257`）；pullNodes 只增不删 = M2.5 A6 设计边界非缺陷（关闭） | ✅ **已完成**（2026-10-29，分支 m4.0） |
 
 **待您裁定的非代码项（不入期，单独确认）**：验收残留 keychain 假键清理（`Momo Studio-<hash8>` 共 8 条，`security delete-generic-password` 一次性脚本）。
 
@@ -33,6 +33,13 @@
 | C3 依赖透传重开协议 minor | 能力门槛实战 3 次零事故，模式成熟 |
 | M4 膨胀（M2 教训） | 硬上限 5 期；C4 可裁关闭；票桶不占期 |
 
-## 4. 待批准（定稿后呈报）
+## 4. 批准记录（2026-10-29）
 
-1. 分期与顺序；2. C4 是否裁关闭；3. keychain 清理是否执行；4. M4.0 是否立即开工。
+用户指令：「没有问题」。
+
+1. 分期与顺序：**采纳**（M4.0 沉淀清偿 → M4.1 错误契约统一 → M4.2 多组终态 → M4.3 委派依赖透传 → M4.4 撤回治理，硬上限 5 期）。
+2. C4 撤回治理：**延后到该期开工前再裁**（默认保留为 M4.4，若届时无真实多租场景即裁关闭）。
+3. keychain 清理：**执行**（仅删验收残留分域键——按创建日期 2026-10-28/29 判别，勿动个人隔离 profile 真实键与裸名既有条目）。
+4. M4.0 **立即开工**（探查回报后回填判定定稿 M4.0 票据）。
+
+**质量门不变**：沿用 M3 全流程（Momus/oracle 技术门保留）。

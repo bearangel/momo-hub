@@ -7,7 +7,9 @@
 // unsubscribe 注销 / leader 与目标断开双侧自动注销——RF#1 断开后零泄漏）/ 守卫矩阵
 // （非 leader / 非同组 / consent false / 离线 / 在途断开结算 / 伪造应答）/ 
 // view.consent 上行处理（形状校验 / 未知节点拒）/ M3.2 groupId 双路径（同组过 /
-// 跨组 forbidden / 守卫先行 / 缺省回落旧形状零变化）。
+// 跨组 forbidden / 守卫先行 / 缺省回落旧形状零变化）/ M4.2 订阅组锚定（显式
+// groupId 订阅：推送透传 + 复检记录值优先；旧订阅形状零变化锁 + 动态推导回落
+// 对照；1.5.0 peer 带新可选字段零门槛）。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -46,7 +48,7 @@ afterAll(async () => {
 
 interface NodeCred { nodeId: string; deviceToken: string }
 
-function connectCred(cred: NodeCred) {
+function connectCred(cred: NodeCred, protoVer: string = PROTOCOL_VERSION) {
   return new Promise<{ ws: WebSocket; nodeId: string; cred: NodeCred; inbox: Envelope[]; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
     const ws = new WebSocket(wsUrl, { headers: { authorization: `Bearer ${cred.deviceToken}` } });
     const inbox: Envelope[] = [];
@@ -781,5 +783,95 @@ describe('M3.2 groupId 双路径', () => {
     const ghost = await callRpc(leader, RPC.view.workspaces, viewReq(RPC.view.workspaces, target.nodeId, { groupId: 'group-ghost' }));
     expect(errOf(ghost).code).toBe('not_found');
     leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// M4.2 订阅组锚定（1.6.0——记录值复检 + 推送透传；旧订阅形状零变化）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('M4.2 订阅组锚定', () => {
+  /** leader 双组含 target：g1 先建（commonGroupId 恒取 g1），g2 为显式锚定消歧组。 */
+  async function setupTwoGroups(pref: string): Promise<{ leader: Client; target: Client; g1: string; g2: string }> {
+    const { leader, target, groupId: g1 } = await setupGroup(pref);
+    const created = await callRpc(leader, RPC.group.create, { groupName: `Team-${pref}-2` });
+    const g2 = (resPayload(created) as { groupId: string }).groupId;
+    const invited = await callRpc(leader, RPC.group.invite, { groupId: g2 });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    return { leader, target, g1, g2 };
+  }
+
+  it('显式 groupId 订阅：tail 推送带该 groupId（订阅时透传记录）；target 退锚定组后复检不扇出——commonGroupId 本可命中旧组（记录值优先）', async () => {
+    const { leader, target, g2 } = await setupTwoGroups('m42anchor');
+    const sub = callRpcEnv(leader, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1', groupId: g2 }));
+    const fwd = await awaitForwarded(target, RPC.view.subscribe);
+    // 转发载荷含 groupId 逐字节透传（M3.2 既有语义，复验）
+    expect(fwd.payload).toEqual(viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1', groupId: g2 }));
+    replyTarget(target, fwd, true, { ok: true });
+    expect(resPayload(await sub.res)).toEqual({ ok: true });
+
+    // 推送组锚定：view.appended 载荷带记录组 g2
+    await sendTail(target, 'sess-1', [msg(1, '锚定组推送')]);
+    const a1 = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    expect(a1.payload).toEqual({ sessionId: 'sess-1', events: [msg(1, '锚定组推送')], groupId: g2 });
+
+    // target 退 g2（仍在 g1——旧路径 commonGroupId 会命中 g1 误放行）：记录组复检失败 → 不扇出
+    await callRpc(target, RPC.group.leave, { groupId: g2 });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string; kind: string }).nodeId === target.nodeId
+      && (e.payload as { kind: string }).kind === 'left');
+    const tail2 = await sendTail(target, 'sess-1', [msg(2, '退锚定组后不可见')]);
+    expect(tail2.kind === 'res' && tail2.ok).toBe(true);
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.viewAppended)).toHaveLength(1); // 仍只有锚定期内那份
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('旧订阅形状零变化锁：无 groupId 订阅——推送载荷不带 groupId 键（逐字节旧形状）；复检回落 commonGroupId 动态推导（退推导组 g1 后改命中 g2 照常扇出——非记录冻结）', async () => {
+    const { leader, target, g1 } = await setupTwoGroups('m42old');
+    const sub = callRpcEnv(leader, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1' }));
+    const fwd = await awaitForwarded(target, RPC.view.subscribe);
+    expect(fwd.payload).toEqual(viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1' }));
+    expect(fwd.payload).not.toHaveProperty('groupId');
+    replyTarget(target, fwd, true, { ok: true });
+    expect(resPayload(await sub.res)).toEqual({ ok: true });
+
+    // 推送载荷 = 旧形状两键（sessionId + events，不带 groupId 键）
+    await sendTail(target, 'sess-1', [msg(1, '旧形状推送')]);
+    const a1 = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    expect(a1.payload).toEqual({ sessionId: 'sess-1', events: [msg(1, '旧形状推送')] });
+
+    // target 退 g1（commonGroupId 此前的推导组；g2 仍在）：动态复检改命中 g2 → 照常扇出
+    // （若复检错误冻结订阅时推导值，此处会误停——旧路径动态语义锁）
+    await callRpc(target, RPC.group.leave, { groupId: g1 });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string; kind: string }).nodeId === target.nodeId
+      && (e.payload as { kind: string }).kind === 'left');
+    await sendTail(target, 'sess-1', [msg(2, '动态推导仍同组')]);
+    const a2 = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended && e !== a1);
+    expect(a2.payload).toEqual({ sessionId: 'sess-1', events: [msg(2, '动态推导仍同组')] });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('minor 零门槛（1.6.0 纯可选字段）：1.5.0 peer 调 view.subscribe 带新可选字段 groupId → 过门槛进 handler 全链受理（非 unsupported_method）', async () => {
+    const target = await connect('m42minor-target');
+    const cred = enrollNode(db, identity.enrollmentToken, 'm42minor-leader');
+    if ('error' in cred) throw new Error('enroll 失败');
+    const leader15 = await connectCred(cred, '1.5.0');
+    const created = await callRpc(leader15, RPC.group.create, { groupName: 'Team-m42minor' });
+    const groupId = (resPayload(created) as { groupId: string }).groupId;
+    const invited = await callRpc(leader15, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader15.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    const sub = callRpcEnv(leader15, RPC.view.subscribe, viewReq(RPC.view.subscribe, target.nodeId, { sessionId: 'sess-1', groupId }));
+    const fwd = await awaitForwarded(target, RPC.view.subscribe);
+    replyTarget(target, fwd, true, { ok: true });
+    const r = await sub.res;
+    // 1.5 peer 调带新可选字段的既有方法：不受新门槛（全表最大门槛 4），照常受理
+    expect(r.kind === 'res' && r.ok).toBe(true);
+    expect(resPayload(r)).toEqual({ ok: true });
+    leader15.ws.close(); target.ws.close();
   });
 });

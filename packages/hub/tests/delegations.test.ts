@@ -565,10 +565,12 @@ describe('task.list', () => {
     expect(tasks.map((t) => t.taskId).sort()).toEqual([t1, t2, t3].sort());
     const rec = tasks.find((t) => t.taskId === t2)!;
     expect(rec).toMatchObject({ workspaceName: 'ws-l2', targetNodeId: target.nodeId, status: 'running', title: '修登录 bug' });
-    // 键集锁（M3.1 扩四键）：代答留痕四字段恒在（未代答为 null）
+    // 组归属投影（M4.2）：group_id 既有列直接带出——零迁移
+    expect(rec.groupId).toBe(groupId);
+    // 键集锁（M3.1 扩四键 + M4.2 扩 groupId）：代答留痕四字段恒在（未代答为 null）
     expect(Object.keys(rec).sort()).toEqual([
       'answerDecision', 'answerMessage', 'answeredAt', 'answeredBy',
-      'createdAt', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+      'createdAt', 'groupId', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
     ]);
 
     // 状态过滤

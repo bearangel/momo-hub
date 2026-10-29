@@ -1,6 +1,7 @@
-// protocol 1.2.0/1.3.0/1.4.0/1.5.0 工作组与远程代答/远端可见性/资源生命周期契约测试
+// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0 工作组与远程代答/远端可见性/资源生命
+// 周期/多组终态契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
-// 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1）：
+// 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -62,17 +63,18 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.5.0 与 1.1.0/1.2.0/1.3.0/1.4.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.5.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.5.0');
+describe('版本 1.6.0 与 1.1.0-1.5.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.6.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.6.0');
   });
 
-  it('1.1.0 ↔ 1.5.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.5.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.5.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.5.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.5.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.5.0')).toBe(false);
+  it('1.1.0 ↔ 1.6.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.6.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.6.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.6.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.6.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.6.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.6.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -156,6 +158,14 @@ describe('minorOf / protocolSupports 矩阵', () => {
     }
     // 未登记者视为基线 2（约定：消费方 fallback ?? 2）
     expect(METHOD_REQUIRED_MINOR['future.method']).toBeUndefined();
+  });
+
+  it('METHOD_REQUIRED_MINOR 无 M4.2 门槛登记：全表无 minor≥5 条目（1.6.0 全部为可选字段——view 订阅组锚定 / view.appended groupId? / TaskRecord.groupId，无新方法；1.5 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
+    for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
+      expect(minor, `方法 ${method}`).toBeLessThan(5);
+    }
+    // 全表最大门槛 4 对 1.5.0 peer 恒通过——新能力纯可选字段，无需能力协商
+    expect(protocolSupports('1.5.0', 4)).toBe(true);
   });
 });
 
@@ -296,12 +306,17 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     expect(withReason.reason).toBe('declined');
   });
 
-  it('ViewAppendedEvent：{sessionId, events[]}', () => {
+  it('ViewAppendedEvent：{sessionId, events[]}；M4.2 可选 groupId（缺省不带键——旧订阅形状载荷零变化）', () => {
     const evt: ViewAppendedEvent = {
       sessionId: 's1',
       events: [{ seq: 1, at: 1_700_000_000_000, role: 'assistant', content: 'hi' }],
     };
     expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
+    expect(evt).not.toHaveProperty('groupId');
+    // 在场：订阅时透传记录的组锚定值（显式 groupId 订阅专属）
+    const anchored: ViewAppendedEvent = { ...evt, groupId: 'g-42' };
+    expect(JSON.parse(JSON.stringify(anchored))).toEqual(anchored);
+    expect(Object.keys(anchored).sort()).toEqual(['events', 'groupId', 'sessionId']);
   });
 
   it('WorkspaceMirroredEvent：五字段全量', () => {
@@ -417,6 +432,13 @@ describe('委派类型 round-trip', () => {
     expect(Object.keys(answered).sort()).toEqual([
       'answerDecision', 'answerMessage', 'answeredAt', 'answeredBy',
       'createdAt', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+    ]);
+    // M4.2 组归属：groupId 可选——在场时入键集（hub 侧 group_id 恒非空，task.list
+    // 实际输出恒带该字段；类型层锁在场格，缺省格由上方基础记录锁覆盖）
+    const grouped: TaskRecord = { ...rec, groupId: 'g-42' };
+    expect(JSON.parse(JSON.stringify(grouped))).toEqual(grouped);
+    expect(Object.keys(grouped).sort()).toEqual([
+      'createdAt', 'groupId', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
     ]);
   });
 

@@ -1,7 +1,8 @@
-// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0 工作组与远程代答/远端可见性/资源生命
-// 周期/多组终态契约测试
+// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0/1.7.0 工作组与远程代答/远端可见性/资源生命
+// 周期/多组终态/委派依赖透传契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
-// 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2）：
+// 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2 +
+// 2026-10-29 M4.3 §2.1/§2.2）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -63,18 +64,19 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.6.0 与 1.1.0-1.5.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.6.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.6.0');
+describe('版本 1.7.0 与 1.1.0-1.6.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.7.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.7.0');
   });
 
-  it('1.1.0 ↔ 1.6.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.6.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.6.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.6.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.6.0')).toBe(true);
-    expect(isCompatible('1.5.0', '1.6.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.6.0')).toBe(false);
+  it('1.1.0 ↔ 1.7.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.7.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.7.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.7.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.7.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.7.0')).toBe(true);
+    expect(isCompatible('1.6.0', '1.7.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.7.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -166,6 +168,14 @@ describe('minorOf / protocolSupports 矩阵', () => {
     }
     // 全表最大门槛 4 对 1.5.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.5.0', 4)).toBe(true);
+  });
+
+  it('METHOD_REQUIRED_MINOR 无 M4.3 门槛登记：全表无 minor≥5 条目（1.7.0 全部为可选字段——DelegationTask.dependsOn 依赖元数据透传，无新方法；1.6 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
+    for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
+      expect(minor, `方法 ${method}`).toBeLessThan(5);
+    }
+    // 全表最大门槛 4 对 1.6.0 peer 恒通过——新能力纯可选字段，无需能力协商
+    expect(protocolSupports('1.6.0', 4)).toBe(true);
   });
 });
 
@@ -278,7 +288,7 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     ]);
   });
 
-  it('TaskAssignedEvent：嵌套 DelegationTask（title/prompt/agentSlug?）', () => {
+  it('TaskAssignedEvent：嵌套 DelegationTask（title/prompt/agentSlug?）；M4.3 可选 dependsOn（缺省不带键——1.6 载荷零变化）', () => {
     const evt: TaskAssignedEvent = {
       taskId: 't1',
       workspaceName: 'ws',
@@ -288,6 +298,17 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
     const noSlug: DelegationTask = { title: 'T', prompt: 'P' };
     expect(noSlug.agentSlug).toBeUndefined();
+    // dependsOn 可选依赖清单（M4.3）：缺省不带键；在场原样 round-trip（leader
+    // 本地任务 id，透传不校验存在性——hub 无从校验）
+    expect(noSlug).not.toHaveProperty('dependsOn');
+    const withDeps: TaskAssignedEvent = {
+      ...evt,
+      task: { ...evt.task, permissionTier: 'confirm', dependsOn: ['T-1', 'T-2'] },
+    };
+    expect(JSON.parse(JSON.stringify(withDeps))).toEqual(withDeps);
+    expect(Object.keys(withDeps.task).sort()).toEqual(
+      ['agentSlug', 'dependsOn', 'permissionTier', 'prompt', 'title'],
+    );
   });
 
   it('TaskProgressEvent：{taskId, sessionId, lastSeq, excerpt, kind?}', () => {

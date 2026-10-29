@@ -116,10 +116,11 @@ function ledgerRow(taskId: string): LedgerRow | undefined {
   return db.prepare('SELECT * FROM delegations WHERE task_id = ?').get(taskId) as LedgerRow | undefined;
 }
 
-function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string; permissionTier?: unknown } = {}): Record<string, unknown> {
+function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string; permissionTier?: unknown; dependsOn?: unknown } = {}): Record<string, unknown> {
   const task: Record<string, unknown> = { title: opts.title ?? '修登录 bug', prompt: opts.prompt ?? '请修复登录失败问题' };
   if (opts.agentSlug !== undefined) task.agentSlug = opts.agentSlug;
   if (opts.permissionTier !== undefined) task.permissionTier = opts.permissionTier;
+  if (opts.dependsOn !== undefined) task.dependsOn = opts.dependsOn;
   return { groupId, targetNodeId, workspaceName: opts.workspaceName ?? 'ws-t', task };
 }
 
@@ -276,6 +277,95 @@ describe('task.delegate 全链', () => {
       });
       expect((assigned.payload as { task: Record<string, unknown> }).task).not.toHaveProperty('permissionTier');
     }
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// dependsOn 透传（M4.3，1.7.0——委派依赖元数据；沿 manifest version? 三格模式：
+// 缺省不带键 / 在场保留 / 非法整包拒 400；透传不校验存在性——leader 本地任务
+// id 对 hub 无意义，worker 零消费，语义裁定 spec 2026-10-29 §2.1）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('dependsOn 透传（M4.3）', () => {
+  it('三格之一 缺省：不带 dependsOn → 受理且 assigned 载荷 task 无该键（1.6 载荷零变化）', async () => {
+    const { leader, target, groupId } = await setupGroup('depns');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-dep-ns' }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
+      title: '修登录 bug', prompt: '请修复登录失败问题',
+    });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('三格之二 在场：合法清单随 task.assigned 原样透传（不校验存在性——伪造 id 也受理）+ 与 agentSlug/permissionTier 并存互不干扰', async () => {
+    const { leader, target, groupId } = await setupGroup('depok');
+    const dependsOn = ['T-abc123', 'T-x9', 'ghost-id-不存在也过'];
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-dep-ok', agentSlug: 'coder-pro', permissionTier: 'confirm', dependsOn,
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
+      title: '修登录 bug', prompt: '请修复登录失败问题',
+      agentSlug: 'coder-pro', permissionTier: 'confirm', dependsOn,
+    });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('三格之三 非法：非数组 / 项非字符串 / null → 整包拒 bad_request（不落档、无 assigned）', async () => {
+    const { leader, target, groupId } = await setupGroup('depbad');
+    const bads: Array<{ name: string; dependsOn: unknown }> = [
+      { name: '字符串非数组', dependsOn: 'T-1' },
+      { name: '项非字符串（数字）', dependsOn: ['T-1', 42] },
+      { name: 'null', dependsOn: null },
+      { name: '嵌套对象', dependsOn: [{ id: 'T-1' }] },
+    ];
+    for (const c of bads) {
+      const res = await callRpc(leader, RPC.task.delegate,
+        delegateReq(groupId, target.nodeId, { workspaceName: 'ws-dep-bad', dependsOn: c.dependsOn }));
+      // 拒收 ≠ 剥除（与 permissionTier 语义相反）：依赖清单是 leader 侧闸的
+      // 数据依据，静默剥除会让 leader 误判透传成功
+      expect(errOf(res).code, `用例：${c.name}`).toBe('bad_request');
+    }
+    await settle();
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegations WHERE workspace_name = ?')
+      .get('ws-dep-bad') as { n: number }).n).toBe(0);
+    expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAssigned)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('上限边界：50 项合法受理且逐项透传；51 项拒 bad_request（DoS 下限）', async () => {
+    const { leader, target, groupId } = await setupGroup('depmax');
+    const fifty = Array.from({ length: 50 }, (_, i) => `T-${i + 1}`);
+    const tOk = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-dep-50', dependsOn: fifty,
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === tOk);
+    expect((assigned.payload as { task: { dependsOn?: string[] } }).task.dependsOn).toEqual(fifty);
+
+    const over = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-dep-51', dependsOn: [...fifty, 'T-51'],
+    }));
+    expect(errOf(over).code).toBe('bad_request');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('单项长度边界：128 字符合法透传；129 字符拒 bad_request（STR_LIST_ITEM_MAX 同量级）', async () => {
+    const { leader, target, groupId } = await setupGroup('depitem');
+    const at = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-dep-128', dependsOn: ['T-' + 'x'.repeat(126)],
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === at);
+    expect((assigned.payload as { task: { dependsOn?: string[] } }).task.dependsOn).toEqual(['T-' + 'x'.repeat(126)]);
+
+    const over = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-dep-129', dependsOn: ['T-' + 'x'.repeat(127)],
+    }));
+    expect(errOf(over).code).toBe('bad_request');
     leader.ws.close(); target.ws.close();
   });
 });

@@ -1,4 +1,9 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.6.0（M4.2 多组终态）：view 订阅组锚定（订阅记录存显式 groupId +
+//  view.appended 推送透传 groupId?）+ TaskRecord 增可选 groupId?（delegations
+//  .group_id 既有列直接投影，零迁移）——全部为可选字段，无新 RPC 方法、无
+//  METHOD_REQUIRED_MINOR 门槛登记（未知字段剥除对旧节点天然宽容，1.5 peer 调
+//  任何已登记方法不受影响），major 不动。
 // 1.5.0（M3.4 资源生命周期）：快照引用 SnapshotResourceRef.version?（B13 版本钉死，可选
 // 透传）+ 目录 HubCatalog.revision（B10 持久化修订号）+ resource.unpublished 撤回事件（B12）
 // ——全部为可选字段/事件，无新 RPC 方法、无 METHOD_REQUIRED_MINOR 门槛登记（事件与字段对
@@ -11,7 +16,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.5.0';
+export const PROTOCOL_VERSION = '1.6.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

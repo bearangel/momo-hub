@@ -41,11 +41,15 @@ export interface TaskCancelRes { ok: boolean }
 export interface TaskListReq { groupId?: string; status?: DelegationStatus }
 export interface TaskListRes { tasks: TaskRecord[] }
 
-/** 委派账本条目（§3.1 task.list 响应项——七字段 + M3.1 代答留痕四字段）。 */
+/** 委派账本条目（§3.1 task.list 响应项——七字段 + M3.1 代答留痕四字段 +
+ *  M4.2 组归属字段）。 */
 export interface TaskRecord {
   taskId: string;
   workspaceName: string;
   targetNodeId: string;
+  /** 组归属（M4.2，1.6.0）：hub 从 delegations.group_id 既有列直接投影（零迁移）
+   *  ——leader 委派板据此按组过滤/聚合；可选字段（1.5 消费方未知容忍剥除）。 */
+  groupId?: string;
   status: DelegationStatus;
   title: string;
   createdAt: number;

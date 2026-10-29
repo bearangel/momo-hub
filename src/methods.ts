@@ -45,6 +45,8 @@ METHOD_REQUIRED_MINOR[RPC.task.answer] = 3;
 // M3.4（1.5.0）：无新 RPC 方法、无门槛登记——本组全部为可选字段/事件
 // （SnapshotResourceRef.version? / HubCatalog.revision / resource.unpublished），
 // 对旧节点天然宽容（未知事件忽略、未知字段剥除），无需能力协商。
+// M4.2（1.6.0）：同上零登记——view 订阅组锚定与 TaskRecord.groupId 全部为
+// 可选字段，无新方法；1.5 peer 调任何已登记方法不受影响（全表最大门槛仍为 4）。
 METHOD_REQUIRED_MINOR[RPC.view.workspaces] = 4;
 METHOD_REQUIRED_MINOR[RPC.view.files] = 4;
 

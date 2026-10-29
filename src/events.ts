@@ -87,6 +87,10 @@ export interface TaskTerminalEvent {
 export interface ViewAppendedEvent {
   sessionId: string;
   events: ViewMessage[];
+  /** 组锚定（M4.2，1.6.0）：显式 groupId 订阅的透传记录——订阅时锚定、推送时
+   *  带出（订阅端据此判定该增量归属哪个组的查看面板）；缺省不带键（旧订阅
+   *  形状载荷逐字节零变化）。 */
+  groupId?: string;
 }
 
 /** workspace.mirrored：组内广播——组内皆可见谁被镜像到什么版本。 */

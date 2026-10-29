@@ -187,6 +187,8 @@ interface DelegationRow {
 function toRecord(r: DelegationRow): TaskRecord {
   return {
     taskId: r.task_id,
+    // 组归属（M4.2）：group_id 既有列直接投影——零迁移，leader 委派板按组聚合的依据
+    groupId: r.group_id,
     workspaceName: r.workspace_name,
     targetNodeId: r.target_node_id,
     status: r.status,

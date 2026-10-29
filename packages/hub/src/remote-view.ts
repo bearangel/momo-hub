@@ -15,9 +15,11 @@
 //    在途窗口内目标断开 → 立即结算 node_offline（不悬到超时）；leader 断开 →
 //    结算释放（res 无处投递，静默丢弃）。
 // 3) view.subscribe 特殊：目标接受（res ok）后 hub 登记 (leaderNodeId,
-//    targetNodeId, sessionId) 三元组；此后目标以 req 信封 method=view.tail
+//    targetNodeId, sessionId) 三元组（M4.2 起显式 groupId 订阅追加锚定值）；
+//    此后目标以 req 信封 method=view.tail
 //    （payload={sessionId, events:[{seq,at,role,content}...]}）主动上行尾部
-//    增量——hub 组装 view.appended evt（§3.2）定向推全部订阅该会话的 leader
+//    增量——hub 组装 view.appended evt（§3.2；锚定订阅带 groupId 透传）定向推
+//    全部订阅该会话的 leader
 //    （多 leader 扇出）；无订阅到达即丢弃 + 日志，对目标仍回 ok（不炸上行）。
 // 4) 豁免约定：view.unsubscribe 为清理路径——不受 consent 校验阻断（目标关
 //    开关后 leader 恒可退订，防 RF#1 卡死）；本地注销先行，目标在线则转发并
@@ -29,11 +31,11 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
   EVT, RPC, RPC_ERROR_CODES,
-  type EventEnvelope, type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload,
+  type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload,
   type ViewAppendedEvent, type ViewMessage, type ViewTailPayload,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
-import { commonGroupId, isMember, type GroupHandlerContext, type RpcOutcome } from './groups';
+import { commonGroupId, isLeaderOf, isMember, type GroupHandlerContext, type RpcOutcome } from './groups';
 import { logger } from './logger';
 
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
@@ -106,7 +108,14 @@ interface PendingForward {
   timer: NodeJS.Timeout;
 }
 
-interface SubEntry { leaderNodeId: string; targetNodeId: string; sessionId: string }
+interface SubEntry {
+  leaderNodeId: string;
+  targetNodeId: string;
+  sessionId: string;
+  /** 订阅组锚定（M4.2 §2.2）：仅显式 payload.groupId 落值；缺省不落——
+   *  handleTail 复检与推送回落 commonGroupId 旧路径（旧订阅形状逐字节零变化）。 */
+  groupId?: string;
+}
 
 /** 构造选项（转发超时测试注入——server.ts viewForwardTimeoutMs 透传）。 */
 export interface RemoteViewRouterOpts {
@@ -177,8 +186,12 @@ export class RemoteViewRouter {
     const outcome = await this.forward(ctx.nodeId, targetNodeId, method, payload);
     if (outcome.ok && method === RPC.view.subscribe) {
       if (sessionId !== null) {
-        this.subs.set(subKey(ctx.nodeId, targetNodeId, sessionId), { leaderNodeId: ctx.nodeId, targetNodeId, sessionId });
-        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId });
+        // 组锚定（M4.2）：仅显式 groupId 入记录（同组校验的 groupId 变量复用）；
+        // 无记录值 → handleTail 回落 commonGroupId 动态推导，旧订阅者零变化
+        const entry: SubEntry = { leaderNodeId: ctx.nodeId, targetNodeId, sessionId };
+        if (groupId !== null) entry.groupId = groupId;
+        this.subs.set(subKey(ctx.nodeId, targetNodeId, sessionId), entry);
+        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId, groupId: entry.groupId });
       }
     }
     return outcome;
@@ -211,20 +224,34 @@ export class RemoteViewRouter {
     }
     const subscribers = [...this.subs.values()]
       .filter((s) => s.targetNodeId === ctx.nodeId && s.sessionId === tail.sessionId
-        // 订阅存续期复检同组（T13 评审 Important①）：hub 不主动杀登记，退组后
-        // 靠复检收敛——同组关系已解除的订阅不再扇出
-        && commonGroupId(this.db, s.leaderNodeId, s.targetNodeId) !== undefined);
+        // 订阅存续期复检同组（T13 评审 Important① 的 M4.2 组锚定版，见 subSameGroup）
+        && this.subSameGroup(s));
     if (subscribers.length === 0) {
       logger.info('尾部事件无订阅，丢弃', { from: ctx.nodeId, sessionId: tail.sessionId, count: tail.events.length });
       return { ok: true, payload: { ok: true } };
     }
-    const evt: EventEnvelope = {
-      v: 1, kind: 'evt', method: EVT.viewAppended,
-      payload: { sessionId: tail.sessionId, events: tail.events } satisfies ViewAppendedEvent,
-    };
-    for (const s of subscribers) void this.registry.sendTo(s.leaderNodeId, evt);
+    for (const s of subscribers) {
+      // 推送组锚定（M4.2）：记录带显式 groupId 时透传（订阅时锚定、推送时带出）；
+      // 无记录值 → 旧形状载荷（不带键——旧订阅者逐字节零变化）
+      const payload: ViewAppendedEvent = s.groupId !== undefined
+        ? { sessionId: tail.sessionId, events: tail.events, groupId: s.groupId }
+        : { sessionId: tail.sessionId, events: tail.events };
+      void this.registry.sendTo(s.leaderNodeId, { v: 1, kind: 'evt', method: EVT.viewAppended, payload });
+    }
     logger.info('尾部事件定向推送', { from: ctx.nodeId, sessionId: tail.sessionId, count: tail.events.length, subscribers: subscribers.length });
     return { ok: true, payload: { ok: true } };
+  }
+
+  /** 订阅存续期复检同组（T13 Important① 的 M4.2 组锚定版）：记录带显式 groupId
+   *  时按该组复检——订阅者仍是该组组长且 target 仍是该组成员（commonGroupId
+   *  谓词的定组版；leader 身份 + isMember 两半分工与 M3.2 双路径一致）；无记录
+   *  值（旧订阅形状）回落 commonGroupId 动态推导——复检语义零变化。hub 不主动
+   *  杀登记，同组关系解除后靠复检收敛。 */
+  private subSameGroup(s: SubEntry): boolean {
+    if (s.groupId === undefined) {
+      return commonGroupId(this.db, s.leaderNodeId, s.targetNodeId) !== undefined;
+    }
+    return isLeaderOf(this.db, s.groupId, s.leaderNodeId) && isMember(this.db, s.groupId, s.targetNodeId);
   }
 
   /** 目标 res 对账（上行 res 信封，id=转发 id）：未匹配 / 来源非该转发目标 → 忽略。 */

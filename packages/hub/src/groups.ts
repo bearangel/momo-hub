@@ -52,6 +52,12 @@ export function isMember(db: Database.Database, groupId: string, nodeId: string)
   return db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND node_id = ?').get(groupId, nodeId) !== undefined;
 }
 
+/** 组长判定（M4.2 起导出：remote-view handleTail 订阅复检的记录组路径消费——
+ *  与 isMember 分工同 M3.2 双路径：复检验 leader 身份 + target 成员两半）。 */
+export function isLeaderOf(db: Database.Database, groupId: string, nodeId: string): boolean {
+  return db.prepare('SELECT 1 FROM groups WHERE id = ? AND leader_node_id = ?').get(groupId, nodeId) !== undefined;
+}
+
 /**
  * group.changed 组内广播（§3.2）：状态变迁落库成功后调用；逐成员定向投递，
  * 离线成员静默跳过（sendTo 判 'offline'）——事件是通知面不是账本，不积压不重放。

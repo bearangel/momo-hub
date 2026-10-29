@@ -83,6 +83,8 @@ const REASON_MAX = 512;
 const EXCERPT_MAX = 512;
 const SLUG_MAX = 64;              // S1 SLUG_MAX
 const ANSWER_MESSAGE_MAX = 512;   // 代答备注（TaskAnswerReq.message 同界）
+const DEPENDS_ON_MAX = 50;        // 依赖 id 清单上限（M4.3，DoS 下限）
+const DEPENDS_ON_ITEM_MAX = 128;  // 依赖 id 单项上限（STR_LIST_ITEM_MAX 同量级）
 
 /** permissionTier 合法档位（M2.1 T10b，与协议包 DelegationTask.permissionTier 枚举同源）。 */
 const PERMISSION_TIERS: readonly DelegationTask['permissionTier'][] = ['readonly', 'sandbox', 'confirm'];
@@ -106,7 +108,8 @@ function optBoundedStr(raw: unknown, max: number): string | null {
   return typeof raw === 'string' && raw.length > 0 && raw.length <= max ? raw : null;
 }
 
-/** 任务书校验：title 1..128、prompt 非空且 ≤16KB（字节）、agentSlug 可选 ≤64。 */
+/** 任务书校验：title 1..128、prompt 非空且 ≤16KB（字节）、agentSlug 可选 ≤64、
+ *  dependsOn 可选 string 数组 ≤50 项且每项 ≤128 字符（M4.3，非法整包拒）。 */
 function parseDelegationTask(raw: unknown): DelegationTask | null {
   if (!isRecord(raw)) return null;
   const title = optBoundedStr(raw.title, TITLE_MAX);
@@ -123,6 +126,16 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
   // modelBinding——档位缺省语义在目标侧，hub 不因坏档位拒整张任务书）
   if (raw.permissionTier !== undefined && (PERMISSION_TIERS as readonly string[]).includes(raw.permissionTier as string)) {
     task.permissionTier = raw.permissionTier as DelegationTask['permissionTier'];
+  }
+  // dependsOn（M4.3）：形状校验 string 数组 + 上限，非法整包拒（沿 manifest
+  // version? 三格模式：缺省不带键 / 在场保留 / 非法拒收——与 permissionTier
+  // 的剥除语义不同：依赖清单是 leader 侧闸的数据依据，静默剥除会让 leader 误判
+  // 透传成功）。透传不校验存在性——leader 本地任务 id 对 hub 无意义（语义裁定
+  // spec 2026-10-29 §2.1，双仓注释锚定）；随 task.assigned 事件过不持久化。
+  if (raw.dependsOn !== undefined) {
+    if (!Array.isArray(raw.dependsOn) || raw.dependsOn.length > DEPENDS_ON_MAX
+      || !raw.dependsOn.every((s) => typeof s === 'string' && s.length <= DEPENDS_ON_ITEM_MAX)) return null;
+    task.dependsOn = [...raw.dependsOn];
   }
   return task;
 }
@@ -257,7 +270,7 @@ export class DelegationRouter {
       return { ok: false, error: err('bad_request', `workspaceName 超长（≤${WORKSPACE_NAME_MAX}）`) };
     }
     const task = parseDelegationTask(isRecord(payload) ? payload.task : undefined);
-    if (!task) return { ok: false, error: err('bad_request', 'task 非法（title 1-128 / prompt 非空 ≤16KB / agentSlug? ≤64）') };
+    if (!task) return { ok: false, error: err('bad_request', 'task 非法（title 1-128 / prompt 非空 ≤16KB / agentSlug? ≤64 / dependsOn? ≤50 项且每项 ≤128）') };
 
     if (!this.db.prepare('SELECT 1 FROM groups WHERE id = ?').get(groupId)) {
       return { ok: false, error: err('not_found', '工作组不存在') };

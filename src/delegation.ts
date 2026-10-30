@@ -1,5 +1,6 @@
 // 委派契约（spec 2026-10-24 M2 §3.1「委派」表 + §3.2 事件 + 裁定 MC1/MC5；
-// M3.1 增 waiting 态与远程代答，spec 2026-10-28 §3.1）——
+// M3.1 增 waiting 态与远程代答，spec 2026-10-28 §3.1；M5.3 增 team 段，
+// spec 2026-10-30 §5.1）——
 // leader→hub→目标节点定向路由；账本状态机七态；hub 与 studio 双端消费。
 export const TASK_RPC = {
   delegate: 'task.delegate',
@@ -31,7 +32,34 @@ export interface DelegationTask {
    *  ≤128 字符，非法整包拒 400——沿 manifest version? 三格模式）；随 task.assigned
    *  事件过不持久化（同 brief 口径）；缺省不带键（1.6 载荷向后兼容）。 */
   dependsOn?: string[];
+  /** 外派团队段（M5.3，1.9.0）：成员名单快照随任务走（A 方案裁定——不依赖两边
+   *  团队表一致，派发时团队展开为名单）；接收端按名解析成员建多成员执行会话
+   *  （leader 接待 + dispatch 注入），任一解析失败 decline 人话名单（裁定 3——
+   *  不静默降级单 agent）。与 agentSlug 互斥（同场整包拒）；随 task.assigned 事件
+   *  透传，hub 不持久化（与 agentSlug/dependsOn 同生命周期——账本只存
+   *  taskId/title/prompt）；缺省不带键（1.8 载荷向后兼容）。 */
+  team?: DelegationTeam;
 }
+
+/** 团队成员条目：name = agent 定义名（与快照名对齐口径一致），1..64 字符。 */
+export interface DelegationTeamMember {
+  name: string;
+  isLeader: boolean;
+}
+
+/** 外派团队段形状：members 2..8 项、恰好 1 项 isLeader=true（hub 侧校验锚点）。 */
+export interface DelegationTeam {
+  members: DelegationTeamMember[];
+}
+
+/**
+ * 团队派发所需的最低协议 minor（M5.3 §5.1 版本门，1.9.0）：team 段是载荷能力
+ * （非新 RPC 方法，不入 METHOD_REQUIRED_MINOR）——目标节点 protoVer minor 低于
+ * 该值的旧 studio 会忽略未知 team 字段按单 agent 跑（静默换班，裁定禁止）。hub
+ * handleDelegate 按目标连接 peerProtoVer 权威门禁；studio 派发闸（提交时早失败）
+ * 消费同一常量作预检提示。1.9.0 = minor 9。
+ */
+export const TEAM_DELEGATION_REQUIRED_MINOR = 9;
 
 export interface TaskDelegateReq {
   groupId: string;

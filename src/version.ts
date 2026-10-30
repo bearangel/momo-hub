@@ -1,4 +1,13 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.9.0（M5.3 外派团队执行）：DelegationTask 增可选 team?（成员名单快照：members
+// 2..8 项、每项 {name: 1..64, isLeader}、恰好 1 个 leader、与 agentSlug 互斥——
+// 非法整包拒 bad_request，沿 dependsOn 先例；hub 不持久化，随 task.assigned 透传）
+// + GroupMember 增可选 protoVer?（group.list 在线成员携带 hello 上报的协议版本
+// ——studio 派发闸 / routingPrecheck nodeCaps 数据源）+ TEAM_DELEGATION_REQUIRED_MINOR
+// =9（team 段为载荷能力非新方法，门槛在 hub handleDelegate 按目标节点 protoVer
+// 权威门禁，不入 METHOD_REQUIRED_MINOR）——除版本门外全部为可选字段，无新 RPC
+// 方法、无 METHOD_REQUIRED_MINOR 门槛登记（无 team 段的旧任务书零变化，1.8 peer
+// 调任何已登记方法不受影响），major 不动。
 // 1.8.0（M5.0 资源归属权威）：HubResourceMeta.ownerNodeId?（目录项归属投影——studio
 //  「已发布」徽标与发布/下架按钮收敛的判定输入）+ ResourcePublishedEvent.ownerNodeId?
 //  （发布事件携归属，studio 目录增量合并保留该字段）+ hello 载荷可选 nodeName?
@@ -29,7 +38,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.8.0';
+export const PROTOCOL_VERSION = '1.9.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

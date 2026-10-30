@@ -161,7 +161,7 @@ describe('hub ws 服务', () => {
     expect(payload?.code).toBe('unsupported_method');
     expect(payload?.method).toBe('task.list');
     expect(payload?.requiredMinor).toBe(2);
-    expect(payload?.message).toContain('hub=1.8.0');
+    expect(payload?.message).toContain('hub=1.9.0');
     expect(payload?.message).toContain('节点=1.1.0');
     expect(payload?.message).toContain('task.list');
     peer.ws.close();

@@ -24,11 +24,11 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
-  EVT, METHOD_REQUIRED_MINOR, RPC, RPC_ERROR_CODES, minorOf,
-  type DelegationStatus, type DelegationTask, type EventEnvelope, type ResponseEnvelope,
-  type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent, type TaskAssignedEvent,
-  type TaskProgressEvent, type TaskRecord, type TaskReportPayload, type TaskReportProgress,
-  type TaskTerminalEvent,
+  EVT, METHOD_REQUIRED_MINOR, RPC, RPC_ERROR_CODES, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
+  type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
+  type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
+  type TaskAssignedEvent, type TaskProgressEvent, type TaskRecord, type TaskReportPayload,
+  type TaskReportProgress, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
@@ -85,6 +85,9 @@ const SLUG_MAX = 64;              // S1 SLUG_MAX
 const ANSWER_MESSAGE_MAX = 512;   // 代答备注（TaskAnswerReq.message 同界）
 const DEPENDS_ON_MAX = 50;        // 依赖 id 清单上限（M4.3，DoS 下限）
 const DEPENDS_ON_ITEM_MAX = 128;  // 依赖 id 单项上限（STR_LIST_ITEM_MAX 同量级）
+const TEAM_MEMBERS_MIN = 2;       // 团队成员下限（M5.3 spec §5.1：单 agent 走 agentSlug/缺省）
+const TEAM_MEMBERS_MAX = 8;       // 团队成员上限（DoS 下限 + 快照团队形态同量级）
+const TEAM_MEMBER_NAME_MAX = 64;  // 成员名上限（节点名/组名同款约束，name=agent 定义名）
 
 /** permissionTier 合法档位（M2.1 T10b，与协议包 DelegationTask.permissionTier 枚举同源）。 */
 const PERMISSION_TIERS: readonly DelegationTask['permissionTier'][] = ['readonly', 'sandbox', 'confirm'];
@@ -108,8 +111,31 @@ function optBoundedStr(raw: unknown, max: number): string | null {
   return typeof raw === 'string' && raw.length > 0 && raw.length <= max ? raw : null;
 }
 
+/** team 段校验（M5.3 spec §5.1）：members 2..8 项、每项 {name 1..64, isLeader:
+ *  boolean}、恰好 1 项 isLeader=true。白名单重建（未知字段剥除）；任何已知约束
+ *  不满足返回 null（由 parseDelegationTask 整包拒——沿 dependsOn 语义）。 */
+function parseTeamSection(raw: unknown): DelegationTask['team'] | null {
+  if (!isRecord(raw) || !Array.isArray(raw.members)) return null;
+  const members = raw.members;
+  if (members.length < TEAM_MEMBERS_MIN || members.length > TEAM_MEMBERS_MAX) return null;
+  const out: DelegationTeamMember[] = [];
+  let leaders = 0;
+  for (const m of members) {
+    if (!isRecord(m)) return null;
+    const name = optBoundedStr(m.name, TEAM_MEMBER_NAME_MAX);
+    if (name === null) return null;
+    if (typeof m.isLeader !== 'boolean') return null;
+    if (m.isLeader) leaders++;
+    out.push({ name, isLeader: m.isLeader });
+  }
+  if (leaders !== 1) return null;
+  return { members: out };
+}
+
 /** 任务书校验：title 1..128、prompt 非空且 ≤16KB（字节）、agentSlug 可选 ≤64、
- *  dependsOn 可选 string 数组 ≤50 项且每项 ≤128 字符（M4.3，非法整包拒）。 */
+ *  dependsOn 可选 string 数组 ≤50 项且每项 ≤128 字符（M4.3，非法整包拒）；
+ *  team 可选（M5.3：与 agentSlug 互斥，非法整包拒——team 是派发核心语义，静默
+ *  剥除会让接收端误解为单 agent）。 */
 function parseDelegationTask(raw: unknown): DelegationTask | null {
   if (!isRecord(raw)) return null;
   const title = optBoundedStr(raw.title, TITLE_MAX);
@@ -136,6 +162,16 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
     if (!Array.isArray(raw.dependsOn) || raw.dependsOn.length > DEPENDS_ON_MAX
       || !raw.dependsOn.every((s) => typeof s === 'string' && s.length <= DEPENDS_ON_ITEM_MAX)) return null;
     task.dependsOn = [...raw.dependsOn];
+  }
+  // team（M5.3）：非法整包拒（沿 dependsOn 三格模式：缺省不带键 / 在场保留 /
+  //  非法拒收——静默剥除会让接收端误解为单 agent 跑，正是版本门要防的静默换班）；
+  //  与 agentSlug 互斥（单 agent 形态与团队形态二选一）；随 task.assigned 事件过
+  //  不持久化（与 agentSlug/dependsOn 同生命周期——账本只存 taskId/title/prompt）。
+  if (raw.team !== undefined) {
+    if (task.agentSlug !== undefined) return null;
+    const team = parseTeamSection(raw.team);
+    if (team === null) return null;
+    task.team = team;
   }
   return task;
 }
@@ -270,13 +306,34 @@ export class DelegationRouter {
       return { ok: false, error: err('bad_request', `workspaceName 超长（≤${WORKSPACE_NAME_MAX}）`) };
     }
     const task = parseDelegationTask(isRecord(payload) ? payload.task : undefined);
-    if (!task) return { ok: false, error: err('bad_request', 'task 非法（title 1-128 / prompt 非空 ≤16KB / agentSlug? ≤64 / dependsOn? ≤50 项且每项 ≤128）') };
+    if (!task) return { ok: false, error: err('bad_request', 'task 非法（title 1-128 / prompt 非空 ≤16KB / agentSlug? ≤64 / dependsOn? ≤50 项且每项 ≤128 / team? members 2-8 项〔name 1-64、isLeader 布尔且恰 1 个 true、与 agentSlug 互斥〕）') };
 
     if (!this.db.prepare('SELECT 1 FROM groups WHERE id = ?').get(groupId)) {
       return { ok: false, error: err('not_found', '工作组不存在') };
     }
     if (!this.db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND node_id = ?').get(groupId, targetNodeId)) {
       return { ok: false, error: err('forbidden', '目标节点不是本组成员') };
+    }
+    // M5.3 团队派发版本门（防旧 studio 静默降级——旧节点忽略未知 team 字段按单
+    // agent 跑，正是裁定禁止的静默换班）：任务带 team 时目标连接 minor < 9 即拒
+    // （不落档）。指定节点与组内调度在 hub 侧同门——组内 least-busy 选点在 leader
+    // studio（pickWorker），到达 hub 的载荷一律是显式 targetNodeId，本门即两种
+    // 路由形态的权威兜底。目标离线（registry 查无）不在本门处理——走下方既有
+    // node_offline 路径（离线语义优先，先落档再回滚不留档）。
+    if (task.team !== undefined) {
+      const conn = this.registry.get(targetNodeId);
+      if (conn) {
+        const peerMinor = minorOf(conn.peerProtoVer);
+        if (peerMinor === null || peerMinor < TEAM_DELEGATION_REQUIRED_MINOR) {
+          logger.info('委派被拒：目标节点协议过旧，不支持团队派发', {
+            targetNodeId, peerProtoVer: conn.peerProtoVer, byNode: ctx.nodeId,
+          });
+          return {
+            ok: false,
+            error: err('node_unsupported', `目标节点 ${conn.nodeName} 协议过旧（${conn.peerProtoVer}，需 1.${TEAM_DELEGATION_REQUIRED_MINOR}.0 及以上），不支持团队派发`),
+          };
+        }
+      }
     }
 
     const taskId = randomUUID();

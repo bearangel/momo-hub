@@ -215,11 +215,17 @@ const handleList: GroupHandler = (ctx) => {
     groupId: g.id,
     groupName: g.name,
     leaderNodeId: g.leader_node_id,
-    members: (memberStmt.all(g.id) as Array<{ node_id: string; name: string }>).map((m) => ({
-      nodeId: m.node_id,
-      name: m.name,
-      online: ctx.registry.get(m.node_id) !== undefined,
-    })),
+    members: (memberStmt.all(g.id) as Array<{ node_id: string; name: string }>).map((m) => {
+      // protoVer（M5.3 nodeCaps 数据源）：在线成员携带 hello 上报的协议版本
+      // （registry 会话内存态）；离线成员不带键——旧形状零变化。
+      const conn = ctx.registry.get(m.node_id);
+      return {
+        nodeId: m.node_id,
+        name: m.name,
+        online: conn !== undefined,
+        ...(conn !== undefined ? { protoVer: conn.peerProtoVer } : {}),
+      };
+    }),
   }));
   return { ok: true, payload: { groups } };
 };

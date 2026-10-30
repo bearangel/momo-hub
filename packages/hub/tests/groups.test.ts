@@ -255,6 +255,37 @@ describe('组管理 RPC', () => {
     outsider.ws.close();
   });
 
+  it('M5.3 成员 protoVer（nodeCaps 数据源）：在线成员携带 hello 版本；离线成员不带键（旧形状零变化）', async () => {
+    const a = await connect('cap-a');
+    const b = await connect('cap-b');
+    const { groupId } = resPayload(await callRpc(a, RPC.group.create, { groupName: 'TeamCap' })) as { groupId: string };
+    const { inviteCode } = resPayload(await callRpc(a, RPC.group.invite, { groupId })) as { inviteCode: string };
+    await callRpc(b, RPC.group.join, { inviteCode });
+    await a.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === b.nodeId);
+
+    const online = resPayload(await callRpc(a, RPC.group.list, {})) as {
+      groups: Array<{ groupId: string; members: Array<{ nodeId: string; protoVer?: string }> }>;
+    };
+    const membersOnline = online.groups.find((g) => g.groupId === groupId)!.members;
+    expect(membersOnline.find((m) => m.nodeId === a.nodeId)?.protoVer).toBe(PROTOCOL_VERSION);
+    expect(membersOnline.find((m) => m.nodeId === b.nodeId)?.protoVer).toBe(PROTOCOL_VERSION);
+
+    b.ws.close();
+    await a.next((e) => e.kind === 'evt' && e.method === EVT.nodeOffline
+      && (e.payload as { nodeId: string }).nodeId === b.nodeId);
+    const mixed = resPayload(await callRpc(a, RPC.group.list, {})) as {
+      groups: Array<{ groupId: string; members: Array<{ nodeId: string; online: boolean; protoVer?: string }> }>;
+    };
+    const membersMixed = mixed.groups.find((g) => g.groupId === groupId)!.members;
+    const aEntry = membersMixed.find((m) => m.nodeId === a.nodeId)!;
+    const bEntry = membersMixed.find((m) => m.nodeId === b.nodeId)!;
+    expect(aEntry.protoVer).toBe(PROTOCOL_VERSION);
+    expect(bEntry.online).toBe(false);
+    expect(bEntry).not.toHaveProperty('protoVer');
+    a.ws.close();
+  });
+
   it('join 幂等：重复凭码入组返回同 groupId，成员不重复', async () => {
     const a = await connect('idem-a');
     const b = await connect('idem-b');

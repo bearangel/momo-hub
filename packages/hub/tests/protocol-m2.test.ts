@@ -1,8 +1,8 @@
-// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0/1.7.0/1.8.0 工作组与远程代答/远端可见性/
-// 资源生命周期/多组终态/委派依赖/资源归属契约测试
+// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0/1.7.0/1.8.0/1.9.0 工作组与远程代答/远端可见性/
+// 资源生命周期/多组终态/委派依赖/资源归属/外派团队契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
 // 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2 +
-// 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6）：
+// 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6 + 2026-10-30 M5.3 §5.1）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -14,6 +14,7 @@ import {
   RPC,
   RPC_ERROR_CODES,
   TASK_WIRE,
+  TEAM_DELEGATION_REQUIRED_MINOR,
   VIEW_FILES_ENTRIES_MAX,
   VIEW_FILES_PATH_MAX,
   VIEW_FILES_READ_MAX,
@@ -64,20 +65,21 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.8.0 与 1.1.0-1.7.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.8.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.8.0');
+describe('版本 1.9.0 与 1.1.0-1.8.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.9.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.9.0');
   });
 
-  it('1.1.0 ↔ 1.8.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.5.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.6.0', '1.8.0')).toBe(true);
-    expect(isCompatible('1.7.0', '1.8.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.8.0')).toBe(false);
+  it('1.1.0 ↔ 1.9.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.6.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.7.0', '1.9.0')).toBe(true);
+    expect(isCompatible('1.8.0', '1.9.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.9.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -185,6 +187,18 @@ describe('minorOf / protocolSupports 矩阵', () => {
     }
     // 全表最大门槛 4 对 1.7.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.7.0', 4)).toBe(true);
+  });
+
+  it('METHOD_REQUIRED_MINOR 无 M5.3 门槛登记：全表无 minor≥5 条目（1.9.0 team 段为载荷能力——门槛在 hub handleDelegate 按目标节点 protoVer 权威门禁，非方法级；1.8 peer 调任何已登记方法不受影响）', () => {
+    for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
+      expect(minor, `方法 ${method}`).toBeLessThan(5);
+    }
+    // 全表最大门槛 4 对 1.8.0 peer 恒通过——team 段无方法级协商
+    expect(protocolSupports('1.8.0', 4)).toBe(true);
+    // 团队派发门槛常量单源锁（hub 版本门与 studio 派发闸双端消费）
+    expect(TEAM_DELEGATION_REQUIRED_MINOR).toBe(9);
+    expect(protocolSupports('1.9.0', TEAM_DELEGATION_REQUIRED_MINOR)).toBe(true);
+    expect(protocolSupports('1.8.0', TEAM_DELEGATION_REQUIRED_MINOR)).toBe(false);
   });
 });
 
@@ -305,7 +319,7 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     ]);
   });
 
-  it('TaskAssignedEvent：嵌套 DelegationTask（title/prompt/agentSlug?）；M4.3 可选 dependsOn（缺省不带键——1.6 载荷零变化）', () => {
+  it('TaskAssignedEvent：嵌套 DelegationTask（title/prompt/agentSlug?）；M4.3 可选 dependsOn（缺省不带键——1.6 载荷零变化）；M5.3 可选 team（缺省不带键——1.8 载荷零变化）', () => {
     const evt: TaskAssignedEvent = {
       taskId: 't1',
       workspaceName: 'ws',
@@ -326,6 +340,18 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
     expect(Object.keys(withDeps.task).sort()).toEqual(
       ['agentSlug', 'dependsOn', 'permissionTier', 'prompt', 'title'],
     );
+    // team 可选团队段（M5.3）：缺省不带键；在场 round-trip（成员名单快照——与
+    // agentSlug 互斥由 hub 校验，结构层不强制）
+    expect(noSlug).not.toHaveProperty('team');
+    const withTeam: TaskAssignedEvent = {
+      ...evt,
+      task: {
+        title: '重构模块', prompt: '拆分并补测试',
+        team: { members: [{ name: 'pm-agent', isLeader: true }, { name: 'coder-agent', isLeader: false }] },
+      },
+    };
+    expect(JSON.parse(JSON.stringify(withTeam))).toEqual(withTeam);
+    expect(Object.keys(withTeam.task).sort()).toEqual(['prompt', 'team', 'title']);
   });
 
   it('TaskProgressEvent：{taskId, sessionId, lastSeq, excerpt, kind?}', () => {
@@ -381,17 +407,20 @@ describe('事件载荷 round-trip（§3.2 逐字段）', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('组管理类型 round-trip', () => {
-  it('GroupInfo/GroupMember 形状（group.list 行）', () => {
+  it('GroupInfo/GroupMember 形状（group.list 行）；M5.3 成员可选 protoVer（在线携带 hello 版本，离线不带键）', () => {
     const group: GroupInfo = {
       groupId: 'g1',
       groupName: '主力组',
       leaderNodeId: 'node-a',
       members: [
-        { nodeId: 'node-a', name: '工作台 1', online: true },
+        { nodeId: 'node-a', name: '工作台 1', online: true, protoVer: '1.9.0' },
         { nodeId: 'node-b', name: '工作台 2', online: false },
       ],
     };
     expect(JSON.parse(JSON.stringify(group))).toEqual(group);
+    // protoVer 数据源锚点：在线成员恒带（registry 会话内存态）；离线成员不带键
+    expect(group.members[0]?.protoVer).toBe('1.9.0');
+    expect(group.members[1]).not.toHaveProperty('protoVer');
   });
 
   it('InviteInfo：{inviteCode}（独立于 hub enrollment token）', () => {

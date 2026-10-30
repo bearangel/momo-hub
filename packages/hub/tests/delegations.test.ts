@@ -116,11 +116,12 @@ function ledgerRow(taskId: string): LedgerRow | undefined {
   return db.prepare('SELECT * FROM delegations WHERE task_id = ?').get(taskId) as LedgerRow | undefined;
 }
 
-function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string; permissionTier?: unknown; dependsOn?: unknown } = {}): Record<string, unknown> {
+function delegateReq(groupId: string, targetNodeId: string, opts: { workspaceName?: string; title?: string; prompt?: string; agentSlug?: string; permissionTier?: unknown; dependsOn?: unknown; team?: unknown } = {}): Record<string, unknown> {
   const task: Record<string, unknown> = { title: opts.title ?? '修登录 bug', prompt: opts.prompt ?? '请修复登录失败问题' };
   if (opts.agentSlug !== undefined) task.agentSlug = opts.agentSlug;
   if (opts.permissionTier !== undefined) task.permissionTier = opts.permissionTier;
   if (opts.dependsOn !== undefined) task.dependsOn = opts.dependsOn;
+  if (opts.team !== undefined) task.team = opts.team;
   return { groupId, targetNodeId, workspaceName: opts.workspaceName ?? 'ws-t', task };
 }
 
@@ -366,6 +367,192 @@ describe('dependsOn 透传（M4.3）', () => {
       workspaceName: 'ws-dep-129', dependsOn: ['T-' + 'x'.repeat(127)],
     }));
     expect(errOf(over).code).toBe('bad_request');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// team 段（M5.3，1.9.0——外派团队执行；沿 dependsOn 三格模式：缺省不带键 /
+// 在场保留 / 非法整包拒——team 是派发核心语义，静默剥除会让接收端误解为
+// 单 agent；hub 不持久化，账本只存 taskId/title/prompt 既有列）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 两成员团队（leader + 成员）——矩阵用例的最小合法形态。 */
+const team2 = (leaderName = 'pm-agent', memberName = 'coder-agent') => ({
+  members: [
+    { name: leaderName, isLeader: true },
+    { name: memberName, isLeader: false },
+  ],
+});
+
+describe('team 段透传与校验矩阵（M5.3）', () => {
+  it('三格之一 缺省：不带 team → 受理且 assigned 载荷 task 无该键（1.8 载荷零变化）', async () => {
+    const { leader, target, groupId } = await setupGroup('tmns');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-tm-ns' }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    const task = assigned.payload as { task: Record<string, unknown> };
+    expect(task.task).toEqual({ title: '修登录 bug', prompt: '请修复登录失败问题' });
+    expect(task.task).not.toHaveProperty('team');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('三格之二 在场（2 人下边界）：受理且 task.assigned 精确透传 team 段；成员条目未知字段剥除；账本不持久化 team（既有列零变化）', async () => {
+    const { leader, target, groupId } = await setupGroup('tmok');
+    const res = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-tm-ok',
+      team: { members: [{ name: 'pm-agent', isLeader: true, role: '多余字段应剥除' }, { name: 'coder-agent', isLeader: false }] },
+    }));
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const taskId = (resPayload(res) as { taskId: string }).taskId;
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(assigned.payload).toEqual({
+      taskId,
+      workspaceName: 'ws-tm-ok',
+      task: {
+        title: '修登录 bug', prompt: '请修复登录失败问题',
+        team: { members: [{ name: 'pm-agent', isLeader: true }, { name: 'coder-agent', isLeader: false }] },
+      },
+      byNode: leader.nodeId,
+    });
+    // 不持久化：账本行只落既有列（title 照存，team 无列可落）
+    const row = ledgerRow(taskId);
+    expect(row).toMatchObject({ title: '修登录 bug', status: 'pending' });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('8 人上边界受理且成员序保序透传', async () => {
+    const { leader, target, groupId } = await setupGroup('tm8');
+    const members = [
+      { name: 'leader-agent', isLeader: true },
+      ...Array.from({ length: 7 }, (_, i) => ({ name: `member-${i + 1}`, isLeader: false })),
+    ];
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-tm-8', team: { members },
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((assigned.payload as { task: { team: { members: unknown[] } } }).task.team.members).toEqual(members);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('与 permissionTier/dependsOn 并存互不干扰（四段同场全量透传）', async () => {
+    const { leader, target, groupId } = await setupGroup('tmmix');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-tm-mix', permissionTier: 'sandbox', dependsOn: ['T-1'], team: team2(),
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(assigned.payload).toEqual({
+      taskId,
+      workspaceName: 'ws-tm-mix',
+      task: {
+        title: '修登录 bug', prompt: '请修复登录失败问题',
+        permissionTier: 'sandbox', dependsOn: ['T-1'], team: team2(),
+      },
+      byNode: leader.nodeId,
+    });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('三格之三 非法矩阵：1 人 / 9 人 / 0 leader / 2 leader / 名超长 / 名空串 / isLeader 非布尔 / team 非对象 / members 非数组 / team+agentSlug 互斥 → 整包拒 bad_request（不落档、无 assigned）', async () => {
+    const { leader, target, groupId } = await setupGroup('tmbad');
+    const member = (name: string, isLeader: unknown) => ({ name, isLeader });
+    const bads: Array<{ name: string; team: unknown }> = [
+      { name: '1 人（下界外）', team: { members: [member('solo', true)] } },
+      { name: '9 人（上界外）', team: { members: [member('l', true), ...Array.from({ length: 8 }, (_, i) => member(`m-${i}`, false))] } },
+      { name: '0 leader', team: { members: [member('a', false), member('b', false)] } },
+      { name: '2 leader', team: { members: [member('a', true), member('b', true)] } },
+      { name: '名超长（65）', team: { members: [member('n'.repeat(65), true), member('b', false)] } },
+      { name: '名空串', team: { members: [member('', true), member('b', false)] } },
+      { name: 'isLeader 非布尔（字符串）', team: { members: [{ name: 'a', isLeader: 'true' }, member('b', false)] } },
+      { name: 'team 非对象（字符串）', team: 'pm+coder' },
+      { name: 'members 非数组', team: { members: 'pm,coder' } },
+    ];
+    for (const c of bads) {
+      const res = await callRpc(leader, RPC.task.delegate,
+        delegateReq(groupId, target.nodeId, { workspaceName: 'ws-tm-bad', team: c.team }));
+      expect(errOf(res).code, `用例：${c.name}`).toBe('bad_request');
+    }
+    // 互斥：合法 team + agentSlug 同场 → 拒（单 agent 形态与团队形态二选一）
+    const mutex = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-tm-bad', agentSlug: 'coder-pro', team: team2(),
+    }));
+    expect(errOf(mutex).code, '互斥 team+agentSlug').toBe('bad_request');
+    await settle();
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegations WHERE workspace_name = ?')
+      .get('ws-tm-bad') as { n: number }).n).toBe(0);
+    expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAssigned)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 团队派发版本门（M5.3 §5.1——防旧 studio 忽略未知 team 字段按单 agent 跑的
+// 静默换班，hub 权威兜底）。组内 least-busy 选点在 leader studio（pickWorker），
+// 到达 hub 的 task.delegate 载荷一律是显式 targetNodeId——指定节点与组内调度
+// 两种路由形态在 hub 侧同一道门。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('团队派发版本门（M5.3）', () => {
+  it('任务带 team + 目标节点协议 1.8.0 → node_unsupported（文案含节点名与对方协议版本）；不落档、无 assigned', async () => {
+    const leader = await connect('gate-leader');
+    const target = await connect('gate-old-target', '1.8.0');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-Gate' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    const res = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-gate-old', team: team2(),
+    }));
+    const error = errOf(res);
+    expect(error.code).toBe('node_unsupported');
+    // 人话：节点名 + 对方协议版本（studio 派发闸同款文案的数据锚）
+    expect(error.message).toContain('gate-old-target');
+    expect(error.message).toContain('1.8.0');
+    expect(error.message).toContain('团队派发');
+    await settle();
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegations WHERE workspace_name = ?')
+      .get('ws-gate-old') as { n: number }).n).toBe(0);
+    expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAssigned)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('无 team 任务对同一旧协议节点照常派（1.8 载荷零变化——旧节点照常接单，版本门只对 team 生效）', async () => {
+    const leader = await connect('gate2-leader');
+    const target = await connect('gate2-old-target', '1.8.0');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-Gate2' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    const res = await callRpc(leader, RPC.task.delegate, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-gate-plain', agentSlug: 'coder-pro',
+    }));
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const taskId = (resPayload(res) as { taskId: string }).taskId;
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((assigned.payload as { task: Record<string, unknown> }).task).toEqual({
+      title: '修登录 bug', prompt: '请修复登录失败问题', agentSlug: 'coder-pro',
+    });
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('team 任务对 1.9.0 目标照常受理（版本门放行——受理链与矩阵用例同门，锁组内调度形态的权威兜底）', async () => {
+    const { leader, target, groupId } = await setupGroup('gate9');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, {
+      workspaceName: 'ws-gate-9', team: team2(),
+    }));
+    const assigned = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((assigned.payload as { task: { team?: unknown } }).task.team).toEqual(team2());
     leader.ws.close(); target.ws.close();
   });
 });

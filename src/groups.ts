@@ -40,7 +40,15 @@ export interface GroupInfo {
   members: GroupMember[];
 }
 
-export interface GroupMember { nodeId: string; name: string; online: boolean }
+export interface GroupMember {
+  nodeId: string;
+  name: string;
+  online: boolean;
+  /** hello 上报的协议版本（M5.3，1.9.0）：在线成员恒带（registry 会话内存态，随
+   *  连接生灭）；离线成员不带键（旧形状零变化）——studio 派发闸 / routingPrecheck
+   *  nodeCaps（nodeId/name/protoVer）的数据源。 */
+  protoVer?: string;
+}
 
 export interface GroupInviteReq { groupId: string; enrollmentToken?: string }
 /** group.invite 响应：组邀请码——独立于 hub enrollment token（作用域=单组，可撤销）。 */

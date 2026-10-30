@@ -24,6 +24,9 @@ export interface HubResourceMeta {
   sizeBytes: number;
   publishedAt: number;
   versions: string[]; // 全部版本号，semver 降序（最大在前；v0.1.5 前为发布时序新→旧）
+  /** 归属节点 id（1.8.0 M5.0 领地制）：owner 的 nodeId——studio 据此判定「已发布」
+   *  徽标与发布/下架按钮收敛。NULL（无主/开放认领）与旧 hub（<1.8 无该字段）均不带键。 */
+  ownerNodeId?: string;
 }
 
 export interface HubCatalog {
@@ -133,7 +136,8 @@ export function validateHubManifest(raw: unknown): HubPublishManifest | null {
 
 /** 完整 HubResourceMeta 校验（裁定 RM1-1）：manifest 同款字段校验 +
  *  downloadUrl 字符串、checksum 必须合法 sha256、sizeBytes/publishedAt 数字、
- *  versions 字符串数组。非法返回 null。 */
+ *  versions 字符串数组。ownerNodeId（1.8.0）：可选——在场必须字符串（缺省不带键，
+ *  旧 hub 目录零变化容忍）。非法返回 null。 */
 function validateHubMeta(raw: unknown): HubResourceMeta | null {
   const base = validateHubManifest(raw);
   if (base === null || typeof raw !== 'object' || raw === null) return null;
@@ -143,6 +147,7 @@ function validateHubMeta(raw: unknown): HubResourceMeta | null {
   if (typeof m.sizeBytes !== 'number' || !Number.isFinite(m.sizeBytes) || m.sizeBytes < 0) return null;
   if (typeof m.publishedAt !== 'number' || !Number.isFinite(m.publishedAt) || !Number.isInteger(m.publishedAt)) return null;
   if (!isStrArray(m.versions)) return null;
+  if (m.ownerNodeId !== undefined && !isStr(m.ownerNodeId)) return null;
   return {
     ...base,
     downloadUrl: m.downloadUrl,
@@ -150,6 +155,7 @@ function validateHubMeta(raw: unknown): HubResourceMeta | null {
     sizeBytes: m.sizeBytes,
     publishedAt: m.publishedAt,
     versions: [...m.versions],
+    ...(m.ownerNodeId !== undefined ? { ownerNodeId: m.ownerNodeId } : {}),
   };
 }
 

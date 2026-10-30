@@ -5,6 +5,8 @@
 // M3.1 新增三码（spec 2026-10-28 §3.1）：not_waiting（代答时任务非等待态）、
 // node_unsupported（定向目标协议 minor 低于方法门槛，载荷 message 带目标版本）、
 // answer_timeout（代答转发超时——账本不动，可重试）。
+// M5.0 新增一码（spec 2026-10-30 §5）：name_conflict（hello 改名撞名——目标名已被
+// 其他节点占用；专用码不复用 M2 镜像确认的 conflict，一义一名）。
 export type RpcErrorCode =
   | 'unauthorized'
   | 'bad_request'
@@ -18,7 +20,8 @@ export type RpcErrorCode =
   | 'conflict'
   | 'not_waiting'
   | 'node_unsupported'
-  | 'answer_timeout';
+  | 'answer_timeout'
+  | 'name_conflict';
 
 export interface RpcErrorPayload {
   code: RpcErrorCode;
@@ -44,4 +47,5 @@ export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
   'not_waiting',
   'node_unsupported',
   'answer_timeout',
+  'name_conflict',
 ];

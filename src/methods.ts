@@ -60,7 +60,13 @@ export type RpcMethodName =
   | (typeof TASK_RPC)[keyof typeof TASK_RPC]
   | (typeof VIEW_RPC)[keyof typeof VIEW_RPC];
 
-export interface HelloReq { protoVer: string; nodeName?: string }
+export interface HelloReq {
+  protoVer: string;
+  /** 同步改名（1.8.0 M5.0 §5，可选）：与 hub 记录不同且未占用 → hub 同事务刷
+   *  nodes.name + 本人 owner 资源的 author，presence 广播用新名；已占用 → hello
+   *  拒绝（name_conflict）；缺省/相同 → 行为不变（旧 studio 不带该字段零影响）。 */
+  nodeName?: string;
+}
 /** onlineNodes：hello 成功时的在线节点快照（后续增量走 node.online/offline 事件） */
 export interface HelloRes { hubId: string; protoVer: string; serverTime: number; onlineNodes: Array<{ nodeId: string; nodeName: string }> }
 

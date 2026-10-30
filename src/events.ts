@@ -36,6 +36,9 @@ export interface ResourcePublishedEvent {
   version: string;
   author: string;
   at: number;
+  /** 归属节点 id（1.8.0 M5.0）：发布即认领/放行的 owner——studio 目录增量合并保留
+   *  该字段（徽标/按钮收敛），缺省不带键（旧 hub 事件零变化）。 */
+  ownerNodeId?: string;
 }
 
 /** resource.unpublished（1.5.0 M3.4 B12）：撤回成功后广播全部在线节点——

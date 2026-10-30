@@ -1,4 +1,12 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.8.0（M5.0 资源归属权威）：HubResourceMeta.ownerNodeId?（目录项归属投影——studio
+//  「已发布」徽标与发布/下架按钮收敛的判定输入）+ ResourcePublishedEvent.ownerNodeId?
+//  （发布事件携归属，studio 目录增量合并保留该字段）+ hello 载荷可选 nodeName?
+//  （同步改名：不同且未占用 → 同事务刷 nodes.name + 本人 owner 资源 author）+ 错误码
+//  name_conflict（hello 改名撞名拒绝，只增不改义）——除 name_conflict 外全部为可选
+//  字段/事件载荷，无新 RPC 方法、无 METHOD_REQUIRED_MINOR 门槛登记（未知字段剥除对
+//  旧节点天然宽容，1.7 peer 调任何已登记方法不受影响），major 不动。HTTP 403
+//  not_owner 为 publish/unpublish 端点错误体扩展，不走 ws 错误码表。
 // 1.7.0（M4.3 委派依赖透传）：DelegationTask 增可选 dependsOn?（leader 本地
 //  任务 id 清单，纯透传不校验存在性——本地 id 跨节点无意义，worker 零消费；
 //  hub 只做形状校验，非法整包拒）+ task.assigned 事件随 task 对象透传（既有
@@ -21,7 +29,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.7.0';
+export const PROTOCOL_VERSION = '1.8.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

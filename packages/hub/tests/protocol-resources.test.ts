@@ -38,6 +38,7 @@ function validMeta(): HubResourceMeta {
     sizeBytes: 1024,
     publishedAt: 1_700_000_000_000,
     versions: ['1.2.3+build', '1.2.2'],
+    ownerNodeId: '0196a7c0-dead-7cde-9f9a-3f5e4d3b2a10',
   };
 }
 
@@ -223,6 +224,34 @@ describe('HubCatalog.revision（1.5.0 M3.4 B10）', () => {
   });
 });
 
+describe('HubResourceMeta.ownerNodeId（1.8.0 M5.0 归属投影）', () => {
+  const base = { version: '1', revision: 1, updatedAt: 't' } as const;
+
+  it('在场：字符串 → round-trip 保留（studio 归属判定的数据面）', () => {
+    const withOwner = { ...base, items: [validMeta()] };
+    expect(validateHubCatalog(withOwner)).toEqual(withOwner);
+    const item = validateHubCatalog(withOwner)?.items[0];
+    expect(item?.ownerNodeId).toBe('0196a7c0-dead-7cde-9f9a-3f5e4d3b2a10');
+  });
+
+  it('缺省：旧 hub（<1.8）不发送 → 不带键容忍（非 null、非空串——消费方按 undefined 降级）', () => {
+    const noOwner = validMeta();
+    delete (noOwner as Partial<HubResourceMeta>).ownerNodeId;
+    const catalog = { ...base, items: [noOwner] };
+    const out = validateHubCatalog(catalog);
+    expect(out).toEqual(catalog);
+    expect('ownerNodeId' in (out?.items[0] ?? {})).toBe(false);
+  });
+
+  it('非法：非字符串（数字/null/空串不在场校验范围——仅类型闸）→ null', () => {
+    for (const bad of [123, null, {}]) {
+      const meta = validMeta();
+      (meta as Record<string, unknown>)['ownerNodeId'] = bad;
+      expect(validateHubCatalog({ ...base, items: [meta] }), `用例 ${JSON.stringify(bad)}`).toBeNull();
+    }
+  });
+});
+
 describe('EVT 目录扩展（spec M1 §3.3）', () => {
   it('resourcePublished 常量稳定；既有常量不回退', () => {
     expect(EVT.resourcePublished).toBe('resource.published');
@@ -240,6 +269,19 @@ describe('EVT 目录扩展（spec M1 §3.3）', () => {
       at: 1_700_000_000_000,
     };
     expect(Object.keys(evt).sort()).toEqual(['at', 'author', 'name', 'slug', 'type', 'version']);
+  });
+
+  it('ResourcePublishedEvent 形状（1.8.0 带归属变体）：ownerNodeId 追加为第七键', () => {
+    const evt = {
+      slug: 'coder-pro',
+      type: 'agent' as const,
+      name: 'Coder Pro',
+      version: '1.2.3',
+      author: 'workstation-1',
+      at: 1_700_000_000_000,
+      ownerNodeId: '0196a7c0-dead-7cde-9f9a-3f5e4d3b2a10',
+    };
+    expect(Object.keys(evt).sort()).toEqual(['at', 'author', 'name', 'ownerNodeId', 'slug', 'type', 'version']);
   });
 
   it('resourceUnpublished 常量稳定（1.5.0 M3.4 B12 新增）', () => {

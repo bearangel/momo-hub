@@ -308,13 +308,14 @@ describe('迁移 v7', () => {
     expect((d1.prepare('SELECT COUNT(*) AS n FROM resources WHERE unpublished_at IS NOT NULL').get() as { n: number }).n).toBe(0);
     // hub_meta 不重建（v1 既有键仍在）+ 新键初值
     expect(d1.prepare("SELECT value FROM hub_meta WHERE key = 'catalog_revision'").get()).toEqual({ value: '1' });
-    expect(d1.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '9' });
+    // M5.0 v8 归属列追加后 schema_version=10（v7 时为 9）
+    expect(d1.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '10' });
     d1.close();
 
     // 重开幂等：迁移不重复执行、初值不被覆盖
     const d2 = openHubDatabase(dir);
     expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'catalog_revision'").get()).toEqual({ value: '1' });
-    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '9' });
+    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '10' });
     d2.close();
   });
 });

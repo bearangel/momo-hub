@@ -1,8 +1,8 @@
-// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0/1.7.0 工作组与远程代答/远端可见性/资源生命
-// 周期/多组终态/委派依赖透传契约测试
+// protocol 1.2.0/1.3.0/1.4.0/1.5.0/1.6.0/1.7.0/1.8.0 工作组与远程代答/远端可见性/
+// 资源生命周期/多组终态/委派依赖/资源归属契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
 // 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2 +
-// 2026-10-29 M4.3 §2.1/§2.2）：
+// 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -64,19 +64,20 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.7.0 与 1.1.0-1.6.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.7.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.7.0');
+describe('版本 1.8.0 与 1.1.0-1.7.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.8.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.8.0');
   });
 
-  it('1.1.0 ↔ 1.7.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.7.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.7.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.7.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.7.0')).toBe(true);
-    expect(isCompatible('1.5.0', '1.7.0')).toBe(true);
-    expect(isCompatible('1.6.0', '1.7.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.7.0')).toBe(false);
+  it('1.1.0 ↔ 1.8.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.6.0', '1.8.0')).toBe(true);
+    expect(isCompatible('1.7.0', '1.8.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.8.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -177,6 +178,14 @@ describe('minorOf / protocolSupports 矩阵', () => {
     // 全表最大门槛 4 对 1.6.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.6.0', 4)).toBe(true);
   });
+
+  it('METHOD_REQUIRED_MINOR 无 M5.0 门槛登记：全表无 minor≥5 条目（1.8.0 全部为可选字段——ownerNodeId 归属投影 / hello nodeName 改名载荷，无新方法；1.7 peer 调任何已登记方法不受影响）', () => {
+    for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
+      expect(minor, `方法 ${method}`).toBeLessThan(5);
+    }
+    // 全表最大门槛 4 对 1.7.0 peer 恒通过——新能力纯可选字段，无需能力协商
+    expect(protocolSupports('1.7.0', 4)).toBe(true);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -246,13 +255,21 @@ describe('RpcErrorCode 扩充', () => {
 
   it('M3.1 新增三码入枚举（not_waiting / node_unsupported / answer_timeout），既有十码不回退', () => {
     const m31: RpcErrorCode[] = ['not_waiting', 'node_unsupported', 'answer_timeout'];
-    // 顺序锁：新三码追加在尾部（只增不改义——既有码相对位置不动）
-    expect(RPC_ERROR_CODES.slice(0, -3)).toEqual([
+    // 顺序锁（绝对位置切片——后续只增不改义追加不影响本锁）：既有十码相对位置不动，
+    // M3.1 三码追加在其后；总长锁由最新条目测试持有（现为 M5.0 的 14）
+    expect(RPC_ERROR_CODES.slice(0, 10)).toEqual([
       'unauthorized', 'bad_request', 'proto_version_mismatch', 'unknown_method',
       'unsupported_method', 'internal', 'forbidden', 'node_offline', 'not_found', 'conflict',
     ]);
-    expect(RPC_ERROR_CODES.slice(-3)).toEqual(m31);
-    expect(RPC_ERROR_CODES).toHaveLength(13);
+    expect(RPC_ERROR_CODES.slice(10, 13)).toEqual(m31);
+  });
+
+  it('M5.0 新增一码入枚举（name_conflict——hello 改名撞名），既有十三码不回退', () => {
+    // 顺序锁：新码追加在尾部（只增不改义——M3.1 十三码相对位置不动）
+    expect(RPC_ERROR_CODES.slice(-1)).toEqual(['name_conflict']);
+    expect(RPC_ERROR_CODES).toHaveLength(14);
+    const payload: RpcErrorPayload = { code: 'name_conflict', message: '该名称已被其他节点使用' };
+    expect(payload.code).toBe('name_conflict');
   });
 });
 

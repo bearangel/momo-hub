@@ -194,12 +194,45 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
         }
         switch (env.method) {
           case RPC.hello: {
-            const ver = (env.payload as HelloReq | null)?.protoVer ?? '';
+            const helloReq = env.payload as HelloReq | null;
+            const ver = helloReq?.protoVer ?? '';
             if (!isCompatible(ver, PROTOCOL_VERSION)) {
               sendRes(env.id, RPC.hello, false, errPayload('proto_version_mismatch', `hub=${PROTOCOL_VERSION} node=${ver}`));
               socket.close(4402, 'proto_version_mismatch');
               return;
             }
+
+            // 同步改名（M5.0 §5，治 studio 旧瑕疵）：hello 载荷可选 nodeName。
+            // - 缺省 / 非法形态（非串/trim 空/超长）→ 视为缺省，行为不变（宽容姿态：
+            //   身份锚是 nodeId，name 仅展示——与「旧 studio 不带 → 行为不变」一致）
+            // - 与 hub 记录相同 → 不变
+            // - 不同且未占用 → 同事务刷 nodes.name + 本人 owner 资源的 author
+            //   （author≡owner 名展示单一语义，含墓碑行）+ presence 广播用新名
+            // - 不同但已占用 → 按现有 hello 拒绝路径（proto_version_mismatch 同款形态：
+            //   res 错误体 + 44xx 关闭）；专用码 name_conflict——一义一名，不复用 M2
+            //   镜像确认的 conflict；关码顺次取 4404
+            const desiredName = typeof helloReq?.nodeName === 'string' ? helloReq.nodeName.trim() : '';
+            if (desiredName.length >= 1 && desiredName.length <= 64 && desiredName !== session.nodeName) {
+              // 占用者是自己（同节点另一条连接已先行改名）→ 名已在库，只对齐会话名
+              const occupant = db.prepare('SELECT id FROM nodes WHERE name = ?').get(desiredName) as
+                | { id: string }
+                | undefined;
+              if (occupant !== undefined && occupant.id !== session.nodeId) {
+                sendRes(env.id, RPC.hello, false, errPayload('name_conflict', `该名称已被其他节点使用：${desiredName}`));
+                socket.close(4404, 'name_conflict');
+                return;
+              }
+              if (occupant === undefined) {
+                // 单连接同步事务：占用预查与落库之间无交错窗口，UNIQUE 兜底不可达
+                db.transaction(() => {
+                  db.prepare('UPDATE nodes SET name = ? WHERE id = ?').run(desiredName, session.nodeId);
+                  db.prepare('UPDATE resources SET author = ? WHERE owner_node_id = ?').run(desiredName, session.nodeId);
+                })();
+              }
+              logger.info('节点改名', { nodeId: session.nodeId, name: desiredName });
+              session.nodeName = desiredName;
+            }
+
             clearTimeout(helloTimer);
             session.helloDone = true;
             session.peerProtoVer = ver;

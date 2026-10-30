@@ -33,7 +33,25 @@ export type PublishErrorCode =
   | 'invalid_slug'        // 400：slug 非法
   | 'invalid_version'     // 400：version 非法
   | 'version_exists'      // 409：同 slug+version 已发布（版本不可变）
+  | 'not_owner'           // 403（M5.0 §3）：slug 领地属于他节点（错误体附 owner_name）
   | 'too_large';          // 413：超过大小上限
+
+/** 领地判定失败（事务内抛出 → 403 not_owner）：ownerName = 现任领主节点名。 */
+class NotOwnerError extends Error {
+  constructor(readonly ownerName: string) { super('not_owner'); }
+}
+
+/** 资源归属读取（M5.0 §3 领地判定的单点查询）：LEFT JOIN nodes 悬空 owner（指向已删
+ *  nodes 行——仅手工 DB 可造成）投影为 owner_name = null，等同开放认领。
+ *  返回 undefined = resources 无该 slug 行。 */
+interface ResourceOwnerRow { owner_node_id: string | null; owner_name: string | null }
+
+function readResourceOwner(db: Database.Database, slug: string): ResourceOwnerRow | undefined {
+  return db.prepare(`
+    SELECT r.owner_node_id AS owner_node_id, n.name AS owner_name
+    FROM resources r LEFT JOIN nodes n ON n.id = r.owner_node_id
+    WHERE r.slug = ?`).get(slug) as ResourceOwnerRow | undefined;
+}
 
 export type PublishManifestResult =
   | { ok: true; manifest: HubPublishManifest }
@@ -217,6 +235,7 @@ interface CatalogItemRow {
   tags_json: string;
   category: string;
   icon_emoji: string;
+  owner_node_id: string | null;
 }
 
 /** 版本行全量来源（目录 latest/versions 的唯一数据面，v0.1.5）。 */
@@ -365,10 +384,12 @@ export function compareVersions(a: string, b: string): number {
  *  - versions：该 slug 全部版本号，semver 降序（H2，保持 versions[0]==version 不变式）；
  *    semver 同分兜底 published_at 新→旧（Array.sort 稳定，入序已是该序）
  *  - downloadUrl：按请求 origin 拼绝对地址（反代场景天然正确）
- *  - author 直映射 resources.author（= 鉴权节点名，R-M1-8）；verificationStatus 恒 'unverified'（表无该列） */
+ *  - author 直映射 resources.author（= owner 节点名，R-M1-8 + M5.0 §3 定死；hello 改名
+ *    时随 owner 同刷，§5）；verificationStatus 恒 'unverified'（表无该列）
+ *  - ownerNodeId（M5.0 §6 归属投影）：非 NULL 时携带，无主不带键（旧形状零变化） */
 export function buildHubCatalog(db: Database.Database, origin: string): HubCatalog {
   const itemRows = db.prepare(`
-    SELECT slug, type, name, author, description, readme, tags_json, category, icon_emoji
+    SELECT slug, type, name, author, description, readme, tags_json, category, icon_emoji, owner_node_id
     FROM resources
     WHERE unpublished_at IS NULL
   `).all() as CatalogItemRow[];
@@ -410,6 +431,8 @@ export function buildHubCatalog(db: Database.Database, origin: string): HubCatal
       sizeBytes: latest.size_bytes,
       publishedAt: latest.published_at,
       versions: versions.map((v) => v.version),
+      // 归属投影（M5.0 §6）：无主（NULL）不带键——旧目录形状零变化
+      ...(row.owner_node_id !== null ? { ownerNodeId: row.owner_node_id } : {}),
     });
   }
   // 目录按发布时间倒序（新的在前）——同毫秒以 slug 兜底，保证顺序确定
@@ -518,7 +541,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
         // 形态损坏：剩余字节无处可去，忽略（响应已发出）
       }
     };
-    const fail = (status: number, code: PublishErrorCode): FastifyReply => {
+    const fail = (status: number, code: PublishErrorCode, extra: Record<string, unknown> = {}): FastifyReply => {
       // 已经取出但未消费的 package part（文件形态）必须在这里排干：
       // busboy 停在当前 part 上 → 请求体读不完 → 连接悬挂（close 挂起、连接不可复用）。
       // 迭代器只能拿到【下一个】part，拿不到手上这个——只能直接把它的流读干净。
@@ -526,7 +549,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       if (!packageHandedOff && packagePart !== null && packagePart.type === 'file') {
         void discardPartFile(packagePart.file);
       }
-      const res = reply.code(status).send({ error: code });
+      const res = reply.code(status).send({ error: code, ...extra });
       void drainParts();
       return res;
     };
@@ -557,6 +580,15 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       manifest = r.manifest;
     }
 
+    // ③.5 owner 领地预判（M5.0 §3）：他节点领地 → 403 not_owner（错误体附 owner_name）。
+    //    【必须先于 ④ 版本预查】——越权者不探知版本存在与否（信息最小化）。
+    //    无主（NULL/悬空 → owner_name = null）放行走认领路径；此处只是快路径，
+    //    预判后他人抢先落主的并发窗口由 ⑥ 事务内权威重判兜底。
+    const owned = readResourceOwner(db, manifest.slug);
+    if (owned !== undefined && owned.owner_name !== null && owned.owner_node_id !== node.nodeId) {
+      return fail(403, 'not_owner', { owner_name: owned.owner_name });
+    }
+
     // ④ 版本不可变预查（C4 快路径）：已有同 slug+version → 409
     const dup = db.prepare('SELECT 1 FROM resource_versions WHERE slug = ? AND version = ?')
       .get(manifest.slug, manifest.version);
@@ -578,16 +610,23 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       throw err;
     }
 
-    // ⑥ 事务落库：resources upsert latest_version + resource_versions 插入。
+    // ⑥ 事务落库：领地判定（M5.0 §3）+ resources upsert + resource_versions 插入。
+    //    领地规则（事务内权威重判——③.5 预判与他节点抢先落主之间的窗口由这里兜底；
+    //    better-sqlite3 单连接同步事务，重读即最新已提交态）：
+    //    - 无 resources 行（新 slug）：INSERT 即认领（owner_node_id = 鉴权 nodeId），
+    //      author 定死 = owner 名（不再被后续发布覆盖）
+    //    - 无主（NULL/悬空）：原子认领——条件 UPDATE（认领与 author 刷新同语句，
+    //      维持 author≡owner 名不变式）；changes=0 → 重读 owner → 403（并发双认领互斥）
+    //    - owner = 本节点：放行（元数据 upsert 保留，owner 权），author 不变
+    //    - owner = 他节点：403 not_owner（携 owner_name）
     //    唯一键 (slug, version) 冲突 → 事务回滚 → 409（R-M1-4 并发窗口兜底，错误体同款）。
     const publishedAt = Date.now();
     const upsertResource = db.prepare(`
-      INSERT INTO resources (slug, type, name, author, description, readme, tags_json, category, icon_emoji, latest_version)
-      VALUES (@slug, @type, @name, @author, @description, @readme, @tags_json, @category, @icon_emoji, @latest_version)
+      INSERT INTO resources (slug, type, name, author, description, readme, tags_json, category, icon_emoji, latest_version, owner_node_id)
+      VALUES (@slug, @type, @name, @author, @description, @readme, @tags_json, @category, @icon_emoji, @latest_version, @owner_node_id)
       ON CONFLICT(slug) DO UPDATE SET
         type = excluded.type,
         name = excluded.name,
-        author = excluded.author,
         description = excluded.description,
         readme = excluded.readme,
         tags_json = excluded.tags_json,
@@ -597,21 +636,42 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     const insertVersion = db.prepare(`
       INSERT INTO resource_versions (slug, version, checksum, size_bytes, published_by, published_at)
       VALUES (?, ?, ?, ?, ?, ?)`);
+    // 原子认领（spec §3 SQL 逐字 + author 同刷）：WHERE 条件保证只在无主（NULL/悬空）
+    // 时生效——changes=0 即窗口内被他节点抢注。
+    const claimOwner = db.prepare(`
+      UPDATE resources SET owner_node_id = ?, author = ?
+      WHERE slug = ? AND (owner_node_id IS NULL OR owner_node_id NOT IN (SELECT id FROM nodes))`);
     // M3.4：清墓碑（同 slug 重发布恢复目录可见）+ revision++——与版本行落库同事务原子。
     // 新 slug 时清墓碑影响 0 行（INSERT 未置 unpublished_at，天然可见），无害。
     const clearTombstone = db.prepare('UPDATE resources SET unpublished_at = NULL WHERE slug = ?');
-    const tx = db.transaction(() => {
+    const tx = db.transaction((): void => {
+      const current = readResourceOwner(db, manifest.slug);
+      if (current === undefined) {
+        // 新 slug：下方 upsert 的 INSERT 分支即认领（owner_node_id + author 落值）
+      } else if (current.owner_name === null) {
+        // 无主（NULL/悬空）→ 原子认领；并发双认领互斥兜底
+        const r = claimOwner.run(node.nodeId, node.name, manifest.slug);
+        if (r.changes === 0) {
+          const winner = readResourceOwner(db, manifest.slug);
+          throw new NotOwnerError(winner?.owner_name ?? '');
+        }
+      } else if (current.owner_node_id !== node.nodeId) {
+        throw new NotOwnerError(current.owner_name);
+      }
       upsertResource.run({
         slug: manifest.slug,
         type: manifest.type,
         name: manifest.name,
-        author: node.name, // 信任根在 hub（R-M1-8）：author = 鉴权节点名，manifest.author 丢弃
+        // 信任根在 hub（R-M1-8）：author = 鉴权节点名，manifest.author 丢弃。
+        // conflict 分支不覆写 author/owner（author 定死 = owner 名，M5.0 §3）
+        author: node.name,
         description: manifest.description,
         readme: manifest.readme,
         tags_json: JSON.stringify(manifest.tags),
         category: manifest.category,
         icon_emoji: manifest.iconEmoji,
         latest_version: manifest.version,
+        owner_node_id: node.nodeId,
       });
       insertVersion.run(manifest.slug, manifest.version, checksum, sizeBytes, node.name, publishedAt);
       clearTombstone.run(manifest.slug);
@@ -620,6 +680,12 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     try {
       tx();
     } catch (err) {
+      // 领地判定失败 403：事务已回滚，但尾随 part 仍需排干（否则连接悬挂）
+      if (err instanceof NotOwnerError) {
+        reply.code(403).send({ error: 'not_owner', owner_name: err.ownerName });
+        void drainParts();
+        return reply;
+      }
       // 唯一键兜底 409：事务已回滚，但尾随 part 仍需排干（否则连接悬挂）
       if (isUniqueViolation(err)) {
         reply.code(409).send({ error: 'version_exists' });
@@ -629,7 +695,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       throw err;
     }
 
-    // ⑦ 发布事件广播（spec §3.3/§5）：入库成功后广播全部在线节点 →
+    // ⑦ 发布事件广播（spec §3.3/§5 + M5.0 §6 携归属）：入库成功后广播全部在线节点 →
     //    studio 侧 HubManager 收到 resource.published → 资源库更新角标。
     //    广播失败不得推翻已提交的发布（DB 已落库）——只记日志。
     try {
@@ -640,6 +706,7 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
         version: manifest.version,
         author: node.name,
         at: publishedAt,
+        ownerNodeId: node.nodeId,
       } satisfies ResourcePublishedEvent);
     } catch (err) {
       logger.warn('发布事件广播失败（发布已入库）', { slug: manifest.slug, err });
@@ -657,9 +724,12 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
     return res;
   });
 
-  // 资源撤回（spec M3.4 §2.2.3）：Bearer 鉴权，与 publish 同信任模型——任何注册节点
-  // 可撤（leader-only 治理记为设计边界延后）。body {slug}。
+  // 资源撤回（spec M3.4 §2.2.3 + M5.0 §4 owner-only）：Bearer 鉴权，与 publish 同信任模型——
+  // M4.4 裁关闭前提「无归属模型」已不成立 → 重评翻转为 owner-only（owner 即权威，
+  // leader-only 无必要——个人 hub 单信任域）。
   // - 404：无此资源（resources 表无该 slug 行）
+  // - 403：非 owner（携 owner_name）——权限判定先于幂等（已撤回再撤的越权者同样 403）；
+  //   无主（NULL/悬空——开放认领）放行，保持存量行为（认领先于下架：先发新版即自然认领回）
   // - 幂等：已撤回再撤 = 200 且无状态变化（不 bump revision、不广播）
   // - 效果 = 墓碑置位 + revision++（同事务）+ resource.unpublished 广播
   // - 不删版本行/blob：历史版本下载端点保留（roadmap 裁定）
@@ -675,8 +745,11 @@ export function registerResourceRoutes(app: FastifyInstance, opts: ResourceRoute
       return reply.code(400).send({ error: 'invalid_slug' });
     }
     const slug = body.slug;
-    const exists = db.prepare('SELECT 1 FROM resources WHERE slug = ?').get(slug);
-    if (exists === undefined) return reply.code(404).send({ error: 'not_found' });
+    const owned = readResourceOwner(db, slug);
+    if (owned === undefined) return reply.code(404).send({ error: 'not_found' });
+    if (owned.owner_name !== null && owned.owner_node_id !== node.nodeId) {
+      return reply.code(403).send({ error: 'not_owner', owner_name: owned.owner_name });
+    }
 
     const at = Date.now();
     // 条件 UPDATE 自带幂等：墓碑已置位（unpublished_at IS NOT NULL）→ 0 行受影响 → 不 bump

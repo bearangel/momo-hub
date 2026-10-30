@@ -77,6 +77,11 @@ const MIGRATIONS: readonly string[] = [
   // 单调 +1）。hub_meta 表 v1 已存在——此处只 INSERT catalog_revision 键，勿重建表。
   `ALTER TABLE resources ADD COLUMN unpublished_at INTEGER;
    INSERT INTO hub_meta (key, value) VALUES ('catalog_revision', '1') ON CONFLICT(key) DO NOTHING`,
+  // v8（M5.0 资源归属权威，spec §2）：resources 归属列——NULL = 无主（开放认领；
+  // 存量行迁移保持 NULL，现网数据为测试性无损）。悬空（指向已删 nodes 行——仅手工
+  // DB 可造成）等同开放认领。语义外键指向 nodes.id，不加 FK 约束（nodes 无删除面，
+  // 约束冗余）。
+  `ALTER TABLE resources ADD COLUMN owner_node_id TEXT`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

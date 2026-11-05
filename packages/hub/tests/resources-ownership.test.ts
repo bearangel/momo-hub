@@ -425,6 +425,9 @@ describe('迁移 v8（resources.owner_node_id）', () => {
       INSERT INTO resources (slug, type, name, author, description, readme, tags_json, category, icon_emoji, latest_version)
       VALUES ('v7-legacy', 'skill', 'V7 Legacy', 'old-author', '', '', '[]', '', '', '1.0.0')`).run();
     d1.prepare('ALTER TABLE resources DROP COLUMN owner_node_id').run();
+    // 1.10.0 v9 产物一并摘除（仿真 v7 库须回到 v9 之前——mode 列 + 绑定表）
+    d1.prepare('ALTER TABLE groups DROP COLUMN mode').run();
+    d1.prepare('DROP TABLE group_bindings').run();
     d1.prepare(`UPDATE hub_meta SET value = '9' WHERE key = 'schema_version'`).run();
     d1.close();
 
@@ -434,11 +437,11 @@ describe('迁移 v8（resources.owner_node_id）', () => {
     expect(cols).toContain('owner_node_id');
     const legacy = d2.prepare('SELECT owner_node_id FROM resources WHERE slug = ?').get('v7-legacy') as { owner_node_id: string | null };
     expect(legacy.owner_node_id).toBeNull(); // 存量保持 NULL（开放认领）
-    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '10' });
+    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '11' });
     // 再重开幂等：迁移不重复执行（列不被重复 ALTER 炸）
     d2.close();
     const d3 = openHubDatabase(dir);
-    expect(d3.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '10' });
+    expect(d3.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '11' });
     d3.close();
   });
 });

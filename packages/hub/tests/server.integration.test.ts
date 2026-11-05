@@ -25,7 +25,7 @@ function enroll(name: string): { nodeId: string; deviceToken: string } {
 }
 
 /** 便捷客户端：自动过 hello，收集全部信封（deviceToken/inbox 一并暴露给用例），支持条件等待。
- *  protoVer 可注入（M3.0 三态：模拟 1.1.0 低版本 / 1.9.0 高版本节点过 hello）。 */
+ *  protoVer 可注入（M3.0 三态：模拟 1.1.0 低版本 / 1.10.0 高版本节点过 hello）。 */
 function connect(name: string, protoVer: string = PROTOCOL_VERSION) {
   return new Promise<{ ws: WebSocket; nodeId: string; deviceToken: string; inbox: Envelope[]; next(match: (e: Envelope) => boolean): Promise<Envelope> }>((resolve, reject) => {
     const cred = enroll(name);
@@ -161,7 +161,7 @@ describe('hub ws 服务', () => {
     expect(payload?.code).toBe('unsupported_method');
     expect(payload?.method).toBe('task.list');
     expect(payload?.requiredMinor).toBe(2);
-    expect(payload?.message).toContain('hub=1.9.0');
+    expect(payload?.message).toContain('hub=1.10.0');
     expect(payload?.message).toContain('节点=1.1.0');
     expect(payload?.message).toContain('task.list');
     peer.ws.close();

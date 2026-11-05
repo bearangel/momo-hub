@@ -246,13 +246,13 @@ describe('迁移：workspace_snapshots_meta', () => {
   it('schema_version=10；表存在；重开幂等；(workspace_name, version) 库层唯一（C4 并发兜底）', () => {
     const dir = mkdtempSync(join(tmpdir(), 'momo-hub-snap-mig-'));
     const d1: Database.Database = openHubDatabase(dir);
-    expect((d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('10');
+    expect((d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('11');
     expect(d1.prepare(
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'workspace_snapshots_meta'`,
     ).get()).toEqual({ name: 'workspace_snapshots_meta' });
     d1.close();
     const d2 = openHubDatabase(dir);
-    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('10');
+    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('11');
     d2.close();
 
     // 库层唯一键：同 workspace_name+version 二次插入必炸（409 兜底机制的根基）

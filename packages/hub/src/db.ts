@@ -82,6 +82,19 @@ const MIGRATIONS: readonly string[] = [
   // DB 可造成）等同开放认领。语义外键指向 nodes.id，不加 FK 约束（nodes 无删除面，
   // 约束冗余）。
   `ALTER TABLE resources ADD COLUMN owner_node_id TEXT`,
+  // v9（1.10.0 工作组平行模式，spec 2026-11-05 §4.1）：groups 模式列（存量组全落
+  // 'leader-follower' 缺省——零行为漂移）+ 绑定登记表（PK (group_id, node_id)——
+  // 一节点一组一绑定空间；accepts_mirror 镜像接受开关与绑定同表：入组两决定一次
+  // 落账）。不加 FK 约束（groups/group_members 均无删除面；leave 清理由应用层）。
+  `ALTER TABLE groups ADD COLUMN mode TEXT NOT NULL DEFAULT 'leader-follower';
+   CREATE TABLE IF NOT EXISTS group_bindings (
+     group_id TEXT NOT NULL,
+     node_id TEXT NOT NULL,
+     workspace_name TEXT NOT NULL,
+     accepts_mirror INTEGER NOT NULL DEFAULT 0,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (group_id, node_id)
+   )`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

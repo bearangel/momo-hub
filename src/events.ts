@@ -54,10 +54,12 @@ export interface ResourceUnpublishedEvent {
 // M2 事件载荷（§3.2 逐字段）
 // ────────────────────────────────────────────────────────────────────────────
 
-/** group.changed：组内广播（成员变动/leader 转移）。 */
+/** group.changed：组内广播（成员变动/leader 转移/绑定变化）。
+ *  'bound'（1.10.0）：绑定/换绑/解绑/镜像开关翻转——消费方据此重拉 group.list
+ *  （GroupMember.bound/boundWorkspaceName/acceptsMirror 投影刷新）。 */
 export interface GroupChangedEvent {
   groupId: string;
-  kind: 'joined' | 'left' | 'leaderChanged';
+  kind: 'joined' | 'left' | 'leaderChanged' | 'bound';
   nodeId: string;
 }
 
@@ -76,8 +78,10 @@ export interface TaskProgressEvent {
   lastSeq: number;
   excerpt: string;
   /** 等待标注（M2.1 T11b，0.1.4）：'waiting-input' = 目标侧等待用户确认——随
-   *  task.report 进度段透传；缺省 = 正常进度（0.1.3 载荷向后兼容）。 */
-  kind?: 'waiting-input';
+   *  task.report 进度段透传；缺省 = 正常进度（0.1.3 载荷向后兼容）。
+   *  1.10.0 平行模式扩 'received'|'arranged'（草稿已接收/已安排——随 status:'pending'
+   *  生命周期拍透传，发起方看板行状态展示）。 */
+  kind?: 'waiting-input' | 'received' | 'arranged';
 }
 
 /** 终态四件（completed/failed/interrupted/cancelled）共用形状：定向→leader + 账本状态机迁移。 */

@@ -5,8 +5,8 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
-  EVT, RPC,
-  type EventEnvelope, type GroupChangedEvent, type RpcErrorPayload,
+  EVT, RPC, VIEW_RPC, PEER_DELEGATION_REQUIRED_MINOR, minorOf,
+  type EventEnvelope, type GroupChangedEvent, type GroupMode, type RpcErrorPayload,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 
@@ -41,9 +41,9 @@ function validGroupName(raw: unknown): string | null {
   return n.length >= 1 && n.length <= 64 ? n : null;
 }
 
-function groupRow(db: Database.Database, groupId: string): { id: string; name: string; leader_node_id: string } | undefined {
-  return db.prepare('SELECT id, name, leader_node_id FROM groups WHERE id = ?').get(groupId) as
-    | { id: string; name: string; leader_node_id: string }
+function groupRow(db: Database.Database, groupId: string): { id: string; name: string; leader_node_id: string; mode: GroupMode } | undefined {
+  return db.prepare('SELECT id, name, leader_node_id, mode FROM groups WHERE id = ?').get(groupId) as
+    | { id: string; name: string; leader_node_id: string; mode: GroupMode }
     | undefined;
 }
 
@@ -158,6 +158,10 @@ const LEADER_ONLY_METHODS: Record<string, LeaderOnlyExtractor> = {
 /**
  * 组角色守卫：非 leader-only 方法直通；leader-only 方法先验组存在（not_found）
  * 再验 leader 身份（非 leader / 非成员一律 forbidden，§3.3——不区分两者防探测）。
+ * 1.10.0 平行组分流：peer 组 view.* 全拒（平行组无节点查看——spec §2 隐私裁定）；
+ * task.delegate / task.cancel 放行为 peer 分支——delegate 的「任意成员 + 草稿载荷
+ * 白名单 + 目标已绑定」与 cancel 的「发起者可取消」校验由 delegations handler
+ * 承接（守卫层只做模式分流，不重复业务规则）。
  */
 export function checkGroupRole(
   db: Database.Database,
@@ -171,6 +175,12 @@ export function checkGroupRole(
   if (groupId === null) return { ok: true };
   const group = groupRow(db, groupId);
   if (!group) return { ok: false, error: err('not_found', '工作组不存在') };
+  if (group.mode === 'peer') {
+    if ((Object.values(VIEW_RPC) as readonly string[]).includes(method)) {
+      return { ok: false, error: err('forbidden', '平行组不提供节点查看') };
+    }
+    if (method === RPC.task.delegate || method === RPC.task.cancel) return { ok: true };
+  }
   if (group.leader_node_id !== nodeId) {
     return { ok: false, error: err('forbidden', '仅组长（leader）可执行该操作') };
   }
@@ -181,50 +191,112 @@ export function checkGroupRole(
 // 组管理六 RPC（spec §3.1「工作组管理」表逐行）
 // ────────────────────────────────────────────────────────────────────────────
 
+/** 绑定空间名上限（S1 NAME_MAX 同款——与 workspaceName 全线对齐）。 */
+const BIND_WORKSPACE_NAME_MAX = 128;
+
 const handleCreate: GroupHandler = (ctx, payload) => {
   const groupName = validGroupName(isRecord(payload) ? payload.groupName : undefined);
   if (!groupName) return { ok: false, error: err('bad_request', '组名非法（1-64 个字符）') };
+  const modeRaw = isRecord(payload) ? payload.mode : undefined;
+  const mode: GroupMode = modeRaw === 'peer' ? 'peer' : 'leader-follower';
+  let bindWorkspaceName: string | null = null;
+  if (mode === 'peer') {
+    // 建组闸：调用方 minor ≥ 10（旧客户端不识 peer 语义，半懂建组=组内能力错位）
+    const conn = ctx.registry.get(ctx.nodeId);
+    const callerMinor = conn ? minorOf(conn.peerProtoVer) : null;
+    if (callerMinor === null || callerMinor < PEER_DELEGATION_REQUIRED_MINOR) {
+      return {
+        ok: false,
+        error: err('node_unsupported', `本节点协议过旧（${conn?.peerProtoVer ?? '未知'}，需 1.${PEER_DELEGATION_REQUIRED_MINOR}.0 及以上），不能创建平行组`),
+      };
+    }
+    bindWorkspaceName = validBindName(isRecord(payload) ? payload.bindWorkspaceName : undefined);
+    if (!bindWorkspaceName) {
+      return { ok: false, error: err('bad_request', `平行组建组必须携带组长绑定空间（bindWorkspaceName 1-${BIND_WORKSPACE_NAME_MAX} 字符）`) };
+    }
+  }
   const groupId = randomUUID();
   const now = Date.now();
   const tx = ctx.db.transaction(() => {
-    ctx.db.prepare('INSERT INTO groups (id, name, leader_node_id, created_at) VALUES (?, ?, ?, ?)')
-      .run(groupId, groupName, ctx.nodeId, now);
+    ctx.db.prepare('INSERT INTO groups (id, name, leader_node_id, mode, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(groupId, groupName, ctx.nodeId, mode, now);
     ctx.db.prepare('INSERT INTO group_members (group_id, node_id, joined_at) VALUES (?, ?, ?)')
       .run(groupId, ctx.nodeId, now);
+    if (mode === 'peer' && bindWorkspaceName !== null) {
+      ctx.db.prepare(
+        'INSERT INTO group_bindings (group_id, node_id, workspace_name, accepts_mirror, updated_at) VALUES (?, ?, ?, 0, ?)',
+      ).run(groupId, ctx.nodeId, bindWorkspaceName, now);
+    }
   });
   tx();
   broadcastGroupChanged(ctx, groupId, 'joined', ctx.nodeId);
   return { ok: true, payload: { groupId, nodeId: ctx.nodeId } };
 };
 
+/** 绑定空间名合法化：trim 后 1..128（与组名/工作空间名同款有界约束）。 */
+function validBindName(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null;
+  const n = raw.trim();
+  return n.length >= 1 && n.length <= BIND_WORKSPACE_NAME_MAX ? n : null;
+}
+
+/** peer 组成员闸：调用方 minor ≥ 10（入组节点能力对齐——draft 链路两侧都要懂）。 */
+function peerJoinGate(ctx: GroupHandlerContext): RpcOutcome | null {
+  const conn = ctx.registry.get(ctx.nodeId);
+  const callerMinor = conn ? minorOf(conn.peerProtoVer) : null;
+  if (callerMinor === null || callerMinor < PEER_DELEGATION_REQUIRED_MINOR) {
+    return {
+      ok: false,
+      error: err('node_unsupported', `本节点协议过旧（${conn?.peerProtoVer ?? '未知'}，需 1.${PEER_DELEGATION_REQUIRED_MINOR}.0 及以上），不能加入平行组`),
+    };
+  }
+  return null;
+}
+
 const handleList: GroupHandler = (ctx) => {
   // 只返回调用方所在的组（§9 组间可见性不做——非成员不得枚举他人组）
   const rows = ctx.db.prepare(`
-    SELECT g.id, g.name, g.leader_node_id
+    SELECT g.id, g.name, g.leader_node_id, g.mode
     FROM groups g JOIN group_members m ON m.group_id = g.id
     WHERE m.node_id = ?
     ORDER BY g.created_at ASC, g.id ASC
-  `).all(ctx.nodeId) as Array<{ id: string; name: string; leader_node_id: string }>;
+  `).all(ctx.nodeId) as Array<{ id: string; name: string; leader_node_id: string; mode: GroupMode }>;
   const memberStmt = ctx.db.prepare(`
     SELECT m.node_id, COALESCE(n.name, m.node_id) AS name
     FROM group_members m LEFT JOIN nodes n ON n.id = m.node_id
     WHERE m.group_id = ?
     ORDER BY m.joined_at ASC, m.node_id ASC
   `);
+  // 绑定投影（1.10.0，仅 peer 组消费——lf 组旧形状零变化）
+  const bindingStmt = ctx.db.prepare(
+    'SELECT workspace_name, accepts_mirror FROM group_bindings WHERE group_id = ? AND node_id = ?',
+  );
   const groups = rows.map((g) => ({
     groupId: g.id,
     groupName: g.name,
     leaderNodeId: g.leader_node_id,
+    mode: g.mode,
     members: (memberStmt.all(g.id) as Array<{ node_id: string; name: string }>).map((m) => {
       // protoVer（M5.3 nodeCaps 数据源）：在线成员携带 hello 上报的协议版本
       // （registry 会话内存态）；离线成员不带键——旧形状零变化。
       const conn = ctx.registry.get(m.node_id);
-      return {
+      const member: Record<string, unknown> = {
         nodeId: m.node_id,
         name: m.name,
         online: conn !== undefined,
         ...(conn !== undefined ? { protoVer: conn.peerProtoVer } : {}),
       };
+      if (g.mode === 'peer') {
+        const binding = bindingStmt.get(g.id, m.node_id) as
+          | { workspace_name: string; accepts_mirror: number }
+          | undefined;
+        member.bound = binding !== undefined;
+        if (binding !== undefined) {
+          member.boundWorkspaceName = binding.workspace_name;
+          member.acceptsMirror = binding.accepts_mirror === 1;
+        }
+      }
+      return member;
     }),
   }));
   return { ok: true, payload: { groups } };
@@ -261,6 +333,11 @@ const handleJoin: GroupHandler = (ctx, payload) => {
   const groupId = invite.group_id;
   // 幂等：已是成员直接回组 id（重试安全），无状态变迁不广播
   if (isMember(ctx.db, groupId, ctx.nodeId)) return { ok: true, payload: { groupId } };
+  const group = groupRow(ctx.db, groupId);
+  if (group?.mode === 'peer') {
+    const gate = peerJoinGate(ctx);
+    if (gate !== null) return gate;
+  }
   ctx.db.prepare('INSERT INTO group_members (group_id, node_id, joined_at) VALUES (?, ?, ?)')
     .run(groupId, ctx.nodeId, Date.now());
   broadcastGroupChanged(ctx, groupId, 'joined', ctx.nodeId);
@@ -280,7 +357,12 @@ const handleLeave: GroupHandler = (ctx, payload) => {
     return { ok: false, error: err('forbidden', '组长需先转移组长身份再退组') };
   }
   broadcastGroupChanged(ctx, groupId, 'left', ctx.nodeId);
-  ctx.db.prepare('DELETE FROM group_members WHERE group_id = ? AND node_id = ?').run(groupId, ctx.nodeId);
+  const tx = ctx.db.transaction(() => {
+    ctx.db.prepare('DELETE FROM group_members WHERE group_id = ? AND node_id = ?').run(groupId, ctx.nodeId);
+    // 退组同步清绑定（防幽灵绑定——离组成员不再可被委派/镜像，登记随之失效）
+    ctx.db.prepare('DELETE FROM group_bindings WHERE group_id = ? AND node_id = ?').run(groupId, ctx.nodeId);
+  });
+  tx();
   return { ok: true, payload: { ok: true } };
 };
 
@@ -299,7 +381,75 @@ const handleTransfer: GroupHandler = (ctx, payload) => {
   return { ok: true, payload: { ok: true } };
 };
 
-/** 组管理 RPC 分发表（wire 方法名 → handler）。 */
+// ── 绑定三 RPC（1.10.0 平行模式——minor 10 门槛由分发层 METHOD_REQUIRED_MINOR 守卫）──
+
+/** peer 组绑定前置校验：组存在 ∧ peer 模式 ∧ 调用方是成员。 */
+function peerMemberCtx(
+  ctx: GroupHandlerContext,
+  groupId: string,
+): { ok: true; group: { id: string; name: string; leader_node_id: string; mode: GroupMode } } | { ok: false; error: RpcErrorPayload } {
+  const group = groupRow(ctx.db, groupId);
+  if (!group) return { ok: false, error: err('not_found', '工作组不存在') };
+  if (group.mode !== 'peer') {
+    return { ok: false, error: err('bad_request', '仅平行组支持承接空间绑定（主从组走按名镜像）') };
+  }
+  if (!isMember(ctx.db, groupId, ctx.nodeId)) {
+    return { ok: false, error: err('forbidden', '仅本组成员可绑定承接空间') };
+  }
+  return { ok: true, group };
+}
+
+const handleBind: GroupHandler = (ctx, payload) => {
+  const groupId = reqStr(payload, 'groupId');
+  const workspaceName = validBindName(isRecord(payload) ? payload.workspaceName : undefined);
+  if (!groupId) return { ok: false, error: err('bad_request', 'groupId 缺失') };
+  if (!workspaceName) {
+    return { ok: false, error: err('bad_request', `workspaceName 非法（1-${BIND_WORKSPACE_NAME_MAX} 字符）`) };
+  }
+  const guard = peerMemberCtx(ctx, groupId);
+  if (!guard.ok) return guard;
+  // 幂等换绑：最后一次生效；accepts_mirror 保留既有值（换空间不重置开关语义）
+  ctx.db.prepare(`
+    INSERT INTO group_bindings (group_id, node_id, workspace_name, accepts_mirror, updated_at)
+    VALUES (?, ?, ?, COALESCE((SELECT accepts_mirror FROM group_bindings WHERE group_id = ? AND node_id = ?), 0), ?)
+    ON CONFLICT(group_id, node_id) DO UPDATE SET
+      workspace_name = excluded.workspace_name,
+      accepts_mirror = excluded.accepts_mirror,
+      updated_at = excluded.updated_at
+  `).run(groupId, ctx.nodeId, workspaceName, groupId, ctx.nodeId, Date.now());
+  broadcastGroupChanged(ctx, groupId, 'bound', ctx.nodeId);
+  return { ok: true, payload: { ok: true } };
+};
+
+const handleUnbind: GroupHandler = (ctx, payload) => {
+  const groupId = reqStr(payload, 'groupId');
+  if (!groupId) return { ok: false, error: err('bad_request', 'groupId 缺失') };
+  const guard = peerMemberCtx(ctx, groupId);
+  if (!guard.ok) return guard;
+  ctx.db.prepare('DELETE FROM group_bindings WHERE group_id = ? AND node_id = ?').run(groupId, ctx.nodeId);
+  broadcastGroupChanged(ctx, groupId, 'bound', ctx.nodeId);
+  return { ok: true, payload: { ok: true } };
+};
+
+const handleSetMirrorAccept: GroupHandler = (ctx, payload) => {
+  const groupId = reqStr(payload, 'groupId');
+  const accepts = isRecord(payload) ? payload.accepts : undefined;
+  if (!groupId) return { ok: false, error: err('bad_request', 'groupId 缺失') };
+  if (typeof accepts !== 'boolean') return { ok: false, error: err('bad_request', 'accepts 必须为布尔') };
+  const guard = peerMemberCtx(ctx, groupId);
+  if (!guard.ok) return guard;
+  const bound = ctx.db.prepare('SELECT 1 FROM group_bindings WHERE group_id = ? AND node_id = ?')
+    .get(groupId, ctx.nodeId);
+  if (!bound) {
+    return { ok: false, error: err('bad_request', '未绑定承接空间，无法设置镜像开关') };
+  }
+  ctx.db.prepare('UPDATE group_bindings SET accepts_mirror = ?, updated_at = ? WHERE group_id = ? AND node_id = ?')
+    .run(accepts ? 1 : 0, Date.now(), groupId, ctx.nodeId);
+  broadcastGroupChanged(ctx, groupId, 'bound', ctx.nodeId);
+  return { ok: true, payload: { ok: true } };
+};
+
+/** 组管理 + 绑定 RPC 分发表（wire 方法名 → handler）。 */
 export const GROUP_HANDLERS: Record<string, GroupHandler> = {
   [RPC.group.create]: handleCreate,
   [RPC.group.list]: handleList,
@@ -307,4 +457,7 @@ export const GROUP_HANDLERS: Record<string, GroupHandler> = {
   [RPC.group.join]: handleJoin,
   [RPC.group.leave]: handleLeave,
   [RPC.group.transfer]: handleTransfer,
+  [RPC.group.bind]: handleBind,
+  [RPC.group.unbind]: handleUnbind,
+  [RPC.group.setMirrorAccept]: handleSetMirrorAccept,
 };

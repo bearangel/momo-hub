@@ -1,4 +1,19 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.10.0（工作组平行模式，spec moo-studio docs/specs/2026-11-05-workgroup-peer-mode-design.md）：
+// 组模型增可选 mode?（'leader-follower' 缺省 | 'peer'——group.create 载荷与 GroupInfo
+// 投影；peer 组建组必带组长绑定空间）+ 绑定三 RPC（group.bind/group.unbind/
+// group.setMirrorAccept，minor 10 门槛登记）+ GroupMember 增可选 bound?/
+// boundWorkspaceName?/acceptsMirror?（group.list 投影）+ DelegationTask 增可选
+// draft?:true 与 priority?（peer 组仅接受 draft 任务书——载荷白名单：draft 在场时
+// agentSlug/team/dependsOn/permissionTier 任一键整包拒；lf 组拒 draft，模式纯净）
+// + PEER_DELEGATION_REQUIRED_MINOR=10（draft 载荷能力非新方法，同 team 门机制）
+// + task.report 载荷 status 增 'pending'（进度拍值——不改账本状态只转 progress，承载
+// 草稿生命周期拍）+ progress.kind 枚举扩 'received'|'arranged'（草稿已接收/已安排）
+// + MirrorRequest/MirrorApplyPayload 增可选 applyTo?:'binding'|'name'（peer 组镜像由 hub
+// 权威置 'binding'——落目标绑定空间；lf 缺省 'name' 语义不变）+ GroupChangedEvent.kind
+// 扩 'bound'（绑定/换绑/开关翻转组内广播）——除版本门外全部为可选字段/枚举扩值，
+// hub 守卫按组模式分流（peer 组 task.delegate 放开为任意成员、task.cancel 放开为
+// 发起者、view.* 全拒），major 不动。
 // 1.9.0（M5.3 外派团队执行）：DelegationTask 增可选 team?（成员名单快照：members
 // 2..8 项、每项 {name: 1..64, isLeader}、恰好 1 个 leader、与 agentSlug 互斥——
 // 非法整包拒 bad_request，沿 dependsOn 先例；hub 不持久化，随 task.assigned 透传）
@@ -38,7 +53,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.9.0';
+export const PROTOCOL_VERSION = '1.10.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

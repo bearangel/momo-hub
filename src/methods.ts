@@ -51,6 +51,12 @@ METHOD_REQUIRED_MINOR[RPC.task.answer] = 3;
 // 元数据透传），无新方法；1.6 peer 调任何已登记方法不受影响（全表最大门槛仍为 4）。
 METHOD_REQUIRED_MINOR[RPC.view.workspaces] = 4;
 METHOD_REQUIRED_MINOR[RPC.view.files] = 4;
+// 1.10.0（平行模式）：绑定三 RPC 为 minor-10 方法——1.9 客户端调它由分发守卫回
+// unsupported_method{method, requiredMinor:10} 可读降级；既有 group 六方法仍为
+// 基线 2（mode/bindWorkspaceName 为可选载荷字段，缺省不触发门槛，旧调用零变化）。
+METHOD_REQUIRED_MINOR[RPC.group.bind] = 10;
+METHOD_REQUIRED_MINOR[RPC.group.unbind] = 10;
+METHOD_REQUIRED_MINOR[RPC.group.setMirrorAccept] = 10;
 
 export type RpcMethodName =
   | 'hello'

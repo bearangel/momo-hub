@@ -91,6 +91,25 @@ export class MirrorRouter {
     const snap = this.db.prepare('SELECT 1 FROM workspace_snapshots_meta WHERE snapshot_id = ?').get(snapshotId);
     if (!snap) return { ok: false, error: err('not_found', '快照不存在') };
 
+    // 1.10.0 组模式分流（spec 2026-11-05 §3.4）：peer 组镜像落目标绑定空间——
+    // 须已绑定且 acceptsMirror=1（两闸都在转发前——早失败不占在途登记）；apply
+    // 载荷 applyTo:'binding'（hub 权威置位，客户端值忽略）。lf 组缺省按名
+    // （applyTo 不带键——旧 wire 逐字节不变）。
+    const groupMode = (this.db.prepare('SELECT mode FROM groups WHERE id = ?').get(groupId) as
+      | { mode: 'leader-follower' | 'peer' }
+      | undefined)?.mode ?? 'leader-follower';
+    let applyTo: 'binding' | 'name' = 'name';
+    if (groupMode === 'peer') {
+      const binding = this.db.prepare(
+        'SELECT workspace_name, accepts_mirror FROM group_bindings WHERE group_id = ? AND node_id = ?',
+      ).get(groupId, targetNodeId) as { workspace_name: string; accepts_mirror: number } | undefined;
+      if (!binding) return { ok: false, error: err('forbidden', '目标节点未绑定承接空间，无法接收镜像') };
+      if (binding.accepts_mirror !== 1) {
+        return { ok: false, error: err('forbidden', '对方未接受本组镜像（可在组设置中开启）') };
+      }
+      applyTo = 'binding';
+    }
+
     // 并发对账：预占在 await 之前（单线程同步段原子——两发并发不得双双过检）
     const mirrorId = randomUUID();
     const key = inFlightKey(workspaceName, targetNodeId);
@@ -102,6 +121,7 @@ export class MirrorRouter {
     // 定向转发（私有目标端语义）：req 信封 id=mirrorId——目标端回执按 id 对账
     const applyPayload: MirrorApplyPayload = { mirrorId, snapshotId, workspaceName, strategy };
     if (confirmRaw === true) applyPayload.confirm = true;
+    if (applyTo === 'binding') applyPayload.applyTo = 'binding';
     const sent = await this.registry.sendTo(targetNodeId, {
       v: 1, kind: 'req', id: mirrorId, method: MIRROR_WIRE.apply, payload: applyPayload,
     });

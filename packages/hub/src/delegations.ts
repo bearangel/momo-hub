@@ -24,7 +24,7 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
-  EVT, METHOD_REQUIRED_MINOR, RPC, RPC_ERROR_CODES, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
+  EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
   type TaskAssignedEvent, type TaskProgressEvent, type TaskRecord, type TaskReportPayload,
@@ -92,8 +92,12 @@ const TEAM_MEMBER_NAME_MAX = 64;  // 成员名上限（节点名/组名同款约
 /** permissionTier 合法档位（M2.1 T10b，与协议包 DelegationTask.permissionTier 枚举同源）。 */
 const PERMISSION_TIERS: readonly DelegationTask['permissionTier'][] = ['readonly', 'sandbox', 'confirm'];
 
-/** progress.kind 合法标注（M2.1 T11b，与协议包 TaskReportProgress.kind 枚举同源）。 */
-const PROGRESS_KINDS: readonly NonNullable<TaskReportProgress['kind']>[] = ['waiting-input'];
+/** progress.kind 合法标注（M2.1 T11b + 1.10.0 平行模式两值，与协议包 TaskReportProgress.kind 同源）。 */
+const PROGRESS_KINDS: readonly NonNullable<TaskReportProgress['kind']>[] = ['waiting-input', 'received', 'arranged'];
+
+/** 草稿优先级界（1.10.0）：与 studio tasks.priority 同量纲 0..10。 */
+const DRAFT_PRIORITY_MIN = 0;
+const DRAFT_PRIORITY_MAX = 10;
 
 const err = (code: RpcErrorPayload['code'], message: string): RpcErrorPayload => ({ code, message });
 const textEncoder = new TextEncoder();
@@ -173,15 +177,32 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
     if (team === null) return null;
     task.team = team;
   }
+  // draft（1.10.0 平行模式）：字面 true 才合法（防 truthy 泛化）；在场时执行编排
+  // 四键白名单互斥——任一键在场整包拒（深度防御：防异构客户端 smuggle 完整编排
+  // 进平行组，静默换班禁令的 hub 侧锚点）；priority 仅 draft 在场时合法（0..10 整数）。
+  if (raw.draft !== undefined) {
+    if (raw.draft !== true) return null;
+    if (task.agentSlug !== undefined || task.team !== undefined
+      || task.dependsOn !== undefined || task.permissionTier !== undefined) return null;
+    task.draft = true;
+    if (raw.priority !== undefined) {
+      if (typeof raw.priority !== 'number' || !Number.isInteger(raw.priority)
+        || raw.priority < DRAFT_PRIORITY_MIN || raw.priority > DRAFT_PRIORITY_MAX) return null;
+      task.priority = raw.priority;
+    }
+  } else if (raw.priority !== undefined) {
+    return null;
+  }
   return task;
 }
 
-/** task.report 载荷校验：status 三值枚举（interrupted/cancelled 不是上报值）、
- *  sessionId/reason 有界串、progress 形态（lastSeq 非负整数 + excerpt 有界串——
- *  RM2-7：excerpt="" 视同缺省受理，转发时以占位呈现，lastSeq 不丢）。 */
+/** task.report 载荷校验：status 四值枚举（pending=1.10.0 生命周期拍值——仅转
+ *  progress 不迁移状态；interrupted/cancelled 不是上报值）、sessionId/reason 有界串、
+ *  progress 形态（lastSeq 非负整数 + excerpt 有界串——RM2-7：excerpt="" 视同缺省
+ *  受理，转发时以占位呈现，lastSeq 不丢）。 */
 function parseReportPayload(raw: unknown): TaskReportPayload | null {
   if (!isRecord(raw)) return null;
-  if (raw.status !== 'running' && raw.status !== 'done' && raw.status !== 'failed') return null;
+  if (raw.status !== 'running' && raw.status !== 'done' && raw.status !== 'failed' && raw.status !== 'pending') return null;
   const out: TaskReportPayload = { status: raw.status };
   if (raw.sessionId !== undefined) {
     const sessionId = optBoundedStr(raw.sessionId, SESSION_ID_MAX);
@@ -314,6 +335,28 @@ export class DelegationRouter {
     if (!this.db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND node_id = ?').get(groupId, targetNodeId)) {
       return { ok: false, error: err('forbidden', '目标节点不是本组成员') };
     }
+    // 1.10.0 组模式分流（spec 2026-11-05 §3.2——守卫层已按模式放行 peer 调用）：
+    //  peer 组：调用方须为成员（lf 组守卫已验 leader）+ 任务书必须 draft + 目标
+    //  已绑定承接空间 + 目标 minor ≥ 10（draft 能力门）。
+    //  lf 组：draft 任务书整包拒（模式纯净——编排委派与草稿委派不混流）。
+    const groupMode = (this.db.prepare('SELECT mode FROM groups WHERE id = ?').get(groupId) as
+      | { mode: 'leader-follower' | 'peer' }
+      | undefined)?.mode ?? 'leader-follower';
+    if (groupMode === 'peer') {
+      if (!this.db.prepare('SELECT 1 FROM group_members WHERE group_id = ? AND node_id = ?').get(groupId, ctx.nodeId)) {
+        return { ok: false, error: err('forbidden', '仅本组成员可委派任务') };
+      }
+      if (task.draft !== true) {
+        return { ok: false, error: err('bad_request', '平行组仅接受草稿委派（task.draft=true，不含 agent/团队编排）') };
+      }
+      const binding = this.db.prepare('SELECT 1 FROM group_bindings WHERE group_id = ? AND node_id = ?')
+        .get(groupId, targetNodeId);
+      if (!binding) {
+        return { ok: false, error: err('forbidden', '目标节点未绑定承接空间，无法接收草稿') };
+      }
+    } else if (task.draft === true) {
+      return { ok: false, error: err('bad_request', '主从组不接受草稿委派（draft 仅平行组合法）') };
+    }
     // M5.3 团队派发版本门（防旧 studio 静默降级——旧节点忽略未知 team 字段按单
     // agent 跑，正是裁定禁止的静默换班）：任务带 team 时目标连接 minor < 9 即拒
     // （不落档）。指定节点与组内调度在 hub 侧同门——组内 least-busy 选点在 leader
@@ -331,6 +374,23 @@ export class DelegationRouter {
           return {
             ok: false,
             error: err('node_unsupported', `目标节点 ${conn.nodeName} 协议过旧（${conn.peerProtoVer}，需 1.${TEAM_DELEGATION_REQUIRED_MINOR}.0 及以上），不支持团队派发`),
+          };
+        }
+      }
+    }
+    // 1.10.0 草稿版本门（同 team 门机制——旧节点收到 draft 字段会按普通任务书自动
+    // 执行，正是平行模式要防的「静默换班」：草稿必须由懂 draft 语义的节点落板）。
+    if (task.draft === true) {
+      const conn = this.registry.get(targetNodeId);
+      if (conn) {
+        const peerMinor = minorOf(conn.peerProtoVer);
+        if (peerMinor === null || peerMinor < PEER_DELEGATION_REQUIRED_MINOR) {
+          logger.info('委派被拒：目标节点协议过旧，不支持草稿委派', {
+            targetNodeId, peerProtoVer: conn.peerProtoVer, byNode: ctx.nodeId,
+          });
+          return {
+            ok: false,
+            error: err('node_unsupported', `目标节点 ${conn.nodeName} 协议过旧（${conn.peerProtoVer}，需 1.${PEER_DELEGATION_REQUIRED_MINOR}.0 及以上），不支持草稿委派`),
           };
         }
       }
@@ -369,6 +429,14 @@ export class DelegationRouter {
     if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
     const row = this.getTask(taskId);
     if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    // 1.10.0 平行组分流（守卫层已按模式放行 peer 调用）：发起者（by_node_id）可
+    // 取消自己发出的草稿；lf 组守卫层已验 leader（发起者恒为 leader，语义等价）。
+    const groupMode = (this.db.prepare('SELECT mode FROM groups WHERE id = ?').get(row.group_id) as
+      | { mode: 'leader-follower' | 'peer' }
+      | undefined)?.mode ?? 'leader-follower';
+    if (groupMode === 'peer' && row.by_node_id !== ctx.nodeId) {
+      return { ok: false, error: err('forbidden', '平行组仅委派发起者可取消该任务') };
+    }
     if (!canTransition(row.status, 'cancelled')) {
       return { ok: false, error: err('conflict', `任务已处于终态 ${row.status}，不可取消`) };
     }
@@ -575,6 +643,18 @@ export class DelegationRouter {
 
     const to = report.status;
     const kind = report.progress?.kind;
+
+    // 1.10.0 生命周期拍（peer 草稿 received/arranged）：账本状态不动、sessionId
+    // 不回填，仅透传 progress 给委派发起方（by_node）；终态/未知态收到 pending 拍
+    // 静默忽略（对账键合法即不炸连接——拍是通知面不是账本）。
+    if (to === 'pending') {
+      if (row.status === 'done' || row.status === 'failed' || row.status === 'cancelled') {
+        logger.info('委派生命周期拍被忽略：账本已终态', { taskId: row.task_id, status: row.status, from: fromNodeId });
+        return;
+      }
+      this.forwardProgress(row, report);
+      return;
+    }
 
     // M3.1 waiting 触发规则（spec §3.1）：kind 只随 running 上报影响账本——
     // running+kind → 迁入 waiting；waiting+kind → 进度拍（账本不动）；

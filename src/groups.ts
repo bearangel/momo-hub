@@ -12,7 +12,16 @@ export const GROUP_RPC = {
   join: 'group.join',
   leave: 'group.leave',
   transfer: 'group.transfer',
+  bind: 'group.bind',
+  unbind: 'group.unbind',
+  setMirrorAccept: 'group.setMirrorAccept',
 } as const;
+
+/** 组模式（1.10.0 平行模式，spec 2026-11-05 §2）：
+ *  - leader-follower（缺省）：现状主从——组长独占镜像/委派/查看/调度
+ *  - peer：平行——任意成员点对点草稿委派、落点=绑定空间、镜像可选（接收方可拒）、
+ *    节点查看全组禁用。模式建组定死不可切（§9 裁定 7）。 */
+export type GroupMode = 'leader-follower' | 'peer';
 
 /** 镜像 RPC 目录（workspace.snapshot.build 走 HTTP multipart，不在此列）。 */
 export const WORKSPACE_RPC = {
@@ -24,7 +33,14 @@ export const WORKSPACE_RPC = {
 // 组管理载荷与响应（§3.1「工作组管理」表逐行）
 // ────────────────────────────────────────────────────────────────────────────
 
-export interface GroupCreateReq { groupName: string }
+export interface GroupCreateReq {
+  groupName: string;
+  /** 组模式（1.10.0）：缺省 leader-follower（旧客户端零变化）；peer 建组必带
+   *  bindWorkspaceName（组长绑定空间——一组一源，§9 裁定）。 */
+  mode?: GroupMode;
+  /** 组长绑定承接空间名（仅 peer 组消费；lf 组忽略该键）。 */
+  bindWorkspaceName?: string;
+}
 /** 创建者即 leader；nodeId 回调用者自身。 */
 export interface GroupCreateRes { groupId: string; nodeId: string }
 
@@ -37,6 +53,8 @@ export interface GroupInfo {
   groupId: string;
   groupName: string;
   leaderNodeId: string;
+  /** 组模式（1.10.0）：旧 hub 不回该字段 → 消费方按 leader-follower 兜底。 */
+  mode?: GroupMode;
   members: GroupMember[];
 }
 
@@ -48,6 +66,12 @@ export interface GroupMember {
    *  连接生灭）；离线成员不带键（旧形状零变化）——studio 派发闸 / routingPrecheck
    *  nodeCaps（nodeId/name/protoVer）的数据源。 */
   protoVer?: string;
+  /** 承接空间绑定态（1.10.0，仅 peer 组投影）：bound=是否已绑定；
+   *  boundWorkspaceName=绑定空间名（委派方「已绑定✓空间名」展示 + 隐私边界——
+   *  仅此一名对组可见）；acceptsMirror=镜像接受开关（组长镜像界面预过滤）。 */
+  bound?: boolean;
+  boundWorkspaceName?: string;
+  acceptsMirror?: boolean;
 }
 
 export interface GroupInviteReq { groupId: string; enrollmentToken?: string }
@@ -63,6 +87,20 @@ export interface GroupLeaveRes { ok: boolean }
 /** leader 转移（仅 leader 可调）。 */
 export interface GroupTransferReq { groupId: string; toNodeId: string }
 export interface GroupTransferRes { ok: boolean }
+
+// ── 绑定三 RPC（1.10.0 平行模式，minor 10 门槛）─────────────────────────────
+
+/** 绑定/换绑承接空间（仅 peer 组；幂等——最后一次生效）。 */
+export interface GroupBindReq { groupId: string; workspaceName: string }
+export interface GroupBindRes { ok: boolean }
+
+/** 解绑（幂等；解绑后该节点不可接收 peer 草稿委派）。 */
+export interface GroupUnbindReq { groupId: string }
+export interface GroupUnbindRes { ok: boolean }
+
+/** 镜像接受开关翻转（仅 peer 组；须已绑定）。 */
+export interface GroupSetMirrorAcceptReq { groupId: string; accepts: boolean }
+export interface GroupSetMirrorAcceptRes { ok: boolean }
 
 // ────────────────────────────────────────────────────────────────────────────
 // 镜像载荷与响应（§3.1「镜像」表逐行 + §5.2 两段式确认）
@@ -86,6 +124,10 @@ export interface WorkspaceSnapshotMeta {
 /** 镜像策略：M2 只做整体替换（增量合并属 YAGNI，§9）。 */
 export type MirrorStrategy = 'replace';
 
+/** 镜像落点（1.10.0）：'name'=按名建/替同名副本（lf 组现状，缺省值——旧载荷零变化）；
+ *  'binding'=落目标节点的组绑定空间（peer 组，hub 按组模式权威置位——客户端值忽略）。 */
+export type MirrorApplyTarget = 'binding' | 'name';
+
 export interface MirrorRequest {
   groupId: string;
   targetNodeId: string;
@@ -94,6 +136,8 @@ export interface MirrorRequest {
   strategy: MirrorStrategy;
   /** 两段式确认（§5.2）：目标工作空间已存在且未 confirm → hub 返 conflict + 差异摘要；confirm=true 直落。 */
   confirm?: boolean;
+  /** 落点（1.10.0）：hub 权威——peer 组恒置 'binding'，lf 组恒缺省 'name'；客户端携带值被忽略。 */
+  applyTo?: MirrorApplyTarget;
 }
 
 /** workspace.mirror 结果（应用在目标节点执行，hub 中转回执汇总）。
@@ -131,6 +175,9 @@ export interface MirrorApplyPayload {
   strategy: MirrorStrategy;
   /** 两段式确认（§5.2）：目标工作空间已存在且未 confirm → 回执 conflict + 差异摘要。 */
   confirm?: boolean;
+  /** 落点（1.10.0）：'binding'=解析本地组绑定空间 replace；缺省 'name'——旧 worker
+   *  零消费零变化（未知字段容忍）。 */
+  applyTo?: MirrorApplyTarget;
 }
 
 /** workspace.mirror 第一段响应（hub 收到即返——异步两段式的受理回执）。 */

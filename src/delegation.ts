@@ -39,6 +39,14 @@ export interface DelegationTask {
    *  透传，hub 不持久化（与 agentSlug/dependsOn 同生命周期——账本只存
    *  taskId/title/prompt）；缺省不带键（1.8 载荷向后兼容）。 */
   team?: DelegationTeam;
+  /** 平行组草稿标记（1.10.0，spec 2026-11-05 §3.2）：peer 组唯一合法形态——任务书
+   *  仅承载 title/prompt/priority（人接手自行安排），携带 agentSlug/team/dependsOn/
+   *  permissionTier 任一键整包拒（深度防御：防异构客户端把完整编排 smuggle 进平行组
+   *  ——静默换班禁令）；lf 组携带 draft 同样整包拒（模式纯净）。缺省不带键
+   *  （1.9 载荷向后兼容）。 */
+  draft?: true;
+  /** 草稿优先级（1.10.0，仅 draft 在场时合法）：0-10 整数，落接收方任务行 priority 列。 */
+  priority?: number;
 }
 
 /** 团队成员条目：name = agent 定义名（与快照名对齐口径一致），1..64 字符。 */
@@ -60,6 +68,14 @@ export interface DelegationTeam {
  * 消费同一常量作预检提示。1.9.0 = minor 9。
  */
 export const TEAM_DELEGATION_REQUIRED_MINOR = 9;
+
+/**
+ * 平行组草稿委派所需的最低协议 minor（1.10.0 §3.5）：draft 是载荷能力（非新 RPC
+ * 方法，不入 METHOD_REQUIRED_MINOR）——peer 组建组/入组节点 minor 低于该值直接拒
+ * （组内全员能力对齐），task.delegate 载荷带 draft 时 hub 按目标连接 peerProtoVer
+ * 权威门禁（同 team 门机制）。1.10.0 = minor 10。
+ */
+export const PEER_DELEGATION_REQUIRED_MINOR = 10;
 
 export interface TaskDelegateReq {
   groupId: string;
@@ -137,11 +153,14 @@ export const TASK_WIRE = {
   report: 'task.report',
 } as const;
 
-/** task.report 载荷：status 三值；hub 按 id=taskId 对账、canTransition 单点
+/** task.report 载荷：status 四值；hub 按 id=taskId 对账、canTransition 单点
  *  校验后更新账本，并按 status 转发对应 EVT 定向给 leader——
- *  running→task.progress、done→task.completed、failed→task.failed{reason}。 */
+ *  running→task.progress、done→task.completed、failed→task.failed{reason}。
+ *  'pending'（1.10.0 平行模式）= 生命周期拍专用值：不改账本状态、不回填
+ *  sessionId，仅转发 progress 给委派发起方（承载草稿 received/arranged 拍）；
+ *  终态账本收到 pending 拍静默忽略。 */
 export interface TaskReportPayload {
-  status: 'running' | 'done' | 'failed';
+  status: 'running' | 'done' | 'failed' | 'pending';
   /** 委派会话 id（MC1 独立委派会话——首次 running 上报建立，hub 回填账本 session_id）。 */
   sessionId?: string;
   /** failed 附因（约定值：'declined'=目标拒派；'local_session_lost'=续传时本地
@@ -154,9 +173,11 @@ export interface TaskReportPayload {
 /** 进度拍：委派会话 message_events 尾部摘要（excerpt 为截断文本）。
  *  kind 可选标注（M2.1 T11b，0.1.4）：'waiting-input' = 目标侧 agent 正等待
  *  用户确认（写授权卡等）——leader 看板据此切「等待节点确认」态。hub 侧白名单
- *  + 枚举校验，非法值剥除不抛（先例 permissionTier/modelBinding）。 */
+ *  + 枚举校验，非法值剥除不抛（先例 permissionTier/modelBinding）。
+ *  1.10.0 平行模式扩两值：'received' = 草稿已落接收方看板；'arranged' = 接收方
+ *  已指派 agent/团队——随 status:'pending' 拍携带，发起方看板行生命周期展示。 */
 export interface TaskReportProgress {
   lastSeq: number;
   excerpt: string;
-  kind?: 'waiting-input';
+  kind?: 'waiting-input' | 'received' | 'arranged';
 }

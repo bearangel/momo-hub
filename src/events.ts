@@ -63,12 +63,15 @@ export interface GroupChangedEvent {
   nodeId: string;
 }
 
-/** task.assigned：定向→目标节点；收到后本地建委派会话执行（MC1）。 */
+/** task.assigned：定向→目标节点；收到后本地建委派会话执行（MC1）。
+ *  groupId?（1.10.0）：组归属透传——peer 草稿接收端据此解析组级绑定空间
+ *  （多 peer 组绑定的判别键）；hub 恒置（旧 worker 未知字段容忍零消费）。 */
 export interface TaskAssignedEvent {
   taskId: string;
   workspaceName: string;
   task: DelegationTask;
   byNode: string;
+  groupId?: string;
 }
 
 /** task.progress：定向→leader（目标节点 500ms 合并批量转发；seq 单调）。 */

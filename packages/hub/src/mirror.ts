@@ -119,7 +119,7 @@ export class MirrorRouter {
     this.inFlight.set(key, mirrorId);
 
     // 定向转发（私有目标端语义）：req 信封 id=mirrorId——目标端回执按 id 对账
-    const applyPayload: MirrorApplyPayload = { mirrorId, snapshotId, workspaceName, strategy };
+    const applyPayload: MirrorApplyPayload = { mirrorId, snapshotId, workspaceName, strategy, groupId };
     if (confirmRaw === true) applyPayload.confirm = true;
     if (applyTo === 'binding') applyPayload.applyTo = 'binding';
     const sent = await this.registry.sendTo(targetNodeId, {

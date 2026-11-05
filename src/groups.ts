@@ -178,6 +178,8 @@ export interface MirrorApplyPayload {
   /** 落点（1.10.0）：'binding'=解析本地组绑定空间 replace；缺省 'name'——旧 worker
    *  零消费零变化（未知字段容忍）。 */
   applyTo?: MirrorApplyTarget;
+  /** 组归属（1.10.0）：applyTo='binding' 时目标节点解析组级绑定的判别键；hub 恒置。 */
+  groupId?: string;
 }
 
 /** workspace.mirror 第一段响应（hub 收到即返——异步两段式的受理回执）。 */

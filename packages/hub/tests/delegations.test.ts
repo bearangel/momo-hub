@@ -219,6 +219,7 @@ describe('task.delegate 全链', () => {
       workspaceName: 'ws-del',
       task: { title: '修登录 bug', prompt: '请修复登录失败问题', agentSlug: 'coder-pro' },
       byNode: leader.nodeId,
+      groupId,
     });
     // 定向：leader/outsider 不收 task.assigned
     await settle();
@@ -415,6 +416,7 @@ describe('team 段透传与校验矩阵（M5.3）', () => {
         team: { members: [{ name: 'pm-agent', isLeader: true }, { name: 'coder-agent', isLeader: false }] },
       },
       byNode: leader.nodeId,
+      groupId,
     });
     // 不持久化：账本行只落既有列（title 照存，team 无列可落）
     const row = ledgerRow(taskId);
@@ -452,6 +454,7 @@ describe('team 段透传与校验矩阵（M5.3）', () => {
         permissionTier: 'sandbox', dependsOn: ['T-1'], team: team2(),
       },
       byNode: leader.nodeId,
+      groupId,
     });
     leader.ws.close(); target.ws.close();
   });

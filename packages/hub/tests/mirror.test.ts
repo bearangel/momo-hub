@@ -156,7 +156,7 @@ describe('workspace.mirror 全链', () => {
     const { applyEnv } = await targetApplyAndReceipt(target, { ok: true, appliedResources: ['coder-pro', 'mcp-fetch'] });
     // 转达形态：req 信封 id=mirrorId（对账键），载荷四字段精确、无 confirm 键
     expect(applyEnv.id).toBe(mirrorId);
-    expect(applyEnv.payload).toEqual({ mirrorId, snapshotId, workspaceName: 'ws-full', strategy: 'replace' });
+    expect(applyEnv.payload).toEqual({ mirrorId, snapshotId, workspaceName: 'ws-full', strategy: 'replace', groupId });
 
     // 定向结果（两段式第二段——res 信封）
     const result = await leader.next((e) => e.kind === 'res' && e.method === MIRROR_WIRE.result && e.id === mirrorId);

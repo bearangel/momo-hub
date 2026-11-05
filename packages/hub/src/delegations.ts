@@ -405,7 +405,7 @@ export class DelegationRouter {
       .run(taskId, groupId, workspaceName, targetNodeId, ctx.nodeId, task.title, now, now);
     const evt: EventEnvelope = {
       v: 1, kind: 'evt', method: EVT.taskAssigned,
-      payload: { taskId, workspaceName, task, byNode: ctx.nodeId } satisfies TaskAssignedEvent,
+      payload: { taskId, workspaceName, task, byNode: ctx.nodeId, groupId } satisfies TaskAssignedEvent,
     };
     const sent = await this.registry.sendTo(targetNodeId, evt);
     if (sent === 'offline') {

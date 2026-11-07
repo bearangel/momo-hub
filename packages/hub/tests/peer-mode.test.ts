@@ -398,3 +398,52 @@ describe('peer 查看全拒 + 入组版本门', () => {
     a.ws.close(); oldClient.ws.close();
   });
 });
+
+describe('唯一成员（组长）退组 = 解散工作组（防「先转移再退」死角）', () => {
+  it('solo 组长退组：成功 + 组消亡 + 级联清理（成员/绑定/邀请码/组行）', async () => {
+    const a = await connect('solo-leader');
+    const created = await callRpc(a, RPC.group.create, { groupName: '孤组', mode: 'peer', bindWorkspaceName: '孤空间' });
+    const groupId = (created.payload as { groupId: string }).groupId;
+    const res = await callRpc(a, RPC.group.leave, { groupId });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const list = await callRpc(a, RPC.group.list, {});
+    expect(((list.payload as { groups: unknown[] }).groups)).toHaveLength(0);
+    a.ws.close();
+  });
+
+  it('解散级联：组内 in-flight 委派标记 cancelled + 目标节点收 task.cancelled', async () => {
+    const a = await connect('solo-leader-2');
+    const b = await connect('solo-worker-2');
+    const created = await callRpc(a, RPC.group.create, { groupName: '解散级联组' });
+    const groupId = (created.payload as { groupId: string }).groupId;
+    const invite = await callRpc(a, RPC.group.invite, { groupId });
+    await callRpc(b, RPC.group.join, { inviteCode: (invite.payload as { inviteCode: string }).inviteCode });
+    const del = await callRpc(a, RPC.task.delegate, {
+      groupId, targetNodeId: b.nodeId, workspaceName: 'ws',
+      task: { title: '在途任务', prompt: 'p' },
+    });
+    expect(del.kind === 'res' && del.ok).toBe(true);
+    const taskId = (del.payload as { taskId: string }).taskId;
+    // B 退组（成员路径）→ A 成唯一节点，但账本挂着指向 B 的在途任务
+    const bLeave = await callRpc(b, RPC.group.leave, { groupId });
+    expect(bLeave.kind === 'res' && bLeave.ok).toBe(true);
+    const aLeave = await callRpc(a, RPC.group.leave, { groupId });
+    expect(aLeave.kind === 'res' && aLeave.ok).toBe(true);
+    const cancelled = await b.next((e) => e.kind === 'evt' && e.method === EVT.taskCancelled && (e.payload as { taskId: string }).taskId === taskId);
+    expect(cancelled).toBeDefined();
+    a.ws.close(); b.ws.close();
+  });
+
+  it('多成员组长退组仍拒（防无主组守卫回归锁）', async () => {
+    const a = await connect('solo-leader-3');
+    const b = await connect('solo-member-3');
+    const created = await callRpc(a, RPC.group.create, { groupName: '双成员组' });
+    const groupId = (created.payload as { groupId: string }).groupId;
+    const invite = await callRpc(a, RPC.group.invite, { groupId });
+    await callRpc(b, RPC.group.join, { inviteCode: (invite.payload as { inviteCode: string }).inviteCode });
+    const res = await callRpc(a, RPC.group.leave, { groupId });
+    expect(errCode(res)).toBe('forbidden');
+    expect(errMsg(res)).toContain('先转移组长身份');
+    a.ws.close(); b.ws.close();
+  });
+});

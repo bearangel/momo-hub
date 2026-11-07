@@ -352,9 +352,40 @@ const handleLeave: GroupHandler = (ctx, payload) => {
   if (!isMember(ctx.db, groupId, ctx.nodeId)) {
     return { ok: false, error: err('forbidden', '仅本组成员可退组') };
   }
-  // leader 不得直接退组（防无主组）——先 transfer 再退是唯一路径
+  // leader 不得直接退组（防无主组）——多成员时先 transfer 再退是唯一路径；
+  // 唯一成员（组长自身）例外：无处可转移，退组 = 解散工作组（级联清理 + 在途
+  // 委派取消——防「先转移再退」死角：单节点组既无法退也无法删）
   if (group.leader_node_id === ctx.nodeId) {
-    return { ok: false, error: err('forbidden', '组长需先转移组长身份再退组') };
+    const memberCount = (ctx.db.prepare('SELECT COUNT(*) AS n FROM group_members WHERE group_id = ?')
+      .get(groupId) as { n: number }).n;
+    if (memberCount > 1) {
+      return { ok: false, error: err('forbidden', '组长需先转移组长身份再退组') };
+    }
+    // 解散：先广播（此时成员清单尚在），再级联清理
+    broadcastGroupChanged(ctx, groupId, 'left', ctx.nodeId);
+    ctx.db.transaction(() => {
+      // 在途委派（pending/running/waiting/interrupted）标记 cancelled——组已灭，
+      // 续传/代答面不复存在；终态行留作历史（按节点对账不受组消亡影响）
+      const inFlight = ctx.db.prepare(
+        `SELECT task_id, target_node_id FROM delegations
+         WHERE group_id = ? AND status IN ('pending','running','waiting','interrupted')`,
+      ).all(groupId) as Array<{ task_id: string; target_node_id: string }>;
+      ctx.db.prepare(
+        `UPDATE delegations SET status = 'cancelled', updated_at = ?
+         WHERE group_id = ? AND status IN ('pending','running','waiting','interrupted')`,
+      ).run(Date.now(), groupId);
+      for (const t of inFlight) {
+        void ctx.registry.sendTo(t.target_node_id, {
+          v: 1, kind: 'evt', method: EVT.taskCancelled,
+          payload: { taskId: t.task_id, reason: '工作组已解散' },
+        });
+      }
+      ctx.db.prepare('DELETE FROM group_invites WHERE group_id = ?').run(groupId);
+      ctx.db.prepare('DELETE FROM group_bindings WHERE group_id = ?').run(groupId);
+      ctx.db.prepare('DELETE FROM group_members WHERE group_id = ?').run(groupId);
+      ctx.db.prepare('DELETE FROM groups WHERE id = ?').run(groupId);
+    })();
+    return { ok: true, payload: { ok: true } };
   }
   broadcastGroupChanged(ctx, groupId, 'left', ctx.nodeId);
   const tx = ctx.db.transaction(() => {

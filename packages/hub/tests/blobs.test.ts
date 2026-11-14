@@ -86,7 +86,7 @@ describe('迁移 v2（spec M1 §4 两表，逐字 SQL）', () => {
     const db = openHubDatabase(dir);
     // v1 即两条语句（hub_meta/nodes），追加 v2 两表后 4 条；M2b v3 组三表（单条多语句）
     // 后 5 条；M2c 快照表后 6 条；M3.1 v6 决策列后 8 条；M3.4 v7 墓碑列后 9 条；
-    // M5.0 v8 归属列后 10 条
+    // M5.0 v8 归属列后 10 条；1.10.0 v9 两表后 11 条；1.11.0 v10 后 12 条
     expect(db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '12' });
     db.prepare(
       "INSERT INTO resources (slug, type, name, author, latest_version) VALUES ('coder-pro', 'agent', 'Coder Pro', 'ws-1', '1.2.3')",

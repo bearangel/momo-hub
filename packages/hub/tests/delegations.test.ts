@@ -170,26 +170,28 @@ async function workerAnswer(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 状态机纯函数矩阵（Review Focus #3——7×7=49 对全覆盖，M3.1 增 waiting 行列）
+// 状态机纯函数矩阵（Review Focus #3——8×8=64 对全覆盖，M3.1 增 waiting 行列，
+// 1.11.0 增 submitted 行列）
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('canTransition 全迁移矩阵', () => {
   const LEGAL: Array<[DelegationStatus, DelegationStatus]> = [
     ['pending', 'running'], ['pending', 'failed'], ['pending', 'cancelled'], ['pending', 'interrupted'],
-    ['running', 'waiting'],
+    ['running', 'waiting'], ['running', 'submitted'],
     ['running', 'done'], ['running', 'failed'], ['running', 'cancelled'], ['running', 'interrupted'],
-    ['waiting', 'running'], ['waiting', 'done'], ['waiting', 'failed'], ['waiting', 'cancelled'], ['waiting', 'interrupted'],
+    ['waiting', 'running'], ['waiting', 'submitted'], ['waiting', 'done'], ['waiting', 'failed'], ['waiting', 'cancelled'], ['waiting', 'interrupted'],
+    ['submitted', 'done'], ['submitted', 'running'], ['submitted', 'cancelled'], ['submitted', 'failed'],
     ['interrupted', 'running'], ['interrupted', 'failed'], ['interrupted', 'cancelled'],
   ];
 
-  it('17 个合法对放行（M3.1 增 running→waiting 与 waiting 五出边）', () => {
+  it('23 个合法对放行（1.11.0 增 running/waiting→submitted 与 submitted 四出边——spec §8.1）', () => {
     for (const [from, to] of LEGAL) {
       expect(canTransition(from, to), `${from}→${to}`).toBe(true);
     }
-    expect(LEGAL).toHaveLength(17);
+    expect(LEGAL).toHaveLength(23);
   });
 
-  it('32 个非法对全拒（含自迁移、终态出场与 waiting 的非法组合——7×7 全覆盖）', () => {
+  it('41 个非法对全拒（含自迁移、终态出场与 submitted 的非法组合——8×8 全覆盖）', () => {
     for (const from of DELEGATION_STATUSES) {
       for (const to of DELEGATION_STATUSES) {
         const legal = LEGAL.some(([f, t]) => f === from && t === to);
@@ -1491,7 +1493,7 @@ describe('审计日志', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('db v10 schema（任务生命周期 v2）', () => {
-  it('v10 后 delegations 含 run_no/submitted_at/accepted_at；delegation_interventions 列集齐全 + 索引在场 + schema_version=10', () => {
+  it('v10 后 delegations 含 run_no/submitted_at/accepted_at；delegation_interventions 列集齐全 + 索引在场 + schema_version=12', () => {
     const delegCols = (db.prepare('PRAGMA table_info(delegations)').all() as Array<{ name: string }>).map((c) => c.name);
     expect(delegCols).toEqual(expect.arrayContaining(['run_no', 'submitted_at', 'accepted_at']));
 

@@ -186,7 +186,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(METHOD_REQUIRED_MINOR['future.method']).toBeUndefined();
   });
 
-  it('METHOD_REQUIRED_MINOR 无 M4.2 门槛登记：全表无 minor≥5 条目（1.6.0 全部为可选字段——view 订阅组锚定 / view.appended groupId? / TaskRecord.groupId，无新方法；1.5 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
+  it('METHOD_REQUIRED_MINOR 无 M4.2 门槛登记：全表无 minor 5..9 区间条目（1.6.0 全部为可选字段——view 订阅组锚定 / view.appended groupId? / TaskRecord.groupId，无新方法；1.5 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
     // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
     // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
@@ -196,7 +196,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1.5.0', 4)).toBe(true);
   });
 
-  it('METHOD_REQUIRED_MINOR 无 M4.3 门槛登记：全表无 minor≥5 条目（1.7.0 全部为可选字段——DelegationTask.dependsOn 依赖元数据透传，无新方法；1.6 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
+  it('METHOD_REQUIRED_MINOR 无 M4.3 门槛登记：全表无 minor 5..9 区间条目（1.7.0 全部为可选字段——DelegationTask.dependsOn 依赖元数据透传，无新方法；1.6 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
     // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
     // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
@@ -206,7 +206,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1.6.0', 4)).toBe(true);
   });
 
-  it('METHOD_REQUIRED_MINOR 无 M5.0 门槛登记：全表无 minor≥5 条目（1.8.0 全部为可选字段——ownerNodeId 归属投影 / hello nodeName 改名载荷，无新方法；1.7 peer 调任何已登记方法不受影响）', () => {
+  it('METHOD_REQUIRED_MINOR 无 M5.0 门槛登记：全表无 minor 5..9 区间条目（1.8.0 全部为可选字段——ownerNodeId 归属投影 / hello nodeName 改名载荷，无新方法；1.7 peer 调任何已登记方法不受影响）', () => {
     // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
     // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
@@ -216,7 +216,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1.7.0', 4)).toBe(true);
   });
 
-  it('METHOD_REQUIRED_MINOR 无 M5.3 门槛登记：全表无 minor≥5 条目（1.9.0 team 段为载荷能力——门槛在 hub handleDelegate 按目标节点 protoVer 权威门禁，非方法级；1.8 peer 调任何已登记方法不受影响）', () => {
+  it('METHOD_REQUIRED_MINOR 无 M5.3 门槛登记：全表无 minor 5..9 区间条目（1.9.0 team 段为载荷能力——门槛在 hub handleDelegate 按目标节点 protoVer 权威门禁，非方法级；1.8 peer 调任何已登记方法不受影响）', () => {
     // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
     // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
@@ -328,7 +328,7 @@ describe('RpcErrorCode 扩充', () => {
   it('M3.1 新增三码入枚举（not_waiting / node_unsupported / answer_timeout），既有十码不回退', () => {
     const m31: RpcErrorCode[] = ['not_waiting', 'node_unsupported', 'answer_timeout'];
     // 顺序锁（绝对位置切片——后续只增不改义追加不影响本锁）：既有十码相对位置不动，
-    // M3.1 三码追加在其后；总长锁由最新条目测试持有（现为 M5.0 的 14）
+    // M3.1 三码追加在其后；总长锁由最新条目测试持有（现为 1.11.0 的 18）
     expect(RPC_ERROR_CODES.slice(0, 10)).toEqual([
       'unauthorized', 'bad_request', 'proto_version_mismatch', 'unknown_method',
       'unsupported_method', 'internal', 'forbidden', 'node_offline', 'not_found', 'conflict',

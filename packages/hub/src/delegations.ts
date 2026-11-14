@@ -39,29 +39,33 @@ import { logger } from './logger';
 // ────────────────────────────────────────────────────────────────────────────
 
 /**
- * 合法迁移表（§4 状态机 + MC5 + brief 矩阵 + M3.1 waiting）：
+ * 合法迁移表（§4 状态机 + MC5 + brief 矩阵 + M3.1 waiting + 1.11.0 submitted，
+ * spec 2026-11-13 §8.1）：
  * - pending → running / failed('declined' 目标拒派) / cancelled / interrupted（hub 离线迁移）
- * - running → waiting（M3.1，kind='waiting-input' 上报触发）/ done / failed / cancelled / interrupted
- * - waiting → running（无 kind 上报=等待解除）/ done / failed / cancelled / interrupted
+ * - running → waiting（M3.1，kind='waiting-input' 上报触发）/ submitted（1.11.0
+ *   run 完成待验收）/ done / failed / cancelled / interrupted
+ * - waiting → running（无 kind 上报=等待解除）/ submitted / done / failed / cancelled / interrupted
+ * - submitted → done（task.accept 验收）/ running（task.reject 打回，新 run）/
+ *   cancelled / failed（run 失败结算，§8.3 映射）
  * - interrupted → running（重连续传）/ failed('local_session_lost') / cancelled
  * - done / failed / cancelled 终态，拒一切。
  * 全部迁移（task.cancel / task.report 上报 / onNodeOffline 自动迁移）必经
  * canTransition 单点——目标节点的上报必须匹配账本当前态。waiting↔running 由
  * acceptReport 特殊分支处理（独立审计行），不走通用迁移路径；task.answer 刻意
- * 不迁移状态（状态单源：worker 上报驱动，代答只写决策列）。
+ * 不迁移状态（状态单源：worker 上报驱动，代答只写决策列）。submitted 的进入由
+ * worker task.report(status='submitted') 驱动（解析器白名单 1.11.0 扩列后生效），
+ * 出边由 task.accept / task.reject RPC 结算——两条 RPC 本 task（H3）只接线状态机，
+ * RPC 端点由干预任务接入。
  */
 const DELEGATION_TRANSITIONS: Record<DelegationStatus, readonly DelegationStatus[]> = {
   pending: ['running', 'failed', 'cancelled', 'interrupted'],
-  running: ['waiting', 'done', 'failed', 'cancelled', 'interrupted'],
-  waiting: ['running', 'done', 'failed', 'cancelled', 'interrupted'],
+  running: ['waiting', 'submitted', 'done', 'failed', 'cancelled', 'interrupted'],
+  waiting: ['running', 'submitted', 'done', 'failed', 'cancelled', 'interrupted'],
+  submitted: ['done', 'running', 'cancelled', 'failed'],
   interrupted: ['running', 'failed', 'cancelled'],
   done: [],
   failed: [],
   cancelled: [],
-  // 1.11.0 类型层占位（协议 DelegationStatus 扩 'submitted' 后 Record 键全集要求）：
-  // 转换边由状态机任务（H3）按 spec 2026-11-13 §8.1 接线；当前无任何运行时路径可
-  // 将账本置为 submitted（report 解析器白名单未含该值），空出边表即无行为影响。
-  submitted: [],
 };
 
 /** 状态机单点校验（纯函数）：合法迁移对查表；自迁移一律 false——running 进度拍
@@ -70,9 +74,9 @@ export function canTransition(from: DelegationStatus, to: DelegationStatus): boo
   return DELEGATION_TRANSITIONS[from].includes(to);
 }
 
-/** 状态枚举全集（task.list 过滤校验 + 矩阵测试遍历用）。 */
+/** 状态枚举全集（task.list 过滤校验 + 矩阵测试遍历用；1.11.0 增 submitted）。 */
 export const DELEGATION_STATUSES: readonly DelegationStatus[] = [
-  'pending', 'running', 'waiting', 'done', 'failed', 'interrupted', 'cancelled',
+  'pending', 'running', 'waiting', 'submitted', 'done', 'failed', 'interrupted', 'cancelled',
 ];
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -600,7 +604,7 @@ export class DelegationRouter {
     let status: DelegationStatus | null = null;
     if (statusRaw !== undefined) {
       if (typeof statusRaw !== 'string' || !(DELEGATION_STATUSES as readonly string[]).includes(statusRaw)) {
-        return { ok: false, error: err('bad_request', 'status 非法（七态枚举外）') };
+        return { ok: false, error: err('bad_request', 'status 非法（八态枚举外）') };
       }
       status = statusRaw as DelegationStatus;
     }

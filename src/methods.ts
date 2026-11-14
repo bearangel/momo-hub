@@ -57,6 +57,15 @@ METHOD_REQUIRED_MINOR[RPC.view.files] = 4;
 METHOD_REQUIRED_MINOR[RPC.group.bind] = 10;
 METHOD_REQUIRED_MINOR[RPC.group.unbind] = 10;
 METHOD_REQUIRED_MINOR[RPC.group.setMirrorAccept] = 10;
+// 1.11.0（任务生命周期 v2）：干预/验收四 RPC 为 minor-11 方法——1.10 客户端调它
+// 由分发守卫回 unsupported_method{method, requiredMinor:11} 可读降级；既有 task
+// 四方法门槛不变（answer=3、其余基线 2）。载荷级能力（submitted 态上报/结构化
+// 答复/runNo 透传）由 TASK_HITL_REQUIRED_MINOR 单独把守（沿 team/draft 门机制，
+// 不入本表）。
+METHOD_REQUIRED_MINOR[RPC.task.intervene] = 11;
+METHOD_REQUIRED_MINOR[RPC.task.accept] = 11;
+METHOD_REQUIRED_MINOR[RPC.task.reject] = 11;
+METHOD_REQUIRED_MINOR[RPC.task.interventions] = 11;
 
 export type RpcMethodName =
   | 'hello'

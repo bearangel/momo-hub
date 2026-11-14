@@ -1,4 +1,17 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.11.0（任务生命周期 v2，spec moo-studio docs/specs/2026-11-13-task-human-loop-lifecycle-design.md §8）：
+// 账本状态机增 submitted 态（run 完成提交、发起方验收的中间态——report 上报驱动进入，
+// accept/reject 决定终局）+ 干预类型族（InterventionKind/InterventionStatus/InterventionAnswer/
+// InterventionRequest/InterventionRecord）+ 干预四 RPC（task.intervene/task.accept/task.reject/
+// task.interventions，minor 11 门槛登记）+ 干预五事件（task.intervention/task.interventionAnswered/
+// task.submitted/task.accepted/task.rejected 及载荷接口）+ TaskAnswerReq 增可选 interventionId?/
+// answer?（结构化答复：定位干预行 first_wins，旧 decision 写授权语义与可选性零变化）
+// + TaskAnswerRes.disposition 增 'answered' + DelegationTask/TaskReportPayload/TaskRecord 增可选
+// runNo?（1 起缺省 1，打回 +1）/TaskRecord 另增 submittedAt?/acceptedAt?/TaskReportPayload.status
+// 增 'submitted' + TASK_HITL_REQUIRED_MINOR=11（载荷能力门，同 team/draft 门机制，不入
+// METHOD_REQUIRED_MINOR）+ 错误码四枚（not_submitted/intervention_not_found/intervention_stale/
+// forbidden_responder，只增不改义）——除版本门与新方法门槛外全部为可选字段/枚举扩值/新增
+// 成员（1.10 peer 调任何已登记方法、发任何既有载荷不受影响），major 不动。
 // 1.10.0（工作组平行模式，spec moo-studio docs/specs/2026-11-05-workgroup-peer-mode-design.md）：
 // 组模型增可选 mode?（'leader-follower' 缺省 | 'peer'——group.create 载荷与 GroupInfo
 // 投影；peer 组建组必带组长绑定空间）+ 绑定三 RPC（group.bind/group.unbind/
@@ -53,7 +66,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.10.0';
+export const PROTOCOL_VERSION = '1.11.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

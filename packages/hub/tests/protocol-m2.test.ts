@@ -1,8 +1,9 @@
-// protocol 1.2.0-1.10.0 工作组与远程代答/远端可见性/
-// 资源生命周期/多组终态/委派依赖/资源归属/外派团队契约测试
+// protocol 1.2.0-1.11.0 工作组与远程代答/远端可见性/
+// 资源生命周期/多组终态/委派依赖/资源归属/外派团队/任务生命周期 v2 契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
 // 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2 +
-// 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6 + 2026-10-30 M5.3 §5.1）：
+// 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6 + 2026-10-30 M5.3 §5.1 +
+// 2026-11-13 任务生命周期 v2 §8.1/§8.2）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -13,6 +14,7 @@ import {
   PROTOCOL_VERSION,
   RPC,
   RPC_ERROR_CODES,
+  TASK_HITL_REQUIRED_MINOR,
   TASK_WIRE,
   TEAM_DELEGATION_REQUIRED_MINOR,
   VIEW_FILES_ENTRIES_MAX,
@@ -27,6 +29,11 @@ import {
   type DelegationTask,
   type GroupChangedEvent,
   type GroupInfo,
+  type InterventionAnswer,
+  type InterventionKind,
+  type InterventionRecord,
+  type InterventionRequest,
+  type InterventionStatus,
   type InviteInfo,
   type MirrorAcceptRes,
   type MirrorApplyPayload,
@@ -37,13 +44,18 @@ import {
   type RpcErrorCode,
   type RpcErrorPayload,
   type SnapshotManifest,
+  type TaskAcceptedEvent,
   type TaskAnswerReq,
   type TaskAnswerRes,
   type TaskAnsweredEvent,
   type TaskAssignedEvent,
+  type TaskInterventionAnsweredEvent,
+  type TaskInterventionEvent,
   type TaskProgressEvent,
   type TaskRecord,
+  type TaskRejectedEvent,
   type TaskReportPayload,
+  type TaskSubmittedEvent,
   type TaskTerminalEvent,
   type ViewAppendedEvent,
   type ViewFileEntry,
@@ -65,22 +77,23 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.10.0 与 1.1.0-1.9.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.10.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.10.0');
+describe('版本 1.11.0 与 1.1.0-1.10.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.11.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.11.0');
   });
 
-  it('1.1.0 ↔ 1.10.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.5.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.6.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.7.0', '1.10.0')).toBe(true);
-    expect(isCompatible('1.8.0', '1.10.0')).toBe(true)
-    expect(isCompatible('1.9.0', '1.10.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.10.0')).toBe(false);
+  it('1.1.0 ↔ 1.11.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.6.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.7.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.8.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.9.0', '1.11.0')).toBe(true);
+    expect(isCompatible('1.10.0', '1.11.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.11.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -148,6 +161,10 @@ describe('minorOf / protocolSupports 矩阵', () => {
       [RPC.group.bind]: 10,
       [RPC.group.unbind]: 10,
       [RPC.group.setMirrorAccept]: 10,
+      [RPC.task.intervene]: 11,
+      [RPC.task.accept]: 11,
+      [RPC.task.reject]: 11,
+      [RPC.task.interventions]: 11,
     };
     const entries = Object.entries(METHOD_REQUIRED_MINOR);
     expect(entries.length).toBeGreaterThan(0);
@@ -170,36 +187,40 @@ describe('minorOf / protocolSupports 矩阵', () => {
   });
 
   it('METHOD_REQUIRED_MINOR 无 M4.2 门槛登记：全表无 minor≥5 条目（1.6.0 全部为可选字段——view 订阅组锚定 / view.appended groupId? / TaskRecord.groupId，无新方法；1.5 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
+    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.5.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.5.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M4.3 门槛登记：全表无 minor≥5 条目（1.7.0 全部为可选字段——DelegationTask.dependsOn 依赖元数据透传，无新方法；1.6 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
+    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.6.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.6.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M5.0 门槛登记：全表无 minor≥5 条目（1.8.0 全部为可选字段——ownerNodeId 归属投影 / hello nodeName 改名载荷，无新方法；1.7 peer 调任何已登记方法不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
+    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.7.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.7.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M5.3 门槛登记：全表无 minor≥5 条目（1.9.0 team 段为载荷能力——门槛在 hub handleDelegate 按目标节点 protoVer 权威门禁，非方法级；1.8 peer 调任何已登记方法不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
+    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.8.0 peer 恒通过——team 段无方法级协商
     expect(protocolSupports('1.8.0', 4)).toBe(true);
@@ -215,6 +236,20 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(METHOD_REQUIRED_MINOR[RPC.group.setMirrorAccept]).toBe(10);
     expect(protocolSupports('1.10.0', 10)).toBe(true);
     expect(protocolSupports('1.9.0', 10)).toBe(false);
+  });
+
+  it('METHOD_REQUIRED_MINOR 1.11.0 门槛登记：干预/验收四方法 = 11（1.10 peer 调它 → unsupported_method 可读降级；1.11 peer 全通过）', () => {
+    expect(METHOD_REQUIRED_MINOR[RPC.task.intervene]).toBe(11);
+    expect(METHOD_REQUIRED_MINOR[RPC.task.accept]).toBe(11);
+    expect(METHOD_REQUIRED_MINOR[RPC.task.reject]).toBe(11);
+    expect(METHOD_REQUIRED_MINOR[RPC.task.interventions]).toBe(11);
+    expect(protocolSupports('1.11.0', 11)).toBe(true);
+    expect(protocolSupports('1.10.0', 11)).toBe(false);
+    // 载荷门常量单源锁（沿 TEAM_DELEGATION_REQUIRED_MINOR 先例——hub 版本门与
+    // studio 派发闸双端消费；submitted 态/结构化答复等载荷能力非方法级协商）
+    expect(TASK_HITL_REQUIRED_MINOR).toBe(11);
+    expect(protocolSupports('1.11.0', TASK_HITL_REQUIRED_MINOR)).toBe(true);
+    expect(protocolSupports('1.10.0', TASK_HITL_REQUIRED_MINOR)).toBe(false);
   });
 });
 
@@ -241,12 +276,16 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
     expect(RPC.workspace).toEqual({ mirror: 'workspace.mirror', snapshots: 'workspace.snapshots' });
   });
 
-  it('RPC.task 四方法（M3.1 增 answer）', () => {
+  it('RPC.task 八方法（M3.1 增 answer；1.11.0 增干预/验收四方法）', () => {
     expect(RPC.task).toEqual({
       delegate: 'task.delegate',
       cancel: 'task.cancel',
       list: 'task.list',
       answer: 'task.answer',
+      intervene: 'task.intervene',
+      accept: 'task.accept',
+      reject: 'task.reject',
+      interventions: 'task.interventions',
     });
   });
 
@@ -298,11 +337,24 @@ describe('RpcErrorCode 扩充', () => {
   });
 
   it('M5.0 新增一码入枚举（name_conflict——hello 改名撞名），既有十三码不回退', () => {
-    // 顺序锁：新码追加在尾部（只增不改义——M3.1 十三码相对位置不动）
-    expect(RPC_ERROR_CODES.slice(-1)).toEqual(['name_conflict']);
-    expect(RPC_ERROR_CODES).toHaveLength(14);
+    // 顺序锁（绝对位置切片——后续只增不改义追加不影响本锁）：M5.0 一码追加在 M3.1 三码后；
+    // 总长锁由最新条目测试持有（现为 1.11.0 的 18）
+    expect(RPC_ERROR_CODES.slice(13, 14)).toEqual(['name_conflict']);
     const payload: RpcErrorPayload = { code: 'name_conflict', message: '该名称已被其他节点使用' };
     expect(payload.code).toBe('name_conflict');
+  });
+
+  it('1.11.0 新增四码入枚举（not_submitted / intervention_not_found / intervention_stale / forbidden_responder——任务生命周期 v2），既有十四码不回退', () => {
+    // 顺序锁（绝对位置切片——后续只增不改义追加不影响本锁）：四码追加在尾部
+    expect(RPC_ERROR_CODES.slice(14, 18)).toEqual([
+      'not_submitted', 'intervention_not_found', 'intervention_stale', 'forbidden_responder',
+    ]);
+    // 总长锁由最新条目测试持有
+    expect(RPC_ERROR_CODES).toHaveLength(18);
+    for (const code of ['not_submitted', 'intervention_not_found', 'intervention_stale', 'forbidden_responder'] as const) {
+      const payload: RpcErrorPayload = { code, message: 'x' };
+      expect(payload.code).toBe(code);
+    }
   });
 });
 
@@ -322,6 +374,68 @@ describe('EVT 新增九事件目录', () => {
     expect(EVT.taskAnswered).toBe('task.answered');
     expect(EVT.viewAppended).toBe('view.appended');
     expect(EVT.workspaceMirrored).toBe('workspace.mirrored');
+  });
+
+  it('1.11.0 五事件常量（wire 锁）', () => {
+    expect(EVT.taskIntervention).toBe('task.intervention');
+    expect(EVT.taskInterventionAnswered).toBe('task.interventionAnswered');
+    expect(EVT.taskSubmitted).toBe('task.submitted');
+    expect(EVT.taskAccepted).toBe('task.accepted');
+    expect(EVT.taskRejected).toBe('task.rejected');
+  });
+});
+
+describe('1.11.0 五事件载荷 round-trip', () => {
+  it('TaskInterventionEvent：{taskId, intervention:InterventionRequest}（peer 组不转发本事件——结构层不强制）', () => {
+    const evt: TaskInterventionEvent = {
+      taskId: 't1',
+      intervention: {
+        interventionId: 'iv-1',
+        runNo: 1,
+        kind: 'tool_gate',
+        title: '写文件确认',
+        prompt: 'agent 请求写入 src/index.ts',
+        payload: { path: 'src/index.ts', bytes: 128 },
+        options: [{ id: 'allow', label: '允许', description: '本次放行' }],
+        deadlineAt: 1_700_000_100_000,
+      },
+    };
+    expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
+    expect(Object.keys(evt)).toEqual(['taskId', 'intervention']);
+    expect(Object.keys(evt.intervention).sort()).toEqual([
+      'deadlineAt', 'interventionId', 'kind', 'options', 'payload', 'prompt', 'runNo', 'title',
+    ]);
+  });
+
+  it('TaskInterventionAnsweredEvent：{taskId, interventionId, answer, answeredBy}（first_wins 收敛信号）', () => {
+    const evt: TaskInterventionAnsweredEvent = {
+      taskId: 't1',
+      interventionId: 'iv-1',
+      answer: { decision: 'approve', text: '准了' },
+      answeredBy: 'node-a',
+    };
+    expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
+    expect(Object.keys(evt).sort()).toEqual(['answer', 'answeredBy', 'interventionId', 'taskId']);
+  });
+
+  it('TaskSubmittedEvent：{taskId, runNo, deliverable?}（缺省不带键）', () => {
+    const withDeliverable: TaskSubmittedEvent = {
+      taskId: 't1', runNo: 1, deliverable: { summary: '已完成', files: ['a.ts'] },
+    };
+    expect(JSON.parse(JSON.stringify(withDeliverable))).toEqual(withDeliverable);
+    expect(Object.keys(withDeliverable).sort()).toEqual(['deliverable', 'runNo', 'taskId']);
+    const bare: TaskSubmittedEvent = { taskId: 't1', runNo: 2 };
+    expect(JSON.parse(JSON.stringify(bare))).toEqual(bare);
+    expect(bare).not.toHaveProperty('deliverable');
+  });
+
+  it('TaskAcceptedEvent / TaskRejectedEvent：{taskId, runNo}（rejected 必带 reason）', () => {
+    const accepted: TaskAcceptedEvent = { taskId: 't1', runNo: 1 };
+    expect(JSON.parse(JSON.stringify(accepted))).toEqual(accepted);
+    expect(Object.keys(accepted).sort()).toEqual(['runNo', 'taskId']);
+    const rejected: TaskRejectedEvent = { taskId: 't1', runNo: 2, reason: '测试未通过' };
+    expect(JSON.parse(JSON.stringify(rejected))).toEqual(rejected);
+    expect(Object.keys(rejected).sort()).toEqual(['reason', 'runNo', 'taskId']);
   });
 });
 
@@ -481,11 +595,11 @@ describe('镜像类型 round-trip', () => {
 });
 
 describe('委派类型 round-trip', () => {
-  it('TaskRecord：status 七态枚举（账本状态机，M3.1 增 waiting）+ 代答留痕四可选字段', () => {
+  it('TaskRecord：status 八态枚举（账本状态机，M3.1 增 waiting、1.11.0 增 submitted）+ 代答留痕四可选字段', () => {
     const statuses: DelegationStatus[] = [
-      'pending', 'running', 'waiting', 'done', 'failed', 'interrupted', 'cancelled',
+      'pending', 'running', 'waiting', 'submitted', 'done', 'failed', 'interrupted', 'cancelled',
     ];
-    expect(statuses).toHaveLength(7);
+    expect(statuses).toHaveLength(8);
     const rec: TaskRecord = {
       taskId: 't1',
       workspaceName: 'ws',
@@ -526,6 +640,92 @@ describe('委派类型 round-trip', () => {
     expect(Object.keys(grouped).sort()).toEqual([
       'createdAt', 'groupId', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
     ]);
+    // 1.11.0 生命周期三列：runNo/submittedAt/acceptedAt 全可选——在场时入键集
+    // （缺省不带键，1.10 载荷零变化；缺省格由上方基础记录锁覆盖）
+    const submitted: TaskRecord = { ...rec, status: 'submitted', runNo: 2, submittedAt: 1_700_000_000_002 };
+    expect(JSON.parse(JSON.stringify(submitted))).toEqual(submitted);
+    expect(Object.keys(submitted).sort()).toEqual([
+      'createdAt', 'runNo', 'status', 'submittedAt', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+    ]);
+    const accepted: TaskRecord = { ...submitted, status: 'done', acceptedAt: 1_700_000_000_003 };
+    expect(JSON.parse(JSON.stringify(accepted))).toEqual(accepted);
+    expect(Object.keys(accepted).sort()).toEqual([
+      'acceptedAt', 'createdAt', 'runNo', 'status', 'submittedAt', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+    ]);
+  });
+
+  it('1.11.0 干预类型族：InterventionRequest/Record 全字段 round-trip + 枚举', () => {
+    // InterventionRequest 最小形态：可选段缺省不带键（payload/options/deadlineAt）
+    const minimal: InterventionRequest = {
+      interventionId: 'iv-2', runNo: 1, kind: 'question', title: '选一个', prompt: '请选择执行方案',
+    };
+    expect(JSON.parse(JSON.stringify(minimal))).toEqual(minimal);
+    expect(Object.keys(minimal).sort()).toEqual(['interventionId', 'kind', 'prompt', 'runNo', 'title']);
+    expect(minimal).not.toHaveProperty('payload');
+    expect(minimal).not.toHaveProperty('options');
+    expect(minimal).not.toHaveProperty('deadlineAt');
+    // InterventionRecord 全字段构造（request 段 + status/answer/answeredBy/answeredAt/createdAt）
+    const rec: InterventionRecord = {
+      interventionId: 'iv-1',
+      runNo: 2,
+      kind: 'tool_gate',
+      title: '写文件确认',
+      prompt: 'agent 请求写入 src/index.ts',
+      payload: { path: 'src/index.ts', bytes: 128 },
+      options: [{ id: 'allow', label: '允许', description: '本次放行' }],
+      deadlineAt: 1_700_000_100_000,
+      status: 'answered',
+      answer: { decision: 'approve', text: '准了', selected: ['allow'], completed: true },
+      answeredBy: 'node-a',
+      answeredAt: 1_700_000_050_000,
+      createdAt: 1_700_000_000_000,
+    };
+    expect(JSON.parse(JSON.stringify(rec))).toEqual(rec);
+    expect(Object.keys(rec).sort()).toEqual([
+      'answer', 'answeredAt', 'answeredBy', 'createdAt', 'deadlineAt', 'interventionId',
+      'kind', 'options', 'payload', 'prompt', 'runNo', 'status', 'title',
+    ]);
+    // pending 最小记录：answer 段缺省不带键
+    const pending: InterventionRecord = { ...minimal, status: 'pending', createdAt: 1_700_000_000_000 };
+    expect(pending).not.toHaveProperty('answer');
+    expect(pending).not.toHaveProperty('answeredBy');
+    // 三 kind / 五 status 枚举可构造
+    const kinds: InterventionKind[] = ['tool_gate', 'question', 'manual_action'];
+    expect(kinds).toHaveLength(3);
+    for (const kind of kinds) {
+      const req: InterventionRequest = { interventionId: 'iv', runNo: 1, kind, title: 'T', prompt: 'P' };
+      expect(JSON.parse(JSON.stringify(req))).toEqual(req);
+    }
+    const statuses: InterventionStatus[] = ['pending', 'answered', 'expired', 'cancelled', 'superseded'];
+    expect(statuses).toHaveLength(5);
+    // InterventionAnswer 四字段全可选（空答复与全字段答复均可构造）
+    const emptyAnswer: InterventionAnswer = {};
+    expect(JSON.parse(JSON.stringify(emptyAnswer))).toEqual({});
+    const fullAnswer: InterventionAnswer = { decision: 'deny', text: '不允许', selected: ['a', 'b'], completed: false };
+    expect(JSON.parse(JSON.stringify(fullAnswer))).toEqual(fullAnswer);
+    expect(Object.keys(fullAnswer).sort()).toEqual(['completed', 'decision', 'selected', 'text']);
+  });
+
+  it('1.11.0 TaskAnswerReq 双载荷形态与 TaskAnswerRes.disposition 增 answered', () => {
+    // 旧写授权形态（1.10 兼容——decision 必带语义不变，可选新字段缺省不带键）
+    const legacy: TaskAnswerReq = { taskId: 't1', decision: 'approve' };
+    expect(JSON.parse(JSON.stringify(legacy))).toEqual(legacy);
+    expect(legacy).not.toHaveProperty('interventionId');
+    expect(legacy).not.toHaveProperty('answer');
+    // 新结构化答复形态：interventionId + answer 定位干预行（hub 按行路由与权威校验）
+    const structured: TaskAnswerReq = {
+      taskId: 't1',
+      decision: 'approve',
+      interventionId: 'iv-1',
+      answer: { decision: 'deny', text: '不允许', selected: ['a'], completed: false },
+    };
+    expect(JSON.parse(JSON.stringify(structured))).toEqual(structured);
+    expect(Object.keys(structured).sort()).toEqual(['answer', 'decision', 'interventionId', 'taskId']);
+    // disposition 四枚举可构造（'answered' = 结构化答复落行成功）
+    for (const disposition of ['granted', 'denied', 'stale', 'answered'] as const) {
+      const res: TaskAnswerRes = { disposition };
+      expect(JSON.parse(JSON.stringify(res))).toEqual(res);
+    }
   });
 
   it('M3.1 代答三类型：TaskAnswerReq / TaskAnswerRes / TaskAnsweredEvent 形状', () => {
@@ -559,6 +759,26 @@ describe('委派类型 round-trip', () => {
     expect(Object.keys(done)).toEqual(['status']);
     const failed: TaskReportPayload = { status: 'failed', reason: 'declined' };
     expect(JSON.parse(JSON.stringify(failed))).toEqual(failed);
+  });
+
+  it('TaskReportPayload 1.11.0 扩展：status 增 submitted + runNo?（缺省不带键）', () => {
+    const report: TaskReportPayload = { status: 'submitted', runNo: 2 };
+    expect(JSON.parse(JSON.stringify(report))).toEqual(report);
+    expect(Object.keys(report).sort()).toEqual(['runNo', 'status']);
+    const noRun: TaskReportPayload = { status: 'submitted' };
+    expect(JSON.parse(JSON.stringify(noRun))).toEqual(noRun);
+    expect(noRun).not.toHaveProperty('runNo');
+    // 1.10 既有上报形态零变化（runNo 缺省合法）
+    const legacy: TaskReportPayload = { status: 'running', sessionId: 's1' };
+    expect(legacy).not.toHaveProperty('runNo');
+  });
+
+  it('DelegationTask 1.11.0 扩展：runNo? 可选（1 起，缺省不带键——1.10 载荷零变化）', () => {
+    const task: DelegationTask = { title: 'T', prompt: 'P', runNo: 3 };
+    expect(JSON.parse(JSON.stringify(task))).toEqual(task);
+    expect(Object.keys(task).sort()).toEqual(['prompt', 'runNo', 'title']);
+    const legacy: DelegationTask = { title: 'T', prompt: 'P' };
+    expect(legacy).not.toHaveProperty('runNo');
   });
 });
 
@@ -757,9 +977,9 @@ describe('validateSnapshotManifest resources[].version?（1.5.0 M3.4 B13）', ()
     expect(out?.resources[0]).not.toHaveProperty('extra');
   });
 
-  it('METHOD_REQUIRED_MINOR 无 M3.4 门槛登记：全表无 5..9 区间条目（本组全部为可选字段/事件，无需能力协商；1.10.0 绑定三方法 = 10 为后来登记）', () => {
+  it('METHOD_REQUIRED_MINOR 无 M3.4 门槛登记：全表无 5..9 区间条目（本组全部为可选字段/事件，无需能力协商；1.10.0 绑定三方法 = 10 与 1.11.0 干预/验收四方法 = 11 为后来登记）', () => {
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
     }
   });
 });

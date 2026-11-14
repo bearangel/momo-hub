@@ -58,6 +58,10 @@ const DELEGATION_TRANSITIONS: Record<DelegationStatus, readonly DelegationStatus
   done: [],
   failed: [],
   cancelled: [],
+  // 1.11.0 类型层占位（协议 DelegationStatus 扩 'submitted' 后 Record 键全集要求）：
+  // 转换边由状态机任务（H3）按 spec 2026-11-13 §8.1 接线；当前无任何运行时路径可
+  // 将账本置为 submitted（report 解析器白名单未含该值），空出边表即无行为影响。
+  submitted: [],
 };
 
 /** 状态机单点校验（纯函数）：合法迁移对查表；自迁移一律 false——running 进度拍

@@ -1226,6 +1226,18 @@ export class DelegationRouter {
       return;
     }
 
+    // submitted 态运行拍守卫（E2E 实录：agent 中途 submit_task → 回合收尾窗口内
+    // runner 进度拍 running 到达 → 通用迁移路径把 submitted 抹回 running，发起方/
+    // worker 双侧状态连锁回退）。submitted 的出边 done（task.accept 验收）/
+    // running（task.reject 打回，run_no+1）/ cancelled 各归属一个 RPC，worker
+    // task.report 无权迁移账本——整拍忽略，不 forwardProgress（submitted 后进度
+    // 无意义且防误导，与终态粘滞忽略拍口径一致）。1.10 零影响：submitted 态在
+    // 1.10 不存在。
+    if (to === 'running' && row.status === 'submitted') {
+      logger.info('委派已提交，运行拍被忽略（submitted 仅经 task.reject 返回 running）', { taskId: row.task_id, from: fromNodeId });
+      return;
+    }
+
     if (to === row.status) {
       if (to === 'running') {
         const sessionId = report.sessionId && report.sessionId !== row.session_id

@@ -20,15 +20,19 @@
 // 第三方 forbidden、缺省本节点相关全部）/ 投影完整性（payload_json+专属列合并还原
 // InterventionRecord 全字段）/ 断线重连对账（origin 离线期间 worker 干预+自答+提交
 // → 重连拉取收敛，无重复行）。
+// submitted 态运行拍守卫（E2E 实录）：submitted 后 worker running 拍整拍忽略
+// （账本粘滞，仅 task.reject RPC 有权回 running）+ reject 后 running 拍照常幂等
+// 转发的回归锁。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import WebSocket from 'ws';
 import { openHubDatabase } from '../src/db';
 import { ensureHubIdentity } from '../src/identity';
 import { enrollNode } from '../src/auth';
+import { logger } from '../src/logger';
 import { createHubServer, type HubServer } from '../src/server';
 import {
   EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, encodeEnvelope, makeRequest, parseEnvelope,
@@ -987,6 +991,54 @@ describe('task.submitted deliverable 通道矩阵（report.reason → deliverabl
     report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '42' });
     const evt = await awaitSubmitted(leader, taskId, 1);
     expect(evt.payload).toEqual({ taskId, runNo: 1 });
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('submitted 态运行拍守卫（E2E 实录回归：submit_task 后收尾窗口进度拍不得抹账本）', () => {
+  it('worker submitted 后连发两次 running 拍：账本保持 submitted + 两次守卫忽略日志 + 无迁移审计 + 发起方零新进度事件', async () => {
+    const infoSpy = vi.spyOn(logger, 'info');
+    try {
+      const { leader, target, groupId } = await setupGroup('sguard');
+      const taskId = await runningTask(leader, target, groupId, 'sguard');
+      await driveToSubmitted(target, taskId, 1);
+      const progressBefore = leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId).length;
+      const callsBefore = infoSpy.mock.calls.length;
+
+      // 模拟 agent 中途 submit_task 后、runner 回合收尾窗口内的常规进度拍
+      report(target.ws, taskId, { status: 'running', sessionId: 'sess-sguard', progress: { lastSeq: 9, excerpt: '收尾窗口进度拍' } });
+      report(target.ws, taskId, { status: 'running', progress: { lastSeq: 10, excerpt: '第二拍' } });
+      await settle();
+
+      expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1 });
+      const post = infoSpy.mock.calls.slice(callsBefore);
+      expect(post.filter(([msg]) =>
+        msg === '委派已提交，运行拍被忽略（submitted 仅经 task.reject 返回 running）')).toHaveLength(2);
+      expect(post.some(([msg, meta]) =>
+        msg === '委派状态迁移' && (meta as { taskId: string }).taskId === taskId)).toBe(false);
+      const progressAfter = leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+        && (e.payload as { taskId: string }).taskId === taskId).length;
+      expect(progressAfter).toBe(progressBefore);
+      leader.ws.close(); target.ws.close();
+    } finally {
+      infoSpy.mockRestore();
+    }
+  });
+
+  it('回归：task.reject 打回后（账本 running，run_no=2）worker running 拍照常处理——running→running 幂等转发不误伤', async () => {
+    const { leader, target, groupId } = await setupGroup('srej');
+    const taskId = await runningTask(leader, target, groupId, 'srej');
+    await driveToSubmitted(target, taskId, 1);
+    const rj = await callRpc(leader, RPC.task.reject, { taskId, reason: '补充空输入用例' });
+    expect(resPayload(rj)).toEqual({ runNo: 2 });
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', run_no: 2 });
+
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-srej-2', progress: { lastSeq: 20, excerpt: '返工新 run 进度' } });
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId && (e.payload as { lastSeq: number }).lastSeq === 20);
+    expect(evt.payload).toMatchObject({ taskId, sessionId: 'sess-srej-2', lastSeq: 20, excerpt: '返工新 run 进度' });
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', run_no: 2 });
     leader.ws.close(); target.ws.close();
   });
 });

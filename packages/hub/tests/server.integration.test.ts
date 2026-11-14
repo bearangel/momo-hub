@@ -161,7 +161,7 @@ describe('hub ws 服务', () => {
     expect(payload?.code).toBe('unsupported_method');
     expect(payload?.method).toBe('task.list');
     expect(payload?.requiredMinor).toBe(2);
-    expect(payload?.message).toContain('hub=1.10.0');
+    expect(payload?.message).toContain('hub=1.11.0');
     expect(payload?.message).toContain('节点=1.1.0');
     expect(payload?.message).toContain('task.list');
     peer.ws.close();
@@ -236,6 +236,32 @@ describe('hub ws 服务', () => {
         `节点 ${ver} 应到达 handler（forbidden）而非守卫拦截`).toBe('forbidden');
       peer.ws.close();
     }
+  });
+
+  it('minor 门槛三态（1.11.0 HITL 四方法）：1.10.0 节点调 task.intervene/accept/reject/interventions → unsupported_method{method, requiredMinor:11}', async () => {
+    const peer = await connect('node-minor-110-hitl', '1.10.0');
+    const payloads: Record<string, unknown> = {
+      [RPC.task.intervene]: { taskId: 't', intervention: { interventionId: 'iv-x', runNo: 1, kind: 'question', title: 't', prompt: 'p' } },
+      [RPC.task.accept]: { taskId: 't' },
+      [RPC.task.reject]: { taskId: 't', reason: 'r' },
+      [RPC.task.interventions]: { taskId: 't' },
+    };
+    for (const m of [RPC.task.intervene, RPC.task.accept, RPC.task.reject, RPC.task.interventions]) {
+      peer.ws.send(encodeEnvelope(makeRequest(m, payloads[m])));
+      const err = await peer.next((e) => e.kind === 'res' && e.method === m);
+      expect(err.kind === 'res' && err.ok, m).toBe(false);
+      const payload = (err.kind === 'res' ? err.payload : null) as
+        { code: string; message: string; method?: string; requiredMinor?: number } | null;
+      expect(payload?.code, m).toBe('unsupported_method');
+      expect(payload?.method, m).toBe(m);
+      expect(payload?.requiredMinor, m).toBe(11);
+      expect(payload?.message, m).toContain('需要协议 1.11');
+    }
+    // 既有 task 四方法门槛不变（answer=3、其余基线 2）——1.10 节点照常进 handler
+    peer.ws.send(encodeEnvelope(makeRequest(RPC.task.list, {})));
+    const old = await peer.next((e) => e.kind === 'res' && e.method === RPC.task.list);
+    expect(old.kind === 'res' && old.ok, '1.10 节点调 task.list 应正常受理').toBe(true);
+    peer.ws.close();
   });
 
   it('心跳判死：半开连接（不再读 socket）两周期后被踢 → 他人收到 node.offline', async () => {

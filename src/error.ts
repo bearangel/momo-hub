@@ -7,6 +7,11 @@
 // answer_timeout（代答转发超时——账本不动，可重试）。
 // M5.0 新增一码（spec 2026-10-30 §5）：name_conflict（hello 改名撞名——目标名已被
 // 其他节点占用；专用码不复用 M2 镜像确认的 conflict，一义一名）。
+// 1.11.0 新增四码（任务生命周期 v2，spec 2026-11-13 §8.2）：not_submitted
+//（task.accept/reject 时账本非 submitted 态——含二次 accept 幂等拒绝）、
+// intervention_not_found（interventionId 定位不到干预行）、intervention_stale
+//（干预行非 pending——first_wins 重复答/已过期）、forbidden_responder
+//（越权答复：peer 组发起方代答，仅执行节点所有者可答）。
 export type RpcErrorCode =
   | 'unauthorized'
   | 'bad_request'
@@ -21,7 +26,11 @@ export type RpcErrorCode =
   | 'not_waiting'
   | 'node_unsupported'
   | 'answer_timeout'
-  | 'name_conflict';
+  | 'name_conflict'
+  | 'not_submitted'
+  | 'intervention_not_found'
+  | 'intervention_stale'
+  | 'forbidden_responder';
 
 export interface RpcErrorPayload {
   code: RpcErrorCode;
@@ -48,4 +57,8 @@ export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
   'node_unsupported',
   'answer_timeout',
   'name_conflict',
+  'not_submitted',
+  'intervention_not_found',
+  'intervention_stale',
+  'forbidden_responder',
 ];

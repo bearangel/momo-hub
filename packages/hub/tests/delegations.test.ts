@@ -170,26 +170,28 @@ async function workerAnswer(
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// 状态机纯函数矩阵（Review Focus #3——7×7=49 对全覆盖，M3.1 增 waiting 行列）
+// 状态机纯函数矩阵（Review Focus #3——8×8=64 对全覆盖，M3.1 增 waiting 行列，
+// 1.11.0 增 submitted 行列）
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('canTransition 全迁移矩阵', () => {
   const LEGAL: Array<[DelegationStatus, DelegationStatus]> = [
     ['pending', 'running'], ['pending', 'failed'], ['pending', 'cancelled'], ['pending', 'interrupted'],
-    ['running', 'waiting'],
+    ['running', 'waiting'], ['running', 'submitted'],
     ['running', 'done'], ['running', 'failed'], ['running', 'cancelled'], ['running', 'interrupted'],
-    ['waiting', 'running'], ['waiting', 'done'], ['waiting', 'failed'], ['waiting', 'cancelled'], ['waiting', 'interrupted'],
+    ['waiting', 'running'], ['waiting', 'submitted'], ['waiting', 'done'], ['waiting', 'failed'], ['waiting', 'cancelled'], ['waiting', 'interrupted'],
+    ['submitted', 'done'], ['submitted', 'running'], ['submitted', 'cancelled'], ['submitted', 'failed'],
     ['interrupted', 'running'], ['interrupted', 'failed'], ['interrupted', 'cancelled'],
   ];
 
-  it('17 个合法对放行（M3.1 增 running→waiting 与 waiting 五出边）', () => {
+  it('23 个合法对放行（1.11.0 增 running/waiting→submitted 与 submitted 四出边——spec §8.1）', () => {
     for (const [from, to] of LEGAL) {
       expect(canTransition(from, to), `${from}→${to}`).toBe(true);
     }
-    expect(LEGAL).toHaveLength(17);
+    expect(LEGAL).toHaveLength(23);
   });
 
-  it('32 个非法对全拒（含自迁移、终态出场与 waiting 的非法组合——7×7 全覆盖）', () => {
+  it('41 个非法对全拒（含自迁移、终态出场与 submitted 的非法组合——8×8 全覆盖）', () => {
     for (const from of DELEGATION_STATUSES) {
       for (const to of DELEGATION_STATUSES) {
         const legal = LEGAL.some(([f, t]) => f === from && t === to);
@@ -847,10 +849,12 @@ describe('task.list', () => {
     expect(rec).toMatchObject({ workspaceName: 'ws-l2', targetNodeId: target.nodeId, status: 'running', title: '修登录 bug' });
     // 组归属投影（M4.2）：group_id 既有列直接带出——零迁移
     expect(rec.groupId).toBe(groupId);
-    // 键集锁（M3.1 扩四键 + M4.2 扩 groupId）：代答留痕四字段恒在（未代答为 null）
+    // 键集锁（M3.1 扩四键 + M4.2 扩 groupId + 1.11.0 扩 runNo）：代答留痕四字段
+    // 恒在（未代答为 null）；runNo 恒在（旧行 NULL 投影缺省 1）；submittedAt/
+    // acceptedAt 未落值经 wire 序列化丢键（undefined）——此处 running 未提交，不在场
     expect(Object.keys(rec).sort()).toEqual([
       'answerDecision', 'answerMessage', 'answeredAt', 'answeredBy',
-      'createdAt', 'groupId', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
+      'createdAt', 'groupId', 'runNo', 'status', 'targetNodeId', 'taskId', 'title', 'updatedAt', 'workspaceName',
     ]);
 
     // 状态过滤
@@ -1479,5 +1483,80 @@ describe('审计日志', () => {
       infoSpy.mockRestore();
       warnSpy.mockRestore();
     }
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// db v10（1.11.0 任务生命周期 v2，spec §8.1）：delegations 三列 + 干预行表。
+// schema 断言走顶部建库助手（openHubDatabase 已迁至 v10）；行映射经 task.list
+// 真 wire 面（toRecord 模块私有——投影语义以消费端可见形状为准）。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('db v10 schema（任务生命周期 v2）', () => {
+  it('v10 后 delegations 含 run_no/submitted_at/accepted_at；delegation_interventions 列集齐全 + 索引在场 + schema_version=12', () => {
+    const delegCols = (db.prepare('PRAGMA table_info(delegations)').all() as Array<{ name: string }>).map((c) => c.name);
+    expect(delegCols).toEqual(expect.arrayContaining(['run_no', 'submitted_at', 'accepted_at']));
+
+    const ivCols = (db.prepare('PRAGMA table_info(delegation_interventions)').all() as Array<{ name: string }>).map((c) => c.name);
+    expect(ivCols).toEqual([
+      'id', 'delegation_id', 'run_no', 'kind', 'status', 'payload_json',
+      'answer_json', 'answered_by', 'answered_at', 'created_at', 'updated_at',
+    ]);
+
+    const idx = db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_delegation_interventions_delegation'").get();
+    expect(idx).toBeDefined();
+    // schema_version = MIGRATIONS 条目数（v1/v2 各两表两条——非注释块号）：
+    // 1.10.0 v9 后为 11（resources-unpublish 同款算法），1.11.0 v10 后为 12
+    expect((db.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get() as { value: string }).value).toBe('12');
+  });
+
+  it('delegation_interventions 可插行；(delegation_id, status) 查询走专用索引（EXPLAIN QUERY PLAN）', () => {
+    const now = Date.now();
+    db.prepare(`INSERT INTO delegation_interventions
+      (id, delegation_id, run_no, kind, status, payload_json, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run('iv-v10-1', 'task-v10-x', 2, 'tool_gate', 'pending', '{"tool":"bash"}', now, now);
+    const row = db.prepare('SELECT * FROM delegation_interventions WHERE id = ?').get('iv-v10-1') as Record<string, unknown>;
+    expect(row).toMatchObject({ delegation_id: 'task-v10-x', run_no: 2, kind: 'tool_gate', status: 'pending' });
+
+    const plan = db.prepare('EXPLAIN QUERY PLAN SELECT id FROM delegation_interventions WHERE delegation_id = ? AND status = ?')
+      .all('task-v10-x', 'pending') as Array<{ detail: string }>;
+    expect(plan.some((p) => p.detail.includes('idx_delegation_interventions_delegation'))).toBe(true);
+  });
+
+  it('行映射：旧行 run_no NULL → runNo=1；显式 run_no=3 与 submitted_at/accepted_at 经 task.list 透传', async () => {
+    const { leader, target, groupId } = await setupGroup('v10map');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-v10' }));
+
+    // 旧行形态：新委派 run_no NULL（列无缺省，INSERT 不落该列）→ 投影缺省 1
+    expect(ledgerRow(taskId)?.run_no).toBeNull();
+    const list1 = await callRpc(leader, RPC.task.list, { groupId, status: 'pending' });
+    const rec1 = (resPayload(list1) as { tasks: Array<Record<string, unknown>> }).tasks.find((t) => t.taskId === taskId)!;
+    expect(rec1.runNo).toBe(1);
+    expect(rec1.submittedAt).toBeUndefined();
+    expect(rec1.acceptedAt).toBeUndefined();
+
+    // 显式值：提交/验收时刻透传（投影直传不加工）
+    db.prepare('UPDATE delegations SET run_no = 3, submitted_at = 1000, accepted_at = 2000 WHERE task_id = ?').run(taskId);
+    const list2 = await callRpc(leader, RPC.task.list, { groupId });
+    const rec2 = (resPayload(list2) as { tasks: Array<Record<string, unknown>> }).tasks.find((t) => t.taskId === taskId)!;
+    expect(rec2.runNo).toBe(3);
+    expect(rec2.submittedAt).toBe(1000);
+    expect(rec2.acceptedAt).toBe(2000);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('幂等：已 v10 库重复打开零迁移（schema_version 稳定 12，重复 ALTER 不炸）', () => {
+    const dir2 = mkdtempSync(join(tmpdir(), 'momo-hub-v10-'));
+    const first = openHubDatabase(dir2);
+    const ver = (d: ReturnType<typeof openHubDatabase>) =>
+      (d.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get() as { value: string }).value;
+    expect(ver(first)).toBe('12');
+    first.close();
+    const second = openHubDatabase(dir2);
+    expect(ver(second)).toBe('12');
+    // 数据存活：干预表结构与索引重开后仍在
+    expect((second.prepare('PRAGMA table_info(delegation_interventions)').all() as unknown[]).length).toBe(11);
+    second.close();
   });
 });

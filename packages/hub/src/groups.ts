@@ -137,7 +137,12 @@ const LEADER_ONLY_METHODS: Record<string, LeaderOnlyExtractor> = {
   },
   // task.answer 同款 taskId 反查（M3.1）：代答权锚 delegations.group_id →
   // groups.leader_node_id（与 cancel 一致）；未知 taskId 返 null 放行 → handler not_found。
+  // 1.11.0 结构化答复分流（spec §8.6）：载荷带 interventionId 即返 null 放行——
+  // 干预答复权是双通道（发起方代答 / worker 本地答回传），leader 单关会拦死
+  // worker 侧与 peer 组执行节点；权威校验整体由 handleAnswer 干预分支承接
+  // （hub 是授权权威，身份取自信封鉴权）。
   [RPC.task.answer]: (p, db) => {
+    if (isRecord(p) && p.interventionId !== undefined) return null;
     const taskId = reqStr(p, 'taskId');
     if (!taskId) return null;
     const row = db.prepare('SELECT group_id FROM delegations WHERE task_id = ?').get(taskId) as

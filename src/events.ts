@@ -1,5 +1,5 @@
 // 服务端推送事件目录（ws 控制面，evt 信封）。
-import type { DelegationTask } from './delegation';
+import type { DelegationTask, InterventionAnswer, InterventionRequest } from './delegation';
 import type { HubResourceType } from './resources';
 import type { ViewMessage } from './remote-view';
 
@@ -20,6 +20,14 @@ export const EVT = {
   // M3.1（1.3.0）新增：代答复核回执（定向→委派 leader）。刻意不做 task.waiting
   // 双信号——leader 等待展示走 task.progress kind 通道（spec §3.4 裁定）。
   taskAnswered: 'task.answered',
+  // 1.11.0（任务生命周期 v2）新增五事件（spec 2026-11-13 §8.2）：干预请求/答复
+  // 回执/提交/验收通过/打回——定向语义见各载荷接口；peer 组仅转发提交/验收
+  // 三事件，干预两事件不发（hub 只发中性进度，spec §8.6）。
+  taskIntervention: 'task.intervention',
+  taskInterventionAnswered: 'task.interventionAnswered',
+  taskSubmitted: 'task.submitted',
+  taskAccepted: 'task.accepted',
+  taskRejected: 'task.rejected',
   viewAppended: 'view.appended',
   workspaceMirrored: 'workspace.mirrored',
 } as const;
@@ -112,4 +120,48 @@ export interface WorkspaceMirroredEvent {
   appliedResources: string[];
   /** 目标无法解析的引用（软失败——T8b 应用器语义；缺省 = 全部解析）。 */
   unresolvedRefs?: string[];
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1.11.0 任务生命周期 v2 事件载荷（spec 2026-11-13 §8.2 五事件逐字段）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** task.intervention：定向→发起方（lf 组）——worker 人工请求镜像源（发起方据此建
+ *  镜像请求行并代答）。peer 组不转发本事件（hub 只发中性进度，spec §8.6）。 */
+export interface TaskInterventionEvent {
+  taskId: string;
+  intervention: InterventionRequest;
+}
+
+/** task.interventionAnswered：定向→另一侧（答方=发起方则发 worker；答方=worker
+ *  则发发起方）——first_wins 收敛信号，对端据此关闭本地镜像行；answeredBy 为
+ *  答方节点 id（身份取自信封鉴权，不信任载荷自报）。 */
+export interface TaskInterventionAnsweredEvent {
+  taskId: string;
+  interventionId: string;
+  answer: InterventionAnswer;
+  answeredBy: string;
+}
+
+/** task.submitted：定向→发起方——run 提交待验收（账本 submitted）；发起方按
+ *  (taskId, runNo) 幂等懒建镜像 run 行。deliverable 为提交载荷摘要（摘要/文件/
+ *  产物/测试结果，自由形状），缺省不带键。 */
+export interface TaskSubmittedEvent {
+  taskId: string;
+  runNo: number;
+  deliverable?: Record<string, unknown>;
+}
+
+/** task.accepted：定向→worker——验收通过（账本 submitted→done，accepted_at 落账）。 */
+export interface TaskAcceptedEvent {
+  taskId: string;
+  runNo: number;
+}
+
+/** task.rejected：定向→worker——打回（账本 submitted→running，run_no+1 起新 run）；
+ *  runNo 为新 run 号；reason 必带（打回理由，进 agent 上下文）。 */
+export interface TaskRejectedEvent {
+  taskId: string;
+  runNo: number;
+  reason: string;
 }

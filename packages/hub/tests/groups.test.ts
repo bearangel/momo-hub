@@ -84,11 +84,11 @@ afterAll(async () => { await server.close(); db.close(); });
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('迁移 v3 组三表', () => {
-  it('schema_version=11（v3 组三表 + M2c 快照 + M2d 委派表 + M3.1 决策列 + M3.4 墓碑列 + M5.0 归属列 + 1.10.0 模式列/绑定表）；三表存在；重开幂等', () => {
+  it('schema_version=12（v3 组三表 + M2c 快照 + M2d 委派表 + M3.1 决策列 + M3.4 墓碑列 + M5.0 归属列 + 1.10.0 模式列/绑定表 + 1.11.0 v10 生命周期三列/干预表）；三表存在；重开幂等', () => {
     const dir = mkdtempSync(join(tmpdir(), 'momo-hub-mig-'));
     const d1: Database.Database = openHubDatabase(dir);
     const version = d1.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string };
-    expect(version.value).toBe('11');
+    expect(version.value).toBe('12');
     const tables = (d1.prepare(
       `SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('groups', 'group_members', 'group_invites')`,
     ).all() as Array<{ name: string }>).map((r) => r.name).sort();
@@ -96,7 +96,7 @@ describe('迁移 v3 组三表', () => {
     d1.close();
     // 重开幂等：不重复应用、不炸
     const d2 = openHubDatabase(dir);
-    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('11');
+    expect((d2.prepare(`SELECT value FROM hub_meta WHERE key = 'schema_version'`).get() as { value: string }).value).toBe('12');
     d2.close();
   });
 });

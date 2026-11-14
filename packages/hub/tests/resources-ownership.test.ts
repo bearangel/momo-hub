@@ -428,6 +428,11 @@ describe('迁移 v8（resources.owner_node_id）', () => {
     // 1.10.0 v9 产物一并摘除（仿真 v7 库须回到 v9 之前——mode 列 + 绑定表）
     d1.prepare('ALTER TABLE groups DROP COLUMN mode').run();
     d1.prepare('DROP TABLE group_bindings').run();
+    // 1.11.0 v10 产物一并摘除（同款口径——生命周期三列 + 干预表）
+    d1.prepare('ALTER TABLE delegations DROP COLUMN run_no').run();
+    d1.prepare('ALTER TABLE delegations DROP COLUMN submitted_at').run();
+    d1.prepare('ALTER TABLE delegations DROP COLUMN accepted_at').run();
+    d1.prepare('DROP TABLE delegation_interventions').run();
     d1.prepare(`UPDATE hub_meta SET value = '9' WHERE key = 'schema_version'`).run();
     d1.close();
 
@@ -437,11 +442,11 @@ describe('迁移 v8（resources.owner_node_id）', () => {
     expect(cols).toContain('owner_node_id');
     const legacy = d2.prepare('SELECT owner_node_id FROM resources WHERE slug = ?').get('v7-legacy') as { owner_node_id: string | null };
     expect(legacy.owner_node_id).toBeNull(); // 存量保持 NULL（开放认领）
-    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '11' });
+    expect(d2.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '12' });
     // 再重开幂等：迁移不重复执行（列不被重复 ALTER 炸）
     d2.close();
     const d3 = openHubDatabase(dir);
-    expect(d3.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '11' });
+    expect(d3.prepare("SELECT value FROM hub_meta WHERE key = 'schema_version'").get()).toEqual({ value: '12' });
     d3.close();
   });
 });

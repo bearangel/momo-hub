@@ -256,6 +256,11 @@ interface DelegationRow {
   answer_decision: string | null;
   answer_message: string | null;
   answered_at: number | null;
+  // 生命周期三列（1.11.0 db v10）：run_no NULL = 第 1 次执行（投影 ?? 1）；
+  // submitted_at/accepted_at NULL = 未提交/未验收。
+  run_no: number | null;
+  submitted_at: number | null;
+  accepted_at: number | null;
 }
 
 function toRecord(r: DelegationRow): TaskRecord {
@@ -273,6 +278,11 @@ function toRecord(r: DelegationRow): TaskRecord {
     answerDecision: (r.answer_decision ?? null) as TaskRecord['answerDecision'],
     answerMessage: r.answer_message ?? null,
     answeredAt: r.answered_at ?? null,
+    // 执行尝试号（1.11.0）：NULL = 第 1 次执行 → 1；提交/验收时刻可空直传
+    // （?? undefined——wire 序列化丢 undefined 键，未提交/未验收不带键）
+    runNo: r.run_no ?? 1,
+    submittedAt: r.submitted_at ?? undefined,
+    acceptedAt: r.accepted_at ?? undefined,
   };
 }
 

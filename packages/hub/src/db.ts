@@ -95,6 +95,29 @@ const MIGRATIONS: readonly string[] = [
      updated_at INTEGER NOT NULL,
      PRIMARY KEY (group_id, node_id)
    )`,
+  // v10（1.11.0 任务生命周期 v2，spec §8.1 SQL 逐字改列名对齐 delegations 主键
+  // task_id）：delegations 三列（run_no 缺省 NULL = 第 1 次执行，投影层 ?? 1 兜底；
+  // submitted_at/accepted_at NULL = 未提交/未验收）+ 干预行表（worker 侧人工请求
+  // 经 task.intervene 落档，(delegation_id, status) 索引撑发起方挂单查询；
+  // id = worker 本地 human_requests.id 单点生成，不加 FK——delegations 无删除面）。
+  `ALTER TABLE delegations ADD COLUMN run_no INTEGER;
+   ALTER TABLE delegations ADD COLUMN submitted_at INTEGER;
+   ALTER TABLE delegations ADD COLUMN accepted_at INTEGER;
+   CREATE TABLE IF NOT EXISTS delegation_interventions (
+     id TEXT PRIMARY KEY NOT NULL,
+     delegation_id TEXT NOT NULL,
+     run_no INTEGER NOT NULL,
+     kind TEXT NOT NULL,
+     status TEXT NOT NULL,
+     payload_json TEXT NOT NULL,
+     answer_json TEXT,
+     answered_by TEXT,
+     answered_at INTEGER,
+     created_at INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL
+   );
+   CREATE INDEX IF NOT EXISTS idx_delegation_interventions_delegation
+     ON delegation_interventions(delegation_id, status)`,
 ];
 
 export function openHubDatabase(dataDir: string): Database.Database {

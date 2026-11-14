@@ -669,11 +669,10 @@ describe('task.answer 干预分支错误态', () => {
   it('账本非 waiting（running，等待已解除）：行照答、账本不动（保持 running）', async () => {
     const { leader, target, groupId } = await setupGroup('ansrun');
     const taskId = await waitingIntervention(leader, target, groupId, 'ansrun', 'iv-ans-r1');
-    // worker 无 kind 上报解除等待 → 账本回 running（干预行仍 pending）
-    report(target.ws, taskId, { status: 'running', sessionId: 'sess-ansrun' });
-    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
-      && (e.payload as { taskId: string }).taskId === taskId
-      && (e.payload as { lastSeq: number }).lastSeq === 0);
+    // 1.11 解除守卫：pending 干预在册时无 kind 拍不再解除（守卫回归组另锁）——
+    // 此处 SQL 直置 running 构造「账本已 running、行仍 pending」的答复窗口
+    db.prepare("UPDATE delegations SET status = 'running', updated_at = ? WHERE task_id = ?")
+      .run(Date.now(), taskId);
     expect(ledgerRow(taskId)?.status).toBe('running');
 
     const res = await callRpc(leader, RPC.task.answer, {
@@ -1385,6 +1384,48 @@ describe('task.intervene interrupted 态放行（H5 遗留）', () => {
     const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskIntervention
       && (e.payload as { taskId: string }).taskId === taskId);
     expect((evt.payload as { intervention: { interventionId: string } }).intervention.interventionId).toBe('iv-int-1');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 等待解除守卫（1.11.0——pending 干预期间的 waiting 只由 task.answer 解除）
+// 无 kind 进度拍不越权解除；1.10 旧行为（无干预行）零变化。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('等待解除守卫：pending 干预期间无 kind 拍不解除', () => {
+  it('intervene 置 waiting 后连发两次无 kind 进度拍：账本保持 waiting + 行仍 pending + 发起方两拍照收（forwardProgress 不受守卫影响）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivgrd');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ivgrd', 'iv-grd-1');
+    expect(ledgerRow(taskId)?.status).toBe('waiting');
+
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-grd', progress: { lastSeq: 2, excerpt: '守卫拍一' } });
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-grd', progress: { lastSeq: 3, excerpt: '守卫拍二' } });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { lastSeq: number }).lastSeq === 2);
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { lastSeq: number }).lastSeq === 3);
+
+    expect(ledgerRow(taskId)?.status).toBe('waiting');
+    expect(interventionRow('iv-grd-1')?.status).toBe('pending');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('回归（1.10 零变化锁）：无干预行的旧 waiting（SQL 直置）+ 无 kind 拍 → 照旧解除回 running', async () => {
+    const { leader, target, groupId } = await setupGroup('ivold');
+    const taskId = await runningTask(leader, target, groupId, 'ivold');
+    db.prepare("UPDATE delegations SET status = 'waiting', updated_at = ? WHERE task_id = ?")
+      .run(Date.now(), taskId);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
+      .get(taskId) as { n: number }).n).toBe(0);
+
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-ivold' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { lastSeq: number }).lastSeq === 0);
+    expect(ledgerRow(taskId)?.status).toBe('running');
     leader.ws.close(); target.ws.close();
   });
 });

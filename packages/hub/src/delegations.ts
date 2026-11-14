@@ -1199,6 +1199,24 @@ export class DelegationRouter {
         this.forwardProgress({ ...row, session_id: sessionId ?? row.session_id }, report);
         return;
       }
+      // 1.11.0 解除守卫：存在 pending 干预行 → 无 kind 拍不越权解除（账本不动、
+      // 进度照转，与上方 kind==='waiting-input' 同处理）。两代 waiting 的解除
+      // 权威分工：1.10 老形态（无干预行）维持无 kind 拍即解除（下方原路径）；
+      // 1.11 干预 waiting 只由 task.answer（answerIntervention）解除——否则
+      // task.intervene 置 waiting 后 worker 常规进度拍（~2s 窗口）即刻冲掉
+      // waiting，发起方永远看不到等待态。
+      const pendingIv = this.db.prepare(
+        "SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ? AND status = 'pending'",
+      ).get(row.task_id) as { n: number };
+      if (pendingIv.n > 0) {
+        // 等待期间进度拍（账本不动，进度照转）
+        if (sessionId !== null) {
+          this.db.prepare('UPDATE delegations SET session_id = ?, updated_at = ? WHERE task_id = ?')
+            .run(sessionId, Date.now(), row.task_id);
+        }
+        this.forwardProgress({ ...row, session_id: sessionId ?? row.session_id }, report);
+        return;
+      }
       // 等待解除：状态单源铁律——hub 不在 task.answer 时迁移，approve/deny 后
       // worker 下一拍无 kind 即回 running
       this.db.prepare("UPDATE delegations SET status = 'running', session_id = ?, updated_at = ? WHERE task_id = ?")

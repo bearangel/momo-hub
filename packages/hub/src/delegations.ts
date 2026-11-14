@@ -27,11 +27,12 @@ import {
   EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES,
   TASK_HITL_REQUIRED_MINOR, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
-  type InterventionAnswer, type InterventionKind, type InterventionRequest, type InterventionStatus,
+  type InterventionAnswer, type InterventionKind, type InterventionRecord, type InterventionRequest, type InterventionStatus,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
   type TaskAssignedEvent, type TaskAcceptedEvent, type TaskInterventionAnsweredEvent,
   type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
-  type TaskRejectedEvent, type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
+  type TaskRejectedEvent, type TaskReportPayload, type TaskReportProgress,
+  type TaskSubmittedEvent, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
@@ -207,14 +208,21 @@ function parseDelegationTask(raw: unknown): DelegationTask | null {
   return task;
 }
 
-/** task.report 载荷校验：status 四值枚举（pending=1.10.0 生命周期拍值——仅转
- *  progress 不迁移状态；interrupted/cancelled 不是上报值）、sessionId/reason 有界串、
- *  progress 形态（lastSeq 非负整数 + excerpt 有界串——RM2-7：excerpt="" 视同缺省
- *  受理，转发时以占位呈现，lastSeq 不丢）。 */
+/** task.report 载荷校验：status 五值枚举（pending=1.10.0 生命周期拍值——仅转
+ *  progress 不迁移状态；submitted=1.11.0 待验收上报；interrupted/cancelled 不是
+ *  上报值）、sessionId/reason 有界串、progress 形态（lastSeq 非负整数 + excerpt
+ *  有界串——RM2-7：excerpt="" 视同缺省受理，转发时以占位呈现，lastSeq 不丢）、
+ *  runNo 正整数可选（1.11.0，submitted 上报携带对账——打回起新 run；非正整数
+ *  整包拒；其他 status 携带时合法但不消费，未知容忍先例 permissionTier）。 */
 function parseReportPayload(raw: unknown): TaskReportPayload | null {
   if (!isRecord(raw)) return null;
-  if (raw.status !== 'running' && raw.status !== 'done' && raw.status !== 'failed' && raw.status !== 'pending') return null;
+  if (raw.status !== 'running' && raw.status !== 'done' && raw.status !== 'failed'
+    && raw.status !== 'pending' && raw.status !== 'submitted') return null;
   const out: TaskReportPayload = { status: raw.status };
+  if (raw.runNo !== undefined) {
+    if (typeof raw.runNo !== 'number' || !Number.isInteger(raw.runNo) || raw.runNo < 1) return null;
+    out.runNo = raw.runNo;
+  }
   if (raw.sessionId !== undefined) {
     const sessionId = optBoundedStr(raw.sessionId, SESSION_ID_MAX);
     if (sessionId === null) return null;
@@ -390,6 +398,55 @@ function toRecord(r: DelegationRow): TaskRecord {
     submittedAt: r.submitted_at ?? undefined,
     acceptedAt: r.accepted_at ?? undefined,
   };
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 干预行投影（1.11.0 task.interventions 对账——H4 落行义务的还原侧）
+// ────────────────────────────────────────────────────────────────────────────
+
+interface InterventionRow {
+  id: string;
+  delegation_id: string;
+  run_no: number;
+  kind: string;
+  status: string;
+  payload_json: string;
+  answer_json: string | null;
+  answered_by: string | null;
+  answered_at: number | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** 干预行 → InterventionRecord 投影合并还原：H4 落行时 payload_json 只存内容字段
+ *  （title/prompt/payload/options/deadlineAt——id/run_no/kind 有专属列），本函数做
+ *  对应的合并还原。answer 三列只在 first_wins 原子落行时写入（status 同拍变
+ *  'answered'），投影按非 NULL 带键——pending 行不带 answer/answeredBy/answeredAt。
+ *  payload_json/answer_json 均为 hub 自己序列化的 JSON，parse 不设防（库层事实）。 */
+function toInterventionRecord(r: InterventionRow): InterventionRecord {
+  const content = JSON.parse(r.payload_json) as {
+    title: string;
+    prompt: string;
+    payload?: Record<string, unknown>;
+    options?: InterventionRequest['options'];
+    deadlineAt?: number;
+  };
+  const rec: InterventionRecord = {
+    interventionId: r.id,
+    runNo: r.run_no,
+    kind: r.kind as InterventionKind,
+    title: content.title,
+    prompt: content.prompt,
+    status: r.status as InterventionStatus,
+    createdAt: r.created_at,
+  };
+  if (content.payload !== undefined) rec.payload = content.payload;
+  if (content.options !== undefined) rec.options = content.options;
+  if (content.deadlineAt !== undefined) rec.deadlineAt = content.deadlineAt;
+  if (r.answer_json !== null) rec.answer = JSON.parse(r.answer_json) as InterventionAnswer;
+  if (r.answered_by !== null) rec.answeredBy = r.answered_by;
+  if (r.answered_at !== null) rec.answeredAt = r.answered_at;
+  return rec;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -940,8 +997,14 @@ export class DelegationRouter {
 
     const runNo = row.run_no ?? 1;
     const now = Date.now();
-    this.db.prepare("UPDATE delegations SET status = 'done', accepted_at = ?, updated_at = ? WHERE task_id = ?")
+    // 自封口守卫（H6 评审 Minor#1）：UPDATE 带 status='submitted' 条件，changes===1
+    // 才发事件——row 读取与写入间现无 await（前置校验即真相），防未来插入 await
+    // 开 TOCTOU 窗口；竞态败者按 not_submitted 拒（与前置校验同码同义）。
+    const upd = this.db.prepare("UPDATE delegations SET status = 'done', accepted_at = ?, updated_at = ? WHERE task_id = ? AND status = 'submitted'")
       .run(now, now, taskId);
+    if (upd.changes !== 1) {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可验收（已验收不可重复受理）`) };
+    }
     logger.info('委派已验收', { taskId, runNo, byNode: ctx.nodeId });
     const sent = await this.registry.sendTo(row.target_node_id, {
       v: 1, kind: 'evt', method: EVT.taskAccepted,
@@ -982,8 +1045,13 @@ export class DelegationRouter {
 
     const newRunNo = (row.run_no ?? 1) + 1;
     const now = Date.now();
-    this.db.prepare("UPDATE delegations SET status = 'running', run_no = ?, updated_at = ? WHERE task_id = ?")
+    // 自封口守卫同 handleAccept（H6 评审 Minor#1）：UPDATE 带 submitted 条件 +
+    // changes===1 才发事件，防未来 await 化开 TOCTOU 窗口。
+    const upd = this.db.prepare("UPDATE delegations SET status = 'running', run_no = ?, updated_at = ? WHERE task_id = ? AND status = 'submitted'")
       .run(newRunNo, now, taskId);
+    if (upd.changes !== 1) {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可打回`) };
+    }
     logger.info('委派已打回', { taskId, newRunNo, byNode: ctx.nodeId });
     const sent = await this.registry.sendTo(row.target_node_id, {
       v: 1, kind: 'evt', method: EVT.taskRejected,
@@ -1031,6 +1099,39 @@ export class DelegationRouter {
     sql += ' ORDER BY created_at ASC, task_id ASC';
     const rows = this.db.prepare(sql).all(...args) as DelegationRow[];
     return { ok: true, payload: { tasks: rows.map(toRecord) } };
+  }
+
+  /**
+   * task.interventions RPC（1.11.0 重连对账拉取，spec 2026-11-13 §8.2——刻意不入
+   * LEADER_ONLY_METHODS，沿 intervene/accept 先例：查询权是「委派两端」而非组长，
+   * peer 组发起方/执行节点均可调，权限锚在本 handler 的两端判定）。taskId 在场：
+   * 该委派两端（by_node_id/target_node_id）可查，他者 forbidden（不区分组内组外
+   * ——同码防探测）；缺省：本节点相关的全部（by_node_id 或 target_node_id 命中
+   * 的所有委派的 interventions，无相关委派返回空清单——无存在性泄漏面）。
+   * 行投影：payload_json（H4 内容字段序列化）+ 专属列（id/run_no/kind/status/
+   * answer_json/answered_by/answered_at/created_at）经 toInterventionRecord 合并
+   * 还原 InterventionRecord。
+   */
+  handleListInterventions(ctx: GroupHandlerContext, payload: unknown): RpcOutcome {
+    const taskId = reqStr(payload, 'taskId');
+    let rows: InterventionRow[];
+    if (taskId !== null) {
+      const row = this.getTask(taskId);
+      if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+      if (ctx.nodeId !== row.by_node_id && ctx.nodeId !== row.target_node_id) {
+        return { ok: false, error: err('forbidden', '仅委派发起方或执行节点可拉取干预记录') };
+      }
+      rows = this.db.prepare(
+        'SELECT * FROM delegation_interventions WHERE delegation_id = ? ORDER BY created_at ASC, id ASC',
+      ).all(taskId) as InterventionRow[];
+    } else {
+      rows = this.db.prepare(`SELECT iv.* FROM delegation_interventions iv
+        JOIN delegations d ON d.task_id = iv.delegation_id
+        WHERE d.by_node_id = ? OR d.target_node_id = ?
+        ORDER BY iv.created_at ASC, iv.id ASC`)
+        .all(ctx.nodeId, ctx.nodeId) as InterventionRow[];
+    }
+    return { ok: true, payload: { interventions: rows.map(toInterventionRecord) } };
   }
 
   /**
@@ -1124,6 +1225,42 @@ export class DelegationRouter {
     }
     if (!canTransition(row.status, to)) {
       logger.warn('委派上报被拒：非法状态迁移', { taskId: row.task_id, from: row.status, to, by: fromNodeId });
+      return;
+    }
+
+    // 1.11.0 submitted 分支（spec 2026-11-13 §8.2）：run 完成待验收——canTransition
+    // 已单点放行（合法源态仅 running|waiting；pending/interrupted/终态报 submitted
+    // 在上方被拒，重复 submitted 落 to===row.status 幂等忽略）。submitted_at +
+    // run_no 落账（载荷 runNo 缺省沿用行值——1.10 上报形态零变化；session_id 不
+    // 回填：submitted 是 run 收口拍，会话在 running 拍已建立）。task.submitted 定向
+    // 发起方 by_node_id——peer 组照发（spec §3 裁定 #9：提交/验收跨节点，仅人工
+    // 请求内容不转发）；发起方离线容忍（账本已是事实，重连经 task.list /
+    // task.interventions 对账收敛，H7）。
+    if (to === 'submitted') {
+      const runNo = report.runNo ?? row.run_no ?? 1;
+      const now = Date.now();
+      this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ?")
+        .run(now, runNo, now, row.task_id);
+      logger.info('委派状态迁移', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });
+      // deliverable 通道约定（H7 裁定，协议 TaskReportPayload 无 deliverable 字段）：
+      // worker（S2 studio 侧）把交付摘要 JSON 塞 report.reason，hub 尝试 JSON.parse
+      // ——成纯对象则作 deliverable 透传（TaskSubmittedEvent.deliverable?，spec §8.2），
+      // 失败/缺席/非对象不带键。
+      let deliverable: Record<string, unknown> | undefined;
+      if (report.reason !== undefined) {
+        try {
+          const parsed: unknown = JSON.parse(report.reason);
+          if (isRecord(parsed)) deliverable = parsed;
+        } catch { /* 非 JSON 串——不带 deliverable 键（通道约定见上） */ }
+      }
+      void this.registry.sendTo(row.by_node_id, {
+        v: 1, kind: 'evt', method: EVT.taskSubmitted,
+        payload: {
+          taskId: row.task_id,
+          runNo,
+          ...(deliverable !== undefined ? { deliverable } : {}),
+        } satisfies TaskSubmittedEvent,
+      });
       return;
     }
 

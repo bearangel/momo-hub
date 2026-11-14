@@ -245,7 +245,8 @@ describe('task.intervene peer 中性进度', () => {
     expect(prog.payload).toMatchObject({
       taskId, sessionId: '', excerpt: '执行方等待人工处理', kind: 'waiting-input',
     });
-    expect(typeof (prog.payload as { lastSeq: number }).lastSeq).toBe('number');
+    // controller 定约：中性进度 lastSeq 恒 0（毫秒时间戳会污染消费侧单调去重）
+    expect((prog.payload as { lastSeq: number }).lastSeq).toBe(0);
 
     await settle();
     expect(a.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention)).toHaveLength(0);
@@ -339,8 +340,36 @@ describe('task.intervene 幂等与 stale', () => {
     expect(errOf(res).code).toBe('intervention_stale');
     await settle();
     expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention)).toHaveLength(0);
-    // 行保持预置 answered 态（不被重写）
+    // 行保持预置 answered 态（不被重写）；账本停在 running（不被推 waiting）
     expect(interventionRow('iv-stale-1')?.status).toBe('answered');
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('跨任务复用同 interventionId（A 落行后 B 用同 id）→ conflict + B 账本不动 + B 发起方零事件（归属守卫）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivxid');
+    const taskA = await runningTask(leader, target, groupId, 'ivxid-a');
+    const taskB = await runningTask(leader, target, groupId, 'ivxid-b');
+    // A 任务先落行 iv-x-1（leader 收到 A 的 intervention 事件）
+    const resA = await callRpc(target, RPC.task.intervene, {
+      taskId: taskA, intervention: intervention({ interventionId: 'iv-x-1' }),
+    });
+    expect(resA.kind === 'res' && resA.ok).toBe(true);
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskIntervention
+      && (e.payload as { taskId: string }).taskId === taskA);
+    const evtCountA = leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention).length;
+
+    // B 任务撞同 id：拒绝 + 账本/事件/行三不动
+    const resB = await callRpc(target, RPC.task.intervene, {
+      taskId: taskB, intervention: intervention({ interventionId: 'iv-x-1' }),
+    });
+    expect(errOf(resB).code).toBe('conflict');
+    await settle();
+    expect(ledgerRow(taskB)?.status).toBe('running');
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention)).toHaveLength(evtCountA);
+    expect(interventionRow('iv-x-1')?.delegation_id).toBe(taskA);
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
+      .get(taskB) as { n: number }).n).toBe(0);
     leader.ws.close(); target.ws.close();
   });
 });
@@ -369,6 +398,7 @@ describe('task.intervene 发起方版本门', () => {
       && (e.payload as { taskId: string }).taskId === taskId
       && (e.payload as { excerpt: string }).excerpt === '执行方等待人工处理');
     expect(prog.payload).toMatchObject({ taskId, excerpt: '执行方等待人工处理', kind: 'waiting-input' });
+    expect((prog.payload as { lastSeq: number }).lastSeq).toBe(0);
     await settle();
     expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention)).toHaveLength(0);
     expect(JSON.stringify(leader.inbox)).not.toContain('低版本发起方不该看到');

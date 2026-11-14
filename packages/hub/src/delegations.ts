@@ -688,8 +688,15 @@ export class DelegationRouter {
       return { ok: false, error: err('conflict', `任务当前状态为 ${row.status}，不可上报干预`) };
     }
 
-    const existing = this.db.prepare('SELECT status FROM delegation_interventions WHERE id = ?')
-      .get(intervention.interventionId) as { status: InterventionStatus } | undefined;
+    // 幂等归属双查（评审轮 1）：status 判幂等重发/stale 之外，delegation_id 必须
+    // 与本次 taskId 一致——跨任务复用/撞车同 interventionId 时若只查 status 会
+    // 返回 ok 并把 B 任务账本推 waiting、给 B 发起方发事件，但行仍挂 A 任务
+    // （B 干预无行，H7 对账查不到）→ mismatch 直接 conflict 拒绝
+    const existing = this.db.prepare('SELECT delegation_id, status FROM delegation_interventions WHERE id = ?')
+      .get(intervention.interventionId) as { delegation_id: string; status: InterventionStatus } | undefined;
+    if (existing !== undefined && existing.delegation_id !== taskId) {
+      return { ok: false, error: err('conflict', 'interventionId 已归属其他任务，不可跨任务复用') };
+    }
     if (existing !== undefined && existing.status !== 'pending') {
       return { ok: false, error: err('intervention_stale', `干预请求已处于 ${existing.status} 态，不可重复上报`) };
     }
@@ -739,13 +746,16 @@ export class DelegationRouter {
       });
       if (sent === 'offline') logger.info('干预通知未送达（发起方离线）', { taskId, interventionId: intervention.interventionId });
     } else {
-      const after = this.getTask(taskId);
+      // 中性进度 lastSeq 定约（controller，评审轮 1）：恒 0——真实 worker seq 是
+      // 小整数，用毫秒时间戳冒充会让消费侧按 lastSeq 单调去重把恢复后的合法进度
+      // 当陈旧丢弃（任务冻结）；0 不污染序列空间，任何后续真实 seq 恒大于它。
+      // 消费侧不得用 waiting-input 中性拍做 seq 追踪。
       const sent = await this.registry.sendTo(row.by_node_id, {
         v: 1, kind: 'evt', method: EVT.taskProgress,
         payload: {
           taskId,
-          sessionId: after?.session_id ?? row.session_id ?? '',
-          lastSeq: after?.updated_at ?? row.updated_at,
+          sessionId: row.session_id ?? '',
+          lastSeq: 0,
           excerpt: '执行方等待人工处理',
           kind: 'waiting-input',
         } satisfies TaskProgressEvent,

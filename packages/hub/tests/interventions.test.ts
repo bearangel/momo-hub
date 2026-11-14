@@ -5,6 +5,9 @@
 // title/prompt/interventionId 字样）/ 来源校验 forbidden / 终态 conflict /
 // 幂等重发（裁定⑤：事件重发 + 行仍单条）/ intervention_stale / 发起方低版本
 // 降级中性进度（防半开）/ 载荷校验矩阵 bad_request。
+// task.answer 结构化答复分支（H5，spec §8.2/§8.6）：发起方代答（approve + 结构化）/
+// worker 本地答回传（顶层 decision 兼容映射）/ first_wins 双答竞态 / peer 越权
+// forbidden_responder + target 放行 / 四错误态 / 账本非 waiting 不动。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -175,6 +178,21 @@ async function runningTask(leader: Client, target: Client, groupId: string, pref
     && (e.payload as { taskId: string }).taskId === taskId
     && (e.payload as { lastSeq: number }).lastSeq === 1);
   expect(ledgerRow(taskId)?.status).toBe('running');
+  return taskId;
+}
+
+/** lf 组走完「委派 → running → intervene（账本 waiting + 行 pending + 发起方已收
+ *  task.intervention）」链，返回 taskId——task.answer 干预分支用例的公共前置。 */
+async function waitingIntervention(leader: Client, target: Client, groupId: string, pref: string, ivId: string): Promise<string> {
+  const taskId = await runningTask(leader, target, groupId, pref);
+  const res = await callRpc(target, RPC.task.intervene, {
+    taskId, intervention: intervention({ interventionId: ivId }),
+  });
+  if (!(res.kind === 'res' && res.ok)) throw new Error('intervene 失败');
+  await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskIntervention
+    && (e.payload as { taskId: string }).taskId === taskId);
+  expect(ledgerRow(taskId)?.status).toBe('waiting');
+  expect(interventionRow(ivId)?.status).toBe('pending');
   return taskId;
 }
 
@@ -436,6 +454,217 @@ describe('task.intervene 载荷校验矩阵', () => {
     await settle();
     expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
       .get(taskId) as { n: number }).n).toBe(0);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// task.answer 结构化答复（1.11.0 H5——interventionId 在场走干预分支，spec §8.2/§8.6）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.answer 发起方代答（lf 组）', () => {
+  it('tool_gate 语义 approve：res answered + 行 answered（answer_json 直查）+ worker 收 task.interventionAnswered（answer/answeredBy=leader）+ 账本 waiting→running；答方自身不收对端事件', async () => {
+    const { leader, target, groupId } = await setupGroup('anslf');
+    const taskId = await waitingIntervention(leader, target, groupId, 'anslf', 'iv-ans-1');
+
+    const res = await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-1', answer: { decision: 'approve' },
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ disposition: 'answered' });
+
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskInterventionAnswered);
+    expect(evt.payload).toEqual({
+      taskId, interventionId: 'iv-ans-1',
+      answer: { decision: 'approve' }, answeredBy: leader.nodeId,
+    });
+
+    const row = interventionRow('iv-ans-1');
+    expect(row).toMatchObject({ status: 'answered', answered_by: leader.nodeId });
+    expect(row!.answered_at).not.toBeNull();
+    expect(JSON.parse(row!.answer_json!)).toEqual({ decision: 'approve' });
+    expect(ledgerRow(taskId)?.status).toBe('running');
+
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskInterventionAnswered)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('question 结构化（selected+text）：同上形状，answer_json 存结构化答复原样', async () => {
+    const { leader, target, groupId } = await setupGroup('ansq');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ansq', 'iv-ans-2');
+    const answer = { selected: ['go'], text: '按窗口执行' };
+
+    const res = await callRpc(leader, RPC.task.answer, { taskId, interventionId: 'iv-ans-2', answer });
+    expect(resPayload(res)).toEqual({ disposition: 'answered' });
+
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskInterventionAnswered);
+    expect(evt.payload).toEqual({
+      taskId, interventionId: 'iv-ans-2', answer, answeredBy: leader.nodeId,
+    });
+    expect(JSON.parse(interventionRow('iv-ans-2')!.answer_json!)).toEqual(answer);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.answer worker 本地答回传', () => {
+  it('target 调 answer（顶层 decision 兼容映射，无 answer 段）：res answered + leader 侧收事件（answeredBy=target）+ answer_json 落映射后 decision + 账本 waiting→running', async () => {
+    const { leader, target, groupId } = await setupGroup('answ');
+    const taskId = await waitingIntervention(leader, target, groupId, 'answ', 'iv-ans-w1');
+
+    const res = await callRpc(target, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-w1', decision: 'deny',
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ disposition: 'answered' });
+
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskInterventionAnswered);
+    expect(evt.payload).toEqual({
+      taskId, interventionId: 'iv-ans-w1',
+      answer: { decision: 'deny' }, answeredBy: target.nodeId,
+    });
+    expect(JSON.parse(interventionRow('iv-ans-w1')!.answer_json!)).toEqual({ decision: 'deny' });
+    expect(interventionRow('iv-ans-w1')?.answered_by).toBe(target.nodeId);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.answer first_wins 双答竞态', () => {
+  it('leader 与 target 顺序双答：第一 answered、第二 intervention_stale；行 answer_json/answered_by 保持第一份', async () => {
+    const { leader, target, groupId } = await setupGroup('ansfx');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ansfx', 'iv-ans-fx1');
+
+    const res1 = await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-fx1', answer: { decision: 'approve' },
+    });
+    expect(res1.kind === 'res' && res1.ok).toBe(true);
+    expect(resPayload(res1)).toEqual({ disposition: 'answered' });
+
+    const res2 = await callRpc(target, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-fx1', answer: { text: '本地也已答复' },
+    });
+    expect(errOf(res2).code).toBe('intervention_stale');
+
+    const row = interventionRow('iv-ans-fx1');
+    expect(row?.answered_by).toBe(leader.nodeId);
+    expect(JSON.parse(row!.answer_json!)).toEqual({ decision: 'approve' });
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.answer peer 组越权与放行', () => {
+  it('发起方代答 → forbidden_responder（行不动）；target 本地答 → 正常（行 answered + 账本 pending 不动 + 发起方零干预事件零泄漏）', async () => {
+    const { a, b, groupId } = await setupPeerGroup('anspeer');
+    const taskId = await delegateOk(a, delegateReq(groupId, b.nodeId, {
+      workspaceName: 'ws-anspeer', title: '评估迁移方案', prompt: '请评估并给出结论', draft: true,
+    }));
+    const res = await callRpc(b, RPC.task.intervene, {
+      taskId,
+      intervention: intervention({ interventionId: 'iv-ans-p1', title: '机密问题不外泄', prompt: '机密正文不外泄' }),
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    await a.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { excerpt: string }).excerpt === '执行方等待人工处理');
+    expect(ledgerRow(taskId)?.status).toBe('pending');
+
+    const denied = await callRpc(a, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-p1', answer: { decision: 'approve' },
+    });
+    expect(errOf(denied).code).toBe('forbidden_responder');
+    expect(interventionRow('iv-ans-p1')?.status).toBe('pending');
+
+    const ok = await callRpc(b, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-p1', answer: { selected: ['go'] },
+    });
+    expect(resPayload(ok)).toEqual({ disposition: 'answered' });
+    expect(interventionRow('iv-ans-p1')).toMatchObject({ status: 'answered', answered_by: b.nodeId });
+    expect(JSON.parse(interventionRow('iv-ans-p1')!.answer_json!)).toEqual({ selected: ['go'] });
+    expect(ledgerRow(taskId)?.status).toBe('pending');
+
+    // §8.6 平行组两干预事件均不转发：发起方无 interventionAnswered，interventionId 不泄漏
+    await settle();
+    expect(a.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskInterventionAnswered)).toHaveLength(0);
+    expect(JSON.stringify(a.inbox)).not.toContain('iv-ans-p1');
+    a.ws.close(); b.ws.close();
+  });
+});
+
+describe('task.answer 干预分支错误态', () => {
+  it('intervention_not_found / 全空 answer bad_request / 非法载荷 bad_request / 跨任务 conflict / 终态 conflict——全部不落账不改行', async () => {
+    const { leader, target, groupId } = await setupGroup('anserr');
+    const taskId = await waitingIntervention(leader, target, groupId, 'anserr', 'iv-ans-e1');
+
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'no-such-iv', answer: { decision: 'approve' },
+    })).code).toBe('intervention_not_found');
+    // 全空 answer：无 answer 段且无顶层 decision / answer 空对象 / decision 非法枚举
+    expect(errOf(await callRpc(leader, RPC.task.answer, { taskId, interventionId: 'iv-ans-e1' })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-e1', answer: {},
+    })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-e1', decision: 'accept',
+    })).code).toBe('bad_request');
+    // interventionId / answer 字段形态非法
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: '', answer: { decision: 'approve' },
+    })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-e1', answer: { selected: [123] },
+    })).code).toBe('bad_request');
+    expect(interventionRow('iv-ans-e1')?.status).toBe('pending');
+
+    // 跨任务归属：task2 用 task1 的干预 id → conflict
+    const task2 = await runningTask(leader, target, groupId, 'anserr2');
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId: task2, interventionId: 'iv-ans-e1', answer: { decision: 'approve' },
+    })).code).toBe('conflict');
+
+    // 终态：task 走 done 后答复 → conflict；行保持 pending
+    report(target.ws, taskId, { status: 'done' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskCompleted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(ledgerRow(taskId)?.status).toBe('done');
+    expect(errOf(await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-e1', answer: { decision: 'approve' },
+    })).code).toBe('conflict');
+    expect(interventionRow('iv-ans-e1')?.status).toBe('pending');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('非发起方非执行节点的第三节点答复 → forbidden', async () => {
+    const { leader, target, groupId } = await setupGroup('ans3rd');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ans3rd', 'iv-ans-t1');
+    const third = await connect('ans3rd-bystander');
+    await callRpc(third, RPC.group.join, { inviteCode: (resPayload(await callRpc(leader, RPC.group.invite, { groupId })) as { inviteCode: string }).inviteCode });
+    const res = await callRpc(third, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-t1', answer: { decision: 'approve' },
+    });
+    expect(errOf(res).code).toBe('forbidden');
+    expect(interventionRow('iv-ans-t1')?.status).toBe('pending');
+    leader.ws.close(); target.ws.close(); third.ws.close();
+  });
+
+  it('账本非 waiting（running，等待已解除）：行照答、账本不动（保持 running）', async () => {
+    const { leader, target, groupId } = await setupGroup('ansrun');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ansrun', 'iv-ans-r1');
+    // worker 无 kind 上报解除等待 → 账本回 running（干预行仍 pending）
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-ansrun' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { lastSeq: number }).lastSeq === 0);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+
+    const res = await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-r1', answer: { decision: 'approve' },
+    });
+    expect(resPayload(res)).toEqual({ disposition: 'answered' });
+    expect(interventionRow('iv-ans-r1')?.status).toBe('answered');
+    expect(ledgerRow(taskId)?.status).toBe('running');
     leader.ws.close(); target.ws.close();
   });
 });

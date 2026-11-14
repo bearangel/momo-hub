@@ -27,9 +27,10 @@ import {
   EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES,
   TASK_HITL_REQUIRED_MINOR, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
-  type InterventionKind, type InterventionRequest, type InterventionStatus,
+  type InterventionAnswer, type InterventionKind, type InterventionRequest, type InterventionStatus,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
-  type TaskAssignedEvent, type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
+  type TaskAssignedEvent, type TaskInterventionAnsweredEvent, type TaskInterventionEvent,
+  type TaskProgressEvent, type TaskRecord,
   type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
@@ -301,6 +302,45 @@ function parseIntervention(raw: unknown): InterventionRequest | null {
   return out;
 }
 
+/** 干预答复校验（1.11.0 task.answer 干预分支，spec §8.2）：answer 段白名单重建
+ *  （decision 二枚举 / text 1..512 / selected 各项 1..128 / completed 布尔），未知
+ *  字段剥除；顶层 decision 兼容映射（旧客户端只懂顶层字段）——answer.decision
+ *  缺失且顶层在场时映射进段内。映射后至少一项在场，全空返 null（空答复对任何
+ *  kind 都无意义 → bad_request）。组合不校验（协议口径：消费端 agent 按 kind 解释，
+ *  宽松容忍）。 */
+function parseInterventionAnswer(payload: Record<string, unknown>): InterventionAnswer | null {
+  let answer: InterventionAnswer = {};
+  if (payload.answer !== undefined) {
+    if (!isRecord(payload.answer)) return null;
+    const a = payload.answer;
+    if (a.decision !== undefined) {
+      if (a.decision !== 'approve' && a.decision !== 'deny') return null;
+      answer.decision = a.decision;
+    }
+    if (a.text !== undefined) {
+      const text = optBoundedStr(a.text, ANSWER_MESSAGE_MAX);
+      if (text === null) return null;
+      answer.text = text;
+    }
+    if (a.selected !== undefined) {
+      if (!Array.isArray(a.selected)
+        || !a.selected.every((s) => typeof s === 'string' && s.length > 0 && s.length <= OPTION_STR_MAX)) return null;
+      answer.selected = [...a.selected];
+    }
+    if (a.completed !== undefined) {
+      if (typeof a.completed !== 'boolean') return null;
+      answer.completed = a.completed;
+    }
+  }
+  if (answer.decision === undefined && payload.decision !== undefined) {
+    if (payload.decision !== 'approve' && payload.decision !== 'deny') return null;
+    answer = { ...answer, decision: payload.decision };
+  }
+  if (answer.decision === undefined && answer.text === undefined
+    && answer.selected === undefined && answer.completed === undefined) return null;
+  return answer;
+}
+
 // ────────────────────────────────────────────────────────────────────────────
 // 账本行
 // ────────────────────────────────────────────────────────────────────────────
@@ -540,10 +580,19 @@ export class DelegationRouter {
    * 定向转发 task.answer req（per-forward 超时可注入）→ worker res ok 则写决策四列
    * （状态不动——waiting↔running 单由 worker 上报驱动）+ 审计 + task.answered 定向
    * leader。重复 answer 不拒：worker 无 pending 自报 stale，决策列记最新。
+   *
+   * 1.11.0 结构化答复分流（spec §8.2/§8.6）：载荷带 interventionId → 走
+   * answerIntervention 干预分支（守卫层对干预载荷放行——见 groups.ts 提取器注），
+   * 不进本链；interventionId 在场但非法同样在分支内拒 bad_request——不静默回落
+   * 旧路径（decision 语义两分支不同，半套受理比报错更糟）。缺席 → 下方旧
+   * approve/deny 写授权链逐行不动（1.10 兼容，回归锁）。
    */
   async handleAnswer(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
     const taskId = reqStr(payload, 'taskId');
     if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+    if (isRecord(payload) && payload.interventionId !== undefined) {
+      return this.answerIntervention(ctx, taskId, payload);
+    }
     const decision = isRecord(payload) ? payload.decision : undefined;
     if (decision !== 'approve' && decision !== 'deny') {
       return { ok: false, error: err('bad_request', 'decision 非法（approve|deny）') };
@@ -596,6 +645,101 @@ export class DelegationRouter {
       payload: { taskId, decision, by: ctx.nodeId, disposition } satisfies TaskAnsweredEvent,
     });
     return { ok: true, payload: { disposition } };
+  }
+
+  /**
+   * task.answer 干预分支（1.11.0 结构化答复，spec 2026-11-13 §8.2/§8.6——载荷带
+   * interventionId 时 handleAnswer 分流至此，守卫层放行、权威校验在本方法）。
+   * 答复权双通道（hub 是授权权威，身份取自信封鉴权 ctx.nodeId 不信任载荷自报）：
+   * 发起方代答（by_node_id）仅 lf 组——peer 组仅执行节点所有者可答 →
+   * forbidden_responder；target worker 本地答回传两模式均放行；其余节点 forbidden。
+   * 流程：载荷解析（answer 白名单重建 + 顶层 decision 兼容映射，映射后全空 →
+   * bad_request）→ 任务存在 + 账本非终态（pending/running/waiting/interrupted 允许，
+   * 终态与 submitted → conflict——run 已收口无在途人工请求，同 intervene 口径）→
+   * 干预行定位（不存在 intervention_not_found / 跨任务归属 conflict / 非 pending
+   * intervention_stale 预检）→ 权威校验 → first_wins 原子落行（UPDATE 带
+   * status='pending' 条件，changes=0 即竞态落败 → intervention_stale——双答竞态的
+   * 正解，预检与写入之间的真竞态窗口在此收敛）→ 账本 waiting→running
+   * （canTransition 守卫；非 waiting 不动——peer 草稿 pending、在途 running 均原地）
+   * → 对端事件 task.interventionAnswered 定向「另一侧」（答方=发起方 → 发执行
+   * 节点；答方=执行节点 → 发发起方）；peer 组不发（§8.6 平行组两干预事件均不
+   * 转发，answer 载荷含 interventionId 与答复内容——泄漏存在性即泄漏请求本身）。
+   * 设计差异点（与旧代答链刻意相反）：不做 worker 在线检查与转发挂起——干预
+   * 答复落 hub 行即事实，对端离线容忍，重连经 task.interventions 拉取对账收敛
+   * （H7）；旧链 node_offline/answer_timeout 语义不适用。res：{ disposition:
+   * 'answered' }。
+   */
+  private async answerIntervention(
+    ctx: GroupHandlerContext,
+    taskId: string,
+    payload: Record<string, unknown>,
+  ): Promise<RpcOutcome> {
+    const interventionId = optBoundedStr(payload.interventionId, INTERVENTION_ID_MAX);
+    if (interventionId === null) {
+      return { ok: false, error: err('bad_request', `interventionId 非法（1-${INTERVENTION_ID_MAX} 字符）`) };
+    }
+    const answer = parseInterventionAnswer(payload);
+    if (answer === null) {
+      return { ok: false, error: err('bad_request', 'answer 非法（decision approve|deny / text 1-512 / selected 各项 1-128 / completed 布尔；顶层 decision 可映射，至少一项非空）') };
+    }
+
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (row.status !== 'pending' && row.status !== 'running' && row.status !== 'waiting'
+      && row.status !== 'interrupted') {
+      return { ok: false, error: err('conflict', `任务当前状态为 ${row.status}，不可答复干预`) };
+    }
+
+    const iv = this.db.prepare('SELECT delegation_id, status FROM delegation_interventions WHERE id = ?')
+      .get(interventionId) as { delegation_id: string; status: InterventionStatus } | undefined;
+    if (iv === undefined) {
+      return { ok: false, error: err('intervention_not_found', '干预请求不存在') };
+    }
+    if (iv.delegation_id !== taskId) {
+      return { ok: false, error: err('conflict', 'interventionId 已归属其他任务，不可跨任务答复') };
+    }
+    if (iv.status !== 'pending') {
+      return { ok: false, error: err('intervention_stale', `干预请求已处于 ${iv.status} 态，不可重复答复`) };
+    }
+
+    const groupMode = (this.db.prepare('SELECT mode FROM groups WHERE id = ?').get(row.group_id) as
+      | { mode: 'leader-follower' | 'peer' }
+      | undefined)?.mode ?? 'leader-follower';
+    if (ctx.nodeId === row.by_node_id) {
+      if (groupMode === 'peer') {
+        return { ok: false, error: err('forbidden_responder', '平行组仅执行节点所有者可答复干预') };
+      }
+    } else if (ctx.nodeId !== row.target_node_id) {
+      return { ok: false, error: err('forbidden', '仅委派发起方或执行节点可答复干预') };
+    }
+
+    const now = Date.now();
+    let first = false;
+    this.db.transaction(() => {
+      const res = this.db.prepare(`UPDATE delegation_interventions
+        SET status = 'answered', answer_json = ?, answered_by = ?, answered_at = ?, updated_at = ?
+        WHERE id = ? AND status = 'pending'`)
+        .run(JSON.stringify(answer), ctx.nodeId, now, now, interventionId);
+      first = res.changes === 1;
+      if (first && row.status === 'waiting' && canTransition(row.status, 'running')) {
+        this.db.prepare("UPDATE delegations SET status = 'running', updated_at = ? WHERE task_id = ?")
+          .run(now, taskId);
+      }
+    })();
+    if (!first) {
+      return { ok: false, error: err('intervention_stale', '干预请求已被先答（first_wins），本次答复未生效') };
+    }
+    logger.info('干预已答复', { taskId, interventionId, byNode: ctx.nodeId, ledgerFrom: row.status });
+
+    if (groupMode === 'leader-follower') {
+      const peerNodeId = ctx.nodeId === row.by_node_id ? row.target_node_id : row.by_node_id;
+      const sent = await this.registry.sendTo(peerNodeId, {
+        v: 1, kind: 'evt', method: EVT.taskInterventionAnswered,
+        payload: { taskId, interventionId, answer, answeredBy: ctx.nodeId } satisfies TaskInterventionAnsweredEvent,
+      });
+      if (sent === 'offline') logger.info('干预答复通知未送达（对端离线）', { taskId, interventionId });
+    }
+    return { ok: true, payload: { disposition: 'answered' } };
   }
 
   /** 定向转发代答并挂起等待 worker res：req 信封 task.answer + 新 id；sendTo 判

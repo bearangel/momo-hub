@@ -1260,15 +1260,34 @@ export class DelegationRouter {
 
     // 1.11.0 submitted 分支（spec 2026-11-13 §8.2）：run 完成待验收——canTransition
     // 已单点放行（合法源态仅 running|waiting；pending/interrupted/终态报 submitted
-    // 在上方被拒，重复 submitted 落 to===row.status 幂等忽略）。submitted_at +
-    // run_no 落账（载荷 runNo 缺省沿用行值——1.10 上报形态零变化；session_id 不
-    // 回填：submitted 是 run 收口拍，会话在 running 拍已建立）。task.submitted 定向
-    // 发起方 by_node_id——peer 组照发（spec §3 裁定 #9：提交/验收跨节点，仅人工
-    // 请求内容不转发）；发起方离线容忍（账本已是事实，重连经 task.list /
-    // task.interventions 对账收敛，H7）。
+    // 在上方被拒，重复 submitted 落 to===row.status 幂等忽略）。终审 F2 版本门
+    // （handleIntervene 同款 registry.get + minorOf 模式）：发起方在线且 minor ≥
+    // TASK_HITL_REQUIRED_MINOR 才走两段式——否则（离线/未知/<1.11）自动验收降级。
+    // 根因：旧发起方读不懂 task.submitted 且无验收入口（task.accept 被方法门槛拒），
+    // 两段式落账 submitted 即永久挂起；离线 origin 同降级（重连也无法验收，防挂起
+    // 优先）。1.10 零变化：submitted 在 1.10 不存在。
     if (to === 'submitted') {
       const runNo = report.runNo ?? row.run_no ?? 1;
       const now = Date.now();
+      const originConn = this.registry.get(row.by_node_id);
+      const originMinor = originConn !== undefined ? minorOf(originConn.peerProtoVer) : null;
+      if (originMinor === null || originMinor < TASK_HITL_REQUIRED_MINOR) {
+        // 降级 = 提交事实照落（run_no/submitted_at 对账口径不变）+ 即时验收
+        // （accepted_at）：origin 收既有 task.completed（done 终态转发同款，1.10
+        // 读得懂），worker 收 task.accepted（runNo 照常透传，worker 收尾语义不受影响）。
+        this.db.prepare("UPDATE delegations SET status = 'done', submitted_at = ?, accepted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ?")
+          .run(now, now, runNo, now, row.task_id);
+        logger.info('发起方 <1.11，submitted 自动验收降级', { taskId: row.task_id, byNode: row.by_node_id, runNo });
+        void this.registry.sendTo(row.by_node_id, {
+          v: 1, kind: 'evt', method: EVT.taskCompleted,
+          payload: { taskId: row.task_id } satisfies TaskTerminalEvent,
+        });
+        void this.registry.sendTo(row.target_node_id, {
+          v: 1, kind: 'evt', method: EVT.taskAccepted,
+          payload: { taskId: row.task_id, runNo } satisfies TaskAcceptedEvent,
+        });
+        return;
+      }
       this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ?")
         .run(now, runNo, now, row.task_id);
       logger.info('委派状态迁移', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });

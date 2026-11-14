@@ -23,6 +23,9 @@
 // submitted 态运行拍守卫（E2E 实录）：submitted 后 worker running 拍整拍忽略
 // （账本粘滞，仅 task.reject RPC 有权回 running）+ reject 后 running 拍照常幂等
 // 转发的回归锁。
+// 终审 F2（submitted × 发起方版本门）：worker 报 submitted 时发起方离线/未知/
+// <1.11 → 自动验收降级（账本直落 done + accepted_at，origin 收既有 task.completed，
+// worker 收 task.accepted）——混版本舰队防挂起；origin 1.11 在线两段式照常。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1224,7 +1227,7 @@ describe('task.interventions 投影完整性', () => {
 });
 
 describe('断线重连对账（origin 离线期间 worker 干预+自答+提交）', () => {
-  it('origin 断线：worker intervene（事件 tolerate）→ 自答 → report submitted → origin 重连拉 task.interventions 见 answered 行 + task.list 见 submitted；无重复行、状态收敛', async () => {
+  it('origin 断线：worker intervene（事件 tolerate）→ 自答 → report submitted（终审 F2 离线降级直落 done）→ origin 重连拉 task.interventions 见 answered 行 + task.list 见 done；无重复行、状态收敛', async () => {
     const { leader, target, groupId } = await setupGroup('ivre');
     const taskId = await runningTask(leader, target, groupId, 'ivre');
     const ivId = 'iv-recon-1';
@@ -1245,10 +1248,11 @@ describe('断线重连对账（origin 离线期间 worker 干预+自答+提交�
     expect(resPayload(ans)).toEqual({ disposition: 'answered' });
     expect(interventionRow(ivId)).toMatchObject({ status: 'answered', answered_by: target.nodeId });
 
-    // worker 提交（task.submitted 事件 tolerate）
+    // worker 提交（origin 离线 → 终审 F2 自动验收降级：账本直落 done，重连无悬挂）
     report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '{"summary":"离线期间已交付"}' });
-    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'submitted'; i++) await settle(20);
-    expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1 });
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'done'; i++) await settle(20);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
+    expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
 
     // origin 重连（同身份复用 deviceToken——nodeId 不变保两端权限）
     const origin = await openSocket({ nodeId: leader.nodeId, deviceToken: leader.deviceToken }, 'ivre-leader');
@@ -1268,13 +1272,72 @@ describe('断线重连对账（origin 离线期间 worker 干预+自答+提交�
     expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
       .get(taskId) as { n: number }).n).toBe(1);
 
-    // task.list 收敛：origin 看到任务 submitted（含 runNo/submittedAt 投影）
+    // task.list 收敛：origin 看到任务 done（降级自动验收——runNo/acceptedAt 投影）
     const list = await callRpc(origin, RPC.task.list, { groupId });
-    const rec = (resPayload(list) as { tasks: Array<{ taskId: string; status: string; runNo?: number; submittedAt?: number }> })
+    const rec = (resPayload(list) as { tasks: Array<{ taskId: string; status: string; runNo?: number; acceptedAt?: number }> })
       .tasks.find((t) => t.taskId === taskId);
-    expect(rec).toMatchObject({ status: 'submitted', runNo: 1 });
-    expect(rec?.submittedAt).not.toBeUndefined();
+    expect(rec).toMatchObject({ status: 'done', runNo: 1 });
+    expect(rec?.acceptedAt).not.toBeUndefined();
     origin.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 终审 F2：submitted × 发起方版本门（混版本舰队防挂起）——两段式 submitted 仅对
+// 在线且 ≥1.11 发起方生效；离线/未知/<1.11 一律自动验收降级（账本直落 done +
+// accepted_at，origin 收既有 task.completed，worker 收 task.accepted）。
+// 回归（origin 1.11 在线 → task.submitted 照常）：上方「task.report submitted
+// 全链（H7）」「task.accept 全链」各用例即证——发起方默认 PROTOCOL_VERSION
+// 1.11.0 在线，版本门对其零干扰。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('submitted × 发起方版本门：自动验收降级（终审 F2）', () => {
+  it('origin 1.10 在线：worker 报 submitted → 账本直接 done + accepted_at 落列 + origin 收 task.completed（非 task.submitted）+ worker 收 task.accepted {runNo}', async () => {
+    const leader = await connect('f2o-leader', '1.10.0');
+    const target = await connect('f2o-target');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-f2o' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    const taskId = await runningTask(leader, target, groupId, 'f2o');
+    const before = Date.now();
+    report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '{"summary":"修复完成"}' });
+
+    // origin 收既有 task.completed（1.10 读得懂的 done 终态事件），永不收 task.submitted
+    const done = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskCompleted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(done.payload).toEqual({ taskId });
+    // worker 收 task.accepted（runNo 照常透传——worker 收尾语义不受降级影响）
+    const acc = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAccepted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((acc.payload as { runNo: number }).runNo).toBe(1);
+    // 账本直落终态：done + accepted_at（防挂起——旧发起方无验收入口）
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'done'; i++) await settle(20);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
+    expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
+    expect(ledgerRow(taskId)!.accepted_at!).toBeGreaterThanOrEqual(before);
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('origin 离线：同款降级——账本 done + accepted_at（重连也无法验收，防挂起优先）+ worker 收 task.accepted', async () => {
+    const { leader, target, groupId } = await setupGroup('f2off');
+    const taskId = await runningTask(leader, target, groupId, 'f2off');
+    leader.ws.close();
+    await settle();
+
+    report(target.ws, taskId, { status: 'submitted', runNo: 1 });
+    const acc = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAccepted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((acc.payload as { runNo: number }).runNo).toBe(1);
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'done'; i++) await settle(20);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
+    expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
+    target.ws.close();
   });
 });
 
@@ -1334,7 +1397,7 @@ describe('干预链版本门：1.10 worker 调四新 RPC（H8）', () => {
 });
 
 describe('干预链版本门：1.10 origin 事件矩阵（H8）', () => {
-  it('intervene 只见中性进度（H4 已锁）；task.submitted 照发（hub 对 by_node_id 无版本门，旧客户端未知 EVT 静默忽略——照发无害）；accept/reject 调用即拒，accepted/rejected 事件无从产生', async () => {
+  it('intervene 只见中性进度（H4 已锁）；submitted 自动验收降级（终审 F2：1.10 origin 收 task.completed 非 task.submitted，账本直落 done）；accept/reject 调用即拒，accepted/rejected 事件无从产生', async () => {
     const leader = await connect('vgo-leader', '1.10.0');
     const target = await connect('vgo-target');
     const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-vgo' });
@@ -1354,16 +1417,13 @@ describe('干预链版本门：1.10 origin 事件矩阵（H8）', () => {
       && (e.payload as { taskId: string }).taskId === taskId
       && (e.payload as { excerpt: string }).excerpt === '执行方等待人工处理');
 
-    // worker 提交：task.submitted 定向 by_node_id 无 origin 版本门 → 1.10 origin
-    // 照收（A2 裁定：旧客户端 onEvent 纯 if 链对未知 EVT 方法静默跳过、不断连
-    // 不报错，envelope parseEnvelope 亦容忍未知方法——照发无害，不降级）
+    // worker 提交：终审 F2 版本门——1.10 origin 自动验收降级，收既有 task.completed
+    // （非 task.submitted），账本直落 done（混版本舰队防挂起）
     report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '{"summary":"修复完成"}' });
-    const sub = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskCompleted
       && (e.payload as { taskId: string }).taskId === taskId);
-    expect((sub.payload as { runNo: number }).runNo).toBe(1);
-    expect((sub.payload as { deliverable: { summary: string } }).deliverable).toEqual({ summary: '修复完成' });
-    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'submitted'; i++) await settle(20);
-    expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1 });
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'done'; i++) await settle(20);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
 
     // 事件矩阵：intervention（hub 有 origin 版本门）与 accepted/rejected（定向
     // worker 且 1.10 origin 调不了 accept/reject）三新事件零到达

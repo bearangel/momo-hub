@@ -1226,3 +1226,165 @@ describe('断线重连对账（origin 离线期间 worker 干预+自答+提交�
     origin.ws.close(); target.ws.close();
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// H8：干预链版本门三态矩阵（spec 2026-11-13 §8.5——1.10/1.11 混编降级语义）
+// 三态之三（1.11 双端全通）不另立用例：本文件 lf 全链 / answer / accept /
+// reject / interventions 各 describe 即证（如「task.intervene lf 全链」
+// 「task.accept 全链」）——版本门对 1.11 双端零干扰。
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('干预链版本门：1.10 worker 调四新 RPC（H8）', () => {
+  it('整包拒 unsupported_method{method, requiredMinor:11}（METHOD_REQUIRED_MINOR 门槛先于 handler）+ 账本/interventions 行零变化', async () => {
+    const leader = await connect('vgw-leader');
+    const target = await connect('vgw-old-target', '1.10.0');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-vgw' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    // 1.10 worker 正常接单（task.assigned 老事件；task.report 走 res 通道不受
+    // req 分发门槛影响——委派链路对 1.10 执行节点照常可用）
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-vgw' }));
+    await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAssigned
+      && (e.payload as { taskId: string }).taskId === taskId);
+    report(target.ws, taskId, { status: 'running', sessionId: 'sess-vgw', progress: { lastSeq: 1, excerpt: '开跑' } });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { lastSeq: number }).lastSeq === 1);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+
+    const calls: Array<{ name: string; method: string; payload: Record<string, unknown> }> = [
+      { name: RPC.task.intervene, method: RPC.task.intervene, payload: { taskId, intervention: intervention({ interventionId: 'iv-vgw-1' }) } },
+      { name: RPC.task.accept, method: RPC.task.accept, payload: { taskId } },
+      { name: RPC.task.reject, method: RPC.task.reject, payload: { taskId, reason: '低版本节点打回' } },
+      { name: RPC.task.interventions, method: RPC.task.interventions, payload: { taskId } },
+    ];
+    for (const c of calls) {
+      const res = await callRpc(target, c.method, c.payload);
+      const error = errOf(res);
+      expect(error.code, `用例：${c.name}`).toBe('unsupported_method');
+      expect(error.message, `用例：${c.name}`).toContain('hub=1.11.0');
+      expect(error.message, `用例：${c.name}`).toContain('节点=1.10.0');
+      expect(error.message, `用例：${c.name}`).toContain('需要协议 1.11');
+      expect(resPayload(res).method, `用例：${c.name}`).toBe(c.name);
+      expect(resPayload(res).requiredMinor, `用例：${c.name}`).toBe(11);
+    }
+
+    // 门槛先于 handler：账本停在 running（无 submitted/验收迁移）、干预行零落
+    await settle();
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', run_no: null, submitted_at: null, accepted_at: null });
+    expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
+      .get(taskId) as { n: number }).n).toBe(0);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('干预链版本门：1.10 origin 事件矩阵（H8）', () => {
+  it('intervene 只见中性进度（H4 已锁）；task.submitted 照发（hub 对 by_node_id 无版本门，旧客户端未知 EVT 静默忽略——照发无害）；accept/reject 调用即拒，accepted/rejected 事件无从产生', async () => {
+    const leader = await connect('vgo-leader', '1.10.0');
+    const target = await connect('vgo-target');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-vgo' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const invited = await callRpc(leader, RPC.group.invite, { groupId });
+    await callRpc(target, RPC.group.join, { inviteCode: (resPayload(invited) as { inviteCode: string }).inviteCode });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string }).nodeId === target.nodeId);
+
+    const taskId = await runningTask(leader, target, groupId, 'vgo');
+    const res = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ interventionId: 'iv-vgo-1', title: '低版本发起方不该看到', prompt: '低版本正文不该看到' }),
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    // 发起方低版本降级中性进度（H4 测试 7 同款语义——此处作链路同步点）
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
+      && (e.payload as { taskId: string }).taskId === taskId
+      && (e.payload as { excerpt: string }).excerpt === '执行方等待人工处理');
+
+    // worker 提交：task.submitted 定向 by_node_id 无 origin 版本门 → 1.10 origin
+    // 照收（A2 裁定：旧客户端 onEvent 纯 if 链对未知 EVT 方法静默跳过、不断连
+    // 不报错，envelope parseEnvelope 亦容忍未知方法——照发无害，不降级）
+    report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '{"summary":"修复完成"}' });
+    const sub = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((sub.payload as { runNo: number }).runNo).toBe(1);
+    expect((sub.payload as { deliverable: { summary: string } }).deliverable).toEqual({ summary: '修复完成' });
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'submitted'; i++) await settle(20);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1 });
+
+    // 事件矩阵：intervention（hub 有 origin 版本门）与 accepted/rejected（定向
+    // worker 且 1.10 origin 调不了 accept/reject）三新事件零到达
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskIntervention)).toHaveLength(0);
+    expect(leader.inbox.filter((e) => e.kind === 'evt'
+      && (e.method === EVT.taskAccepted || e.method === EVT.taskRejected))).toHaveLength(0);
+    expect(JSON.stringify(leader.inbox)).not.toContain('低版本发起方不该看到');
+
+    // 1.10 origin 调 accept/reject：门槛先于 handler 拒——accepted/rejected 无从产生
+    const deniedAccept = await callRpc(leader, RPC.task.accept, { taskId });
+    expect(errOf(deniedAccept).code).toBe('unsupported_method');
+    expect(resPayload(deniedAccept)).toMatchObject({ method: RPC.task.accept, requiredMinor: 11 });
+    const deniedReject = await callRpc(leader, RPC.task.reject, { taskId, reason: '低版本发起方' });
+    expect(errOf(deniedReject).code).toBe('unsupported_method');
+    expect(resPayload(deniedReject)).toMatchObject({ method: RPC.task.reject, requiredMinor: 11 });
+
+    // 照发无害的 hub 侧证据：收到未知 EVT 后连接照常可用（1.10 节点旧方法不受门槛影响）
+    const list = await callRpc(leader, RPC.task.list, { groupId });
+    expect(list.kind === 'res' && list.ok).toBe(true);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// H5 遗留补强（H8，ledger 已记）：answer 离线容忍分支 + intervene interrupted 放行
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.answer 离线容忍补强（H5 遗留）', () => {
+  it('worker 断线（waiting 被 MC5 收割 interrupted）后 by 答复仍成功：行 answered + 对端事件 sent=offline 仅记日志 + 账本保持 interrupted（waiting→running 守卫不越权迁移）', async () => {
+    const { leader, target, groupId } = await setupGroup('ansoff');
+    const taskId = await waitingIntervention(leader, target, groupId, 'ansoff', 'iv-ans-off1');
+
+    target.ws.close();
+    // MC5 收割：waiting → interrupted + leader 收 task.interrupted（真实路径驱动，非 SQL 预置）
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskInterrupted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+
+    // by 答复（answerIntervention 允许 interrupted）：落行即事实，对端离线 tolerate
+    const res = await callRpc(leader, RPC.task.answer, {
+      taskId, interventionId: 'iv-ans-off1', answer: { decision: 'approve' },
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ disposition: 'answered' });
+    expect(interventionRow('iv-ans-off1')).toMatchObject({ status: 'answered', answered_by: leader.nodeId });
+    expect(interventionRow('iv-ans-off1')?.answered_at).not.toBeNull();
+    // 账本守卫不动：interrupted 非 waiting，答复不迁移（恢复走 worker 重连续传上报）
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+    leader.ws.close();
+  });
+});
+
+describe('task.intervene interrupted 态放行（H5 遗留）', () => {
+  it('账本 interrupted（SQL 预置）：intervene res ok + 行 pending 落行 + 账本守卫不动（interrupted→waiting 非法边）+ 发起方照收 task.intervention', async () => {
+    const { leader, target, groupId } = await setupGroup('ivint');
+    const taskId = await runningTask(leader, target, groupId, 'ivint');
+    db.prepare("UPDATE delegations SET status = 'interrupted', updated_at = ? WHERE task_id = ?")
+      .run(Date.now(), taskId);
+
+    const res = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ interventionId: 'iv-int-1' }),
+    });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ interventionId: 'iv-int-1' });
+    expect(interventionRow('iv-int-1')).toMatchObject({ delegation_id: taskId, status: 'pending' });
+    // 账本守卫不动：§8.1 迁移表 interrupted→waiting 无此边，不越权推 waiting
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskIntervention
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((evt.payload as { intervention: { interventionId: string } }).intervention.interventionId).toBe('iv-int-1');
+    leader.ws.close(); target.ws.close();
+  });
+});

@@ -8,6 +8,11 @@
 // task.answer 结构化答复分支（H5，spec §8.2/§8.6）：发起方代答（approve + 结构化）/
 // worker 本地答回传（顶层 decision 兼容映射）/ first_wins 双答竞态 / peer 越权
 // forbidden_responder + target 放行 / 四错误态 / 账本非 waiting 不动。
+// task.accept / task.reject（H6，spec §8.1/§8.2）：发起方验收闭环——submitted→done
+// （accepted_at）+ task.accepted 定向 worker / submitted→running（run_no+1 打回新
+// run，submitted_at 保留历史）+ task.rejected（reason）；错误态（not_submitted 幂等
+// 拒 / reason 空白 bad_request / 非 by_node_id forbidden / ghost not_found）；peer
+// 与 lf 两模式发起方权威（peer 发起方=by_node_id 非组长）；离线容忍（事件 tolerate）。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -117,6 +122,7 @@ async function setupPeerGroup(pref: string): Promise<{ a: Client; b: Client; gro
 interface LedgerRow {
   task_id: string; status: DelegationStatus; session_id: string | null;
   created_at: number; updated_at: number;
+  run_no: number | null; submitted_at: number | null; accepted_at: number | null;
 }
 
 function ledgerRow(taskId: string): LedgerRow | undefined {
@@ -666,5 +672,196 @@ describe('task.answer 干预分支错误态', () => {
     expect(interventionRow('iv-ans-r1')?.status).toBe('answered');
     expect(ledgerRow(taskId)?.status).toBe('running');
     leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// task.accept / task.reject（H6，spec 2026-11-13 §8.1/§8.2——发起方验收闭环）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 直查 SQL 预置 submitted 态：worker report 的 submitted 解析 H7 才接通，本文件
+ *  用例绕过上报路径直改账本（干预 answered 预置同纪律）；H7 落地后保留 SQL 预置
+ *  亦成立——accept/reject 的行为锁只依赖账本起点态，不依赖进入路径。 */
+function driveToSubmitted(taskId: string, runNo = 1): void {
+  const now = Date.now();
+  db.prepare(`UPDATE delegations
+    SET status = 'submitted', run_no = ?, submitted_at = ?, updated_at = ? WHERE task_id = ?`)
+    .run(runNo, now, now, taskId);
+}
+
+describe('task.accept 全链', () => {
+  it('submitted 态 accept：res {runNo} + 账本 done + accepted_at 落列 + worker 收 task.accepted {taskId, runNo}；发起方自身不收事件', async () => {
+    const { leader, target, groupId } = await setupGroup('acclf');
+    const taskId = await runningTask(leader, target, groupId, 'acclf');
+    driveToSubmitted(taskId);
+
+    const res = await callRpc(leader, RPC.task.accept, { taskId });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ runNo: 1 });
+
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskAccepted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, runNo: 1 });
+
+    const row = ledgerRow(taskId);
+    expect(row?.status).toBe('done');
+    expect(row?.accepted_at).not.toBeNull();
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskAccepted)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.reject 全链', () => {
+  it('submitted(run_no=1) reject：res {runNo:2} + 账本 running + run_no=2 + submitted_at 保留 + accepted_at 仍空 + worker 收 task.rejected {taskId, runNo:2, reason}', async () => {
+    const { leader, target, groupId } = await setupGroup('rjlf');
+    const taskId = await runningTask(leader, target, groupId, 'rjlf');
+    driveToSubmitted(taskId, 1);
+
+    const res = await callRpc(leader, RPC.task.reject, { taskId, reason: '边界条件未覆盖，请补充空输入用例' });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ runNo: 2 });
+
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskRejected
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, runNo: 2, reason: '边界条件未覆盖，请补充空输入用例' });
+
+    const row = ledgerRow(taskId);
+    expect(row?.status).toBe('running');
+    expect(row?.run_no).toBe(2);
+    expect(row?.submitted_at).not.toBeNull();
+    expect(row?.accepted_at).toBeNull();
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskRejected)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.accept / task.reject 错误态', () => {
+  it('非 submitted（running）accept / reject → not_submitted，账本不动', async () => {
+    const { leader, target, groupId } = await setupGroup('acrun');
+    const taskId = await runningTask(leader, target, groupId, 'acrun');
+    expect(ledgerRow(taskId)?.status).toBe('running');
+
+    expect(errOf(await callRpc(leader, RPC.task.accept, { taskId })).code).toBe('not_submitted');
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId, reason: '打回' })).code).toBe('not_submitted');
+    await settle();
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'running', run_no: null, accepted_at: null });
+    expect(target.inbox.filter((e) => e.kind === 'evt'
+      && (e.method === EVT.taskAccepted || e.method === EVT.taskRejected))).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('done 后再 accept → not_submitted（幂等拒绝）；打回后的 running 再 reject → not_submitted', async () => {
+    const { leader, target, groupId } = await setupGroup('acidem');
+    const taskId = await runningTask(leader, target, groupId, 'acidem');
+    driveToSubmitted(taskId);
+    await callRpc(leader, RPC.task.accept, { taskId });
+    expect(ledgerRow(taskId)?.status).toBe('done');
+    expect(errOf(await callRpc(leader, RPC.task.accept, { taskId })).code).toBe('not_submitted');
+
+    const task2 = await runningTask(leader, target, groupId, 'acidem2');
+    driveToSubmitted(task2);
+    await callRpc(leader, RPC.task.reject, { taskId: task2, reason: '返工' });
+    expect(ledgerRow(task2)).toMatchObject({ status: 'running', run_no: 2 });
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId: task2, reason: '再打回' })).code).toBe('not_submitted');
+    expect(errOf(await callRpc(leader, RPC.task.accept, { taskId: task2 })).code).toBe('not_submitted');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('reason 缺失 / 空串 / 纯空白 → bad_request；缺 taskId → bad_request；ghost taskId → not_found', async () => {
+    const { leader, target, groupId } = await setupGroup('acbad');
+    const taskId = await runningTask(leader, target, groupId, 'acbad');
+    driveToSubmitted(taskId);
+
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId, reason: '' })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId, reason: '   ' })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.accept, {})).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.reject, {})).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.accept, { taskId: 'no-such-task' })).code).toBe('not_found');
+    expect(errOf(await callRpc(leader, RPC.task.reject, { taskId: 'no-such-task', reason: 'r' })).code).toBe('not_found');
+    await settle();
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', accepted_at: null });
+    expect(target.inbox.filter((e) => e.kind === 'evt'
+      && (e.method === EVT.taskAccepted || e.method === EVT.taskRejected))).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('非发起方（第三方 join 组成员）accept / reject → forbidden，账本不动', async () => {
+    const { leader, target, groupId } = await setupGroup('ac3rd');
+    const taskId = await runningTask(leader, target, groupId, 'ac3rd');
+    driveToSubmitted(taskId);
+    const third = await connect('ac3rd-bystander');
+    await callRpc(third, RPC.group.join, { inviteCode: (resPayload(await callRpc(leader, RPC.group.invite, { groupId })) as { inviteCode: string }).inviteCode });
+
+    expect(errOf(await callRpc(third, RPC.task.accept, { taskId })).code).toBe('forbidden');
+    expect(errOf(await callRpc(third, RPC.task.reject, { taskId, reason: '越权打回' })).code).toBe('forbidden');
+    await settle();
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', accepted_at: null });
+    expect(target.inbox.filter((e) => e.kind === 'evt'
+      && (e.method === EVT.taskAccepted || e.method === EVT.taskRejected))).toHaveLength(0);
+    leader.ws.close(); target.ws.close(); third.ws.close();
+  });
+
+  it('执行节点（target）非发起方 → forbidden', async () => {
+    const { leader, target, groupId } = await setupGroup('acsrc');
+    const taskId = await runningTask(leader, target, groupId, 'acsrc');
+    driveToSubmitted(taskId);
+    expect(errOf(await callRpc(target, RPC.task.accept, { taskId })).code).toBe('forbidden');
+    expect(ledgerRow(taskId)?.status).toBe('submitted');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.accept / task.reject 两模式发起方权威', () => {
+  it('peer 组非组长成员（by_node_id）委派草稿并 accept：正常受理（锁死不入 LEADER_ONLY_METHODS 的裁定）+ worker 收 task.accepted', async () => {
+    const { a, b, groupId } = await setupPeerGroup('acpeer');
+    // b（普通成员，非组长 leader_node_id=a）作为发起方委派草稿给 a（建组已绑定承接空间）
+    const taskId = await delegateOk(b, delegateReq(groupId, a.nodeId, {
+      workspaceName: 'ws-acpeer', title: '评估迁移方案', prompt: '请评估并给出结论', draft: true,
+    }));
+    driveToSubmitted(taskId);
+
+    const res = await callRpc(b, RPC.task.accept, { taskId });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ runNo: 1 });
+
+    const evt = await a.next((e) => e.kind === 'evt' && e.method === EVT.taskAccepted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, runNo: 1 });
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
+    expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
+
+    // 同链打回方向：b 对新 submitted 任务 reject 正常（peer 提交/验收三事件照发，§8.6 仅干预两事件不发）
+    const task2 = await delegateOk(b, delegateReq(groupId, a.nodeId, {
+      workspaceName: 'ws-acpeer', title: '复核结论', prompt: '请复核', draft: true,
+    }));
+    driveToSubmitted(task2, 1);
+    const res2 = await callRpc(b, RPC.task.reject, { taskId: task2, reason: '结论缺数据支撑' });
+    expect(resPayload(res2)).toEqual({ runNo: 2 });
+    const evt2 = await a.next((e) => e.kind === 'evt' && e.method === EVT.taskRejected
+      && (e.payload as { taskId: string }).taskId === task2);
+    expect(evt2.payload).toEqual({ taskId: task2, runNo: 2, reason: '结论缺数据支撑' });
+    expect(ledgerRow(task2)).toMatchObject({ status: 'running', run_no: 2 });
+    a.ws.close(); b.ws.close();
+  });
+});
+
+describe('task.accept 离线容忍', () => {
+  it('worker（target）断线后 accept 仍成功：submitted 不被离线迁移收割 + 事件 tolerate + 账本 done', async () => {
+    const { leader, target, groupId } = await setupGroup('acoff');
+    const taskId = await runningTask(leader, target, groupId, 'acoff');
+    driveToSubmitted(taskId);
+    target.ws.close();
+    await settle();
+    // submitted 不在 onNodeOffline 收割清单（pending/running/waiting）——待验收态跨断线存活
+    expect(ledgerRow(taskId)?.status).toBe('submitted');
+
+    const res = await callRpc(leader, RPC.task.accept, { taskId });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(ledgerRow(taskId)).toMatchObject({ status: 'done' });
+    expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
+    leader.ws.close();
   });
 });

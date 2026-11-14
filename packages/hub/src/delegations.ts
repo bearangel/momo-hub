@@ -29,9 +29,9 @@ import {
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
   type InterventionAnswer, type InterventionKind, type InterventionRequest, type InterventionStatus,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
-  type TaskAssignedEvent, type TaskInterventionAnsweredEvent, type TaskInterventionEvent,
-  type TaskProgressEvent, type TaskRecord,
-  type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
+  type TaskAssignedEvent, type TaskAcceptedEvent, type TaskInterventionAnsweredEvent,
+  type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
+  type TaskRejectedEvent, type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
@@ -907,6 +907,90 @@ export class DelegationRouter {
       if (sent === 'offline') logger.info('干预中性进度未送达（发起方离线）', { taskId, interventionId: intervention.interventionId });
     }
     return { ok: true, payload: { interventionId: intervention.interventionId } };
+  }
+
+  /**
+   * task.accept RPC（1.11.0 发起方验收通过，spec 2026-11-13 §8.2——刻意不入
+   * LEADER_ONLY_METHODS，沿 handleIntervene 先例：权威关系是「委派发起方」而非
+   * 「现任组长」——peer 组发起方=by_node_id 未必是 leader_node_id，入表会被
+   * checkGroupRole 的 leader 判定拦死；lf 组若入表则 transfer 后旧发起方（仍
+   * by_node_id）被守卫拦死、submitted 任务无人可验收。权限锚在本 handler 的
+   * 来源校验 ctx.nodeId === by_node_id）。
+   * 流程：载荷校验 → getTask/not_found → 来源 forbidden → 非 submitted →
+   * not_submitted（幂等拒绝：已 done 再 accept 同报此错，leader UI 显真实态，
+   * 与 task.cancel 终态 conflict 同取向——不做幂等 ok）→ 账本 submitted→done
+   * （accepted_at 落账；submitted→done 边在 DELEGATION_TRANSITIONS 由 H3 矩阵
+   * 锁定，submitted-only 状态门即迁移单点的等价收敛）→ 定向 task.accepted 给
+   * worker（runNo 取账本投影，离线容忍——账本已是事实，worker 重连经对账收敛）。
+   * delegation_interventions 无 acceptance 类行（验收为发起方本地请求，spec
+   * §8.1 表注）——无级联操作。res：{ runNo }。
+   */
+  async handleAccept(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
+    const taskId = reqStr(payload, 'taskId');
+    if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (ctx.nodeId !== row.by_node_id) {
+      return { ok: false, error: err('forbidden', '仅委派发起方可验收') };
+    }
+    if (row.status !== 'submitted') {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可验收（已验收不可重复受理）`) };
+    }
+
+    const runNo = row.run_no ?? 1;
+    const now = Date.now();
+    this.db.prepare("UPDATE delegations SET status = 'done', accepted_at = ?, updated_at = ? WHERE task_id = ?")
+      .run(now, now, taskId);
+    logger.info('委派已验收', { taskId, runNo, byNode: ctx.nodeId });
+    const sent = await this.registry.sendTo(row.target_node_id, {
+      v: 1, kind: 'evt', method: EVT.taskAccepted,
+      payload: { taskId, runNo } satisfies TaskAcceptedEvent,
+    });
+    if (sent === 'offline') logger.info('验收通知未送达（目标离线，重连对账收敛）', { taskId });
+    return { ok: true, payload: { runNo } };
+  }
+
+  /**
+   * task.reject RPC（1.11.0 发起方打回，spec 2026-11-13 §8.2——与 handleAccept
+   * 同款不入 LEADER_ONLY_METHODS、by_node_id 单点权威）。与 accept 的差异：
+   * reason 必填非空白（trim 后 1..512，打回理由随事件进 worker agent 上下文）；
+   * 账本 submitted→running + run_no+1（打回起新 run——run_no 单源在 hub，worker
+   * 下次 submitted 上报携带同号对账）；submitted_at 保留历史不清（打回前的提交
+   * 时刻是审计事实），accepted_at 恒 NULL（未验收过）。定向 task.rejected
+   * { taskId, runNo: 新, reason } 给 worker（离线容忍同 accept）。res：{ runNo: 新 }。
+   */
+  async handleReject(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
+    const taskId = reqStr(payload, 'taskId');
+    if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+    const reasonRaw = isRecord(payload) ? payload.reason : undefined;
+    const reason = typeof reasonRaw === 'string' && reasonRaw.trim().length >= 1 && reasonRaw.length <= REASON_MAX
+      ? reasonRaw
+      : null;
+    if (reason === null) {
+      return { ok: false, error: err('bad_request', `reason 非法（非空白 1-${REASON_MAX} 字符）`) };
+    }
+
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (ctx.nodeId !== row.by_node_id) {
+      return { ok: false, error: err('forbidden', '仅委派发起方可打回') };
+    }
+    if (row.status !== 'submitted') {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可打回`) };
+    }
+
+    const newRunNo = (row.run_no ?? 1) + 1;
+    const now = Date.now();
+    this.db.prepare("UPDATE delegations SET status = 'running', run_no = ?, updated_at = ? WHERE task_id = ?")
+      .run(newRunNo, now, taskId);
+    logger.info('委派已打回', { taskId, newRunNo, byNode: ctx.nodeId });
+    const sent = await this.registry.sendTo(row.target_node_id, {
+      v: 1, kind: 'evt', method: EVT.taskRejected,
+      payload: { taskId, runNo: newRunNo, reason } satisfies TaskRejectedEvent,
+    });
+    if (sent === 'offline') logger.info('打回通知未送达（目标离线，重连对账收敛）', { taskId });
+    return { ok: true, payload: { runNo: newRunNo } };
   }
 
   /**

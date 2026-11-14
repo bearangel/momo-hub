@@ -210,6 +210,29 @@ export interface TaskInterveneReq {
  *  后返 interventionId。 */
 export interface TaskInterveneRes { interventionId: string }
 
+/** task.accept 请求（1.11.0，发起方 → hub，门槛 minor 11）：submitted 态验收通过。
+ *  hub 校验来源 = 委派发起方（by_node_id，身份取自信封鉴权）后迁移账本
+ *  submitted→done（accepted_at 落账）并定向 worker task.accepted；非 submitted →
+ *  not_submitted（幂等拒绝——已 done 再 accept 同报此错）；非发起方 → forbidden。
+ *  runNo 单源在 hub 账本（spec §8.2 表内 req 列的 runNo 为发起方展示冗余，hub
+ *  不消费——未知字段容忍，spec 客户端携带不影响受理）。 */
+export interface TaskAcceptReq { taskId: string }
+
+/** task.accept 响应：验收结算的 run 号（账本 run_no 投影，与 task.accepted 事件一致）。 */
+export interface TaskAcceptRes { runNo: number }
+
+/** task.reject 请求（1.11.0，发起方 → hub，门槛 minor 11）：submitted 态打回——
+ *  账本 submitted→running + run_no+1（新 run 号；submitted_at 保留历史不清），
+ *  定向 worker task.rejected（reason 必带，进 agent 上下文）；reason 必填非空白
+ *  （trim 后 ≥1 且 ≤512 字符）。runNo 同 TaskAcceptReq 口径——hub 不消费。 */
+export interface TaskRejectReq {
+  taskId: string;
+  reason: string;
+}
+
+/** task.reject 响应：打回后的新 run 号（与 task.rejected 事件一致）。 */
+export interface TaskRejectRes { runNo: number }
+
 /** task.answer 请求（M3.1 HITL L2 远程代答，leader-only，门槛 minor 3；1.11.0 扩
  *  为双向结构化答复，门槛 minor 11——TASK_HITL_REQUIRED_MINOR）。
  *  旧形态（interventionId 缺席）：decision 写授权语义原样保留（1.10 兼容，不触

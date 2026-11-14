@@ -196,6 +196,20 @@ export interface InterventionRecord extends InterventionRequest {
   createdAt: number;
 }
 
+/** task.intervene 请求（worker → hub，门槛 minor 11）：载荷 intervention 为 worker
+ *  本地 human_requests 行镜像（interventionId 单点生成）；hub 校验来源 = 目标节点、
+ *  账本非终态后幂等落 delegation_interventions 行（id=interventionId 主键）并按组
+ *  模式定向通知发起方（lf → task.intervention 事件；peer / 发起方低版本 → 中性
+ *  进度，内容零泄漏，spec 2026-11-13 §8.6）。 */
+export interface TaskInterveneReq {
+  taskId: string;
+  intervention: InterventionRequest;
+}
+
+/** task.intervene 响应：幂等落行（同 interventionId 重发返回既有行，不重复建行）
+ *  后返 interventionId。 */
+export interface TaskInterveneRes { interventionId: string }
+
 /** task.answer 请求（M3.1 HITL L2 远程代答，leader-only，门槛 minor 3；1.11.0 扩
  *  为双向结构化答复，门槛 minor 11——TASK_HITL_REQUIRED_MINOR）。
  *  旧形态（interventionId 缺席）：decision 写授权语义原样保留（1.10 兼容，不触

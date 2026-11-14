@@ -113,6 +113,9 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     [RPC.task.cancel]: (ctx, payload) => delegationRouter.handleCancel(ctx, payload),
     [RPC.task.list]: (ctx, payload) => delegationRouter.handleList(ctx, payload),
     [RPC.task.answer]: (ctx, payload) => delegationRouter.handleAnswer(ctx, payload),
+    // 1.11.0 干预上报：worker（执行节点）发起——非 leader-only，不入守卫表，
+    // 权限锚在 handler 来源校验（ctx.nodeId === target_node_id，delegations.handleIntervene）
+    [RPC.task.intervene]: (ctx, payload) => delegationRouter.handleIntervene(ctx, payload),
     [RPC.view.workspace]: viewHandler(RPC.view.workspace),
     [RPC.view.sessions]: viewHandler(RPC.view.sessions),
     [RPC.view.messages]: viewHandler(RPC.view.messages),

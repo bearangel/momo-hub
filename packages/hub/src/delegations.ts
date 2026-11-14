@@ -24,11 +24,13 @@
 import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
-  EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
+  EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES,
+  TASK_HITL_REQUIRED_MINOR, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
+  type InterventionKind, type InterventionRequest, type InterventionStatus,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload, type TaskAnsweredEvent,
-  type TaskAssignedEvent, type TaskProgressEvent, type TaskRecord, type TaskReportPayload,
-  type TaskReportProgress, type TaskTerminalEvent,
+  type TaskAssignedEvent, type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
+  type TaskReportPayload, type TaskReportProgress, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
@@ -235,6 +237,66 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
     if (p.kind !== undefined && (PROGRESS_KINDS as readonly string[]).includes(p.kind as string)) {
       out.progress.kind = p.kind as TaskReportProgress['kind'];
     }
+  }
+  return out;
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 干预载荷校验（1.11.0 task.intervene——沿 S1 字段类型/长度纪律，白名单重建）
+// ────────────────────────────────────────────────────────────────────────────
+
+const INTERVENTION_ID_MAX = 128;    // interventionId（worker 本地 human_requests.id，UUID 量级）
+const OPTION_STR_MAX = 128;         // options[].id/label（STR_LIST_ITEM_MAX 同量级）
+const OPTION_DESC_MAX = 512;        // options[].description（EXCERPT_MAX 同量级）
+
+/** kind 合法三枚举（与协议包 InterventionKind 同源）。 */
+const INTERVENTION_KINDS: readonly InterventionKind[] = ['tool_gate', 'question', 'manual_action'];
+
+/** 干预请求校验（spec 2026-11-13 §8.2 载荷表）：interventionId 1..128、runNo 正整数、
+ *  kind 三枚举、title 1..128、prompt 字符串 ≤16KB（字节）、payload 纯对象可选、
+ *  options 数组可选（每项 id/label 1..128、description? ≤512）、deadlineAt 正整数
+ *  可选；未知字段剥除（白名单重建），任何已知约束不满足返回 null（整包拒）。 */
+function parseIntervention(raw: unknown): InterventionRequest | null {
+  if (!isRecord(raw)) return null;
+  const interventionId = optBoundedStr(raw.interventionId, INTERVENTION_ID_MAX);
+  if (interventionId === null) return null;
+  if (typeof raw.runNo !== 'number' || !Number.isInteger(raw.runNo) || raw.runNo < 1) return null;
+  if (!(INTERVENTION_KINDS as readonly string[]).includes(raw.kind as string)) return null;
+  const title = optBoundedStr(raw.title, TITLE_MAX);
+  if (title === null) return null;
+  if (typeof raw.prompt !== 'string' || textEncoder.encode(raw.prompt).length > PROMPT_MAX_BYTES) return null;
+  const out: InterventionRequest = {
+    interventionId,
+    runNo: raw.runNo,
+    kind: raw.kind as InterventionKind,
+    title,
+    prompt: raw.prompt,
+  };
+  if (raw.payload !== undefined) {
+    if (!isRecord(raw.payload)) return null;
+    out.payload = raw.payload;
+  }
+  if (raw.options !== undefined) {
+    if (!Array.isArray(raw.options)) return null;
+    const options: NonNullable<InterventionRequest['options']> = [];
+    for (const o of raw.options) {
+      if (!isRecord(o)) return null;
+      const id = optBoundedStr(o.id, OPTION_STR_MAX);
+      const label = optBoundedStr(o.label, OPTION_STR_MAX);
+      if (id === null || label === null) return null;
+      const item: NonNullable<InterventionRequest['options']>[number] = { id, label };
+      if (o.description !== undefined) {
+        const description = optBoundedStr(o.description, OPTION_DESC_MAX);
+        if (description === null) return null;
+        item.description = description;
+      }
+      options.push(item);
+    }
+    out.options = options;
+  }
+  if (raw.deadlineAt !== undefined) {
+    if (typeof raw.deadlineAt !== 'number' || !Number.isInteger(raw.deadlineAt) || raw.deadlineAt < 1) return null;
+    out.deadlineAt = raw.deadlineAt;
   }
   return out;
 }
@@ -591,6 +653,106 @@ export class DelegationRouter {
     clearTimeout(p.timer);
     this.answerPendingById.delete(p.id);
     p.settle(outcome);
+  }
+
+  /**
+   * task.intervene RPC（1.11.0 HITL 结构化干预上报，worker → hub——刻意不入
+   * LEADER_ONLY_METHODS：发起者是执行节点 target 而非 leader〔task.answer 入表是
+   * 因代答为发起方/授权方特权，intervene 方向恰好相反〕，checkGroupRole 对未登记
+   * 方法默认放行，权限锚在本 handler 的来源校验 ctx.nodeId === target_node_id）。
+   * 流程（spec 2026-11-13 §8.2/§8.6）：载荷校验 → getTask/not_found → 来源
+   * forbidden → 账本非终态（pending/running/waiting/interrupted 允许；终态与
+   * submitted → conflict——submitted 是待验收态，run 已收口不存在在途人工请求）
+   * → 幂等落行（id=interventionId 主键：已存在非 pending → intervention_stale；
+   * 已存在 pending → 幂等重发）→ 账本 →waiting（canTransition 守卫：running 合迁、
+   * pending/interrupted 无此边不动、已在 waiting 不动）→ 组模式分流通知发起方。
+   * 裁定⑤（幂等重发也重发事件）：发起方重连后可能丢失首次事件，重发帮助收敛；
+   * 事件侧幂等性由 studio 镜像行 UNIQUE(remote) 保证，hub 不去重。
+   * res：{ interventionId }。
+   */
+  async handleIntervene(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
+    const taskId = reqStr(payload, 'taskId');
+    if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+    const intervention = parseIntervention(isRecord(payload) ? payload.intervention : undefined);
+    if (!intervention) {
+      return { ok: false, error: err('bad_request', 'intervention 非法（interventionId 1-128 / runNo 正整数 / kind tool_gate|question|manual_action / title 1-128 / prompt 字符串 ≤16KB / payload? 纯对象 / options? 数组〔id/label 1-128、description? ≤512〕/ deadlineAt? 正整数）') };
+    }
+
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (ctx.nodeId !== row.target_node_id) {
+      return { ok: false, error: err('forbidden', '仅任务执行节点可上报干预') };
+    }
+    if (row.status !== 'pending' && row.status !== 'running' && row.status !== 'waiting'
+      && row.status !== 'interrupted') {
+      return { ok: false, error: err('conflict', `任务当前状态为 ${row.status}，不可上报干预`) };
+    }
+
+    const existing = this.db.prepare('SELECT status FROM delegation_interventions WHERE id = ?')
+      .get(intervention.interventionId) as { status: InterventionStatus } | undefined;
+    if (existing !== undefined && existing.status !== 'pending') {
+      return { ok: false, error: err('intervention_stale', `干预请求已处于 ${existing.status} 态，不可重复上报`) };
+    }
+    const fresh = existing === undefined;
+    const now = Date.now();
+    // payload_json 按 spec §8.1 注释口径存内容字段（title/prompt/payload/options/
+    // deadline）——id/run_no/kind 已有专属列，投影侧合并还原
+    const contentJson = JSON.stringify({
+      title: intervention.title,
+      prompt: intervention.prompt,
+      ...(intervention.payload !== undefined ? { payload: intervention.payload } : {}),
+      ...(intervention.options !== undefined ? { options: intervention.options } : {}),
+      ...(intervention.deadlineAt !== undefined ? { deadlineAt: intervention.deadlineAt } : {}),
+    });
+    this.db.transaction(() => {
+      if (fresh) {
+        this.db.prepare(`INSERT INTO delegation_interventions
+          (id, delegation_id, run_no, kind, status, payload_json, answer_json, answered_by, answered_at, created_at, updated_at)
+          VALUES (?, ?, ?, ?, 'pending', ?, NULL, NULL, NULL, ?, ?)`)
+          .run(intervention.interventionId, taskId, intervention.runNo, intervention.kind, contentJson, now, now);
+      }
+      if (row.status !== 'waiting' && canTransition(row.status, 'waiting')) {
+        this.db.prepare("UPDATE delegations SET status = 'waiting', updated_at = ? WHERE task_id = ?")
+          .run(now, taskId);
+      }
+    })();
+    if (fresh) {
+      logger.info('干预已落行', { taskId, interventionId: intervention.interventionId, kind: intervention.kind, byNode: ctx.nodeId });
+    }
+
+    // 组模式分流 + 发起方版本门（防半开，spec §8.5）：lf 且发起方 minor ≥ 11 →
+    // task.intervention 定向；peer（spec §8.6 平行组不转发请求内容）或发起方低版本
+    // （老发起方读不懂新事件）→ 中性进度，内容零泄漏（title/prompt/options 一律不带）。
+    const groupMode = (this.db.prepare('SELECT mode FROM groups WHERE id = ?').get(row.group_id) as
+      | { mode: 'leader-follower' | 'peer' }
+      | undefined)?.mode ?? 'leader-follower';
+    const originConn = this.registry.get(row.by_node_id);
+    const originMinor = originConn !== undefined ? minorOf(originConn.peerProtoVer) : null;
+    const originKnowsIntervention = originMinor !== null && originMinor >= TASK_HITL_REQUIRED_MINOR;
+    // 发起方离线两分支均容忍：账本已 waiting、行已 pending，重连走 task.interventions
+    // 对账（H7），不回滚（与 handleDelegate 离线回滚语义相反——intervene 落的是
+    // 事实不是在途请求）
+    if (groupMode === 'leader-follower' && originKnowsIntervention) {
+      const sent = await this.registry.sendTo(row.by_node_id, {
+        v: 1, kind: 'evt', method: EVT.taskIntervention,
+        payload: { taskId, intervention } satisfies TaskInterventionEvent,
+      });
+      if (sent === 'offline') logger.info('干预通知未送达（发起方离线）', { taskId, interventionId: intervention.interventionId });
+    } else {
+      const after = this.getTask(taskId);
+      const sent = await this.registry.sendTo(row.by_node_id, {
+        v: 1, kind: 'evt', method: EVT.taskProgress,
+        payload: {
+          taskId,
+          sessionId: after?.session_id ?? row.session_id ?? '',
+          lastSeq: after?.updated_at ?? row.updated_at,
+          excerpt: '执行方等待人工处理',
+          kind: 'waiting-input',
+        } satisfies TaskProgressEvent,
+      });
+      if (sent === 'offline') logger.info('干预中性进度未送达（发起方离线）', { taskId, interventionId: intervention.interventionId });
+    }
+    return { ok: true, payload: { interventionId: intervention.interventionId } };
   }
 
   /**

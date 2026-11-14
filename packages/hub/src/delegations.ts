@@ -1199,12 +1199,42 @@ export class DelegationRouter {
         this.forwardProgress({ ...row, session_id: sessionId ?? row.session_id }, report);
         return;
       }
+      // 1.11.0 解除守卫：存在 pending 干预行 → 无 kind 拍不越权解除（账本不动、
+      // 进度照转，与上方 kind==='waiting-input' 同处理）。两代 waiting 的解除
+      // 权威分工：1.10 老形态（无干预行）维持无 kind 拍即解除（下方原路径）；
+      // 1.11 干预 waiting 只由 task.answer（answerIntervention）解除——否则
+      // task.intervene 置 waiting 后 worker 常规进度拍（~2s 窗口）即刻冲掉
+      // waiting，发起方永远看不到等待态。
+      const pendingIv = this.db.prepare(
+        "SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ? AND status = 'pending'",
+      ).get(row.task_id) as { n: number };
+      if (pendingIv.n > 0) {
+        // 等待期间进度拍（账本不动，进度照转）
+        if (sessionId !== null) {
+          this.db.prepare('UPDATE delegations SET session_id = ?, updated_at = ? WHERE task_id = ?')
+            .run(sessionId, Date.now(), row.task_id);
+        }
+        this.forwardProgress({ ...row, session_id: sessionId ?? row.session_id }, report);
+        return;
+      }
       // 等待解除：状态单源铁律——hub 不在 task.answer 时迁移，approve/deny 后
       // worker 下一拍无 kind 即回 running
       this.db.prepare("UPDATE delegations SET status = 'running', session_id = ?, updated_at = ? WHERE task_id = ?")
         .run(sessionId ?? row.session_id, Date.now(), row.task_id);
       logger.info('委派等待解除', { taskId: row.task_id, byNode: fromNodeId });
       this.forwardProgress({ ...row, status: 'running', session_id: sessionId ?? row.session_id }, report);
+      return;
+    }
+
+    // submitted 态运行拍守卫（E2E 实录：agent 中途 submit_task → 回合收尾窗口内
+    // runner 进度拍 running 到达 → 通用迁移路径把 submitted 抹回 running，发起方/
+    // worker 双侧状态连锁回退）。submitted 的出边 done（task.accept 验收）/
+    // running（task.reject 打回，run_no+1）/ cancelled 各归属一个 RPC，worker
+    // task.report 无权迁移账本——整拍忽略，不 forwardProgress（submitted 后进度
+    // 无意义且防误导，与终态粘滞忽略拍口径一致）。1.10 零影响：submitted 态在
+    // 1.10 不存在。
+    if (to === 'running' && row.status === 'submitted') {
+      logger.info('委派已提交，运行拍被忽略（submitted 仅经 task.reject 返回 running）', { taskId: row.task_id, from: fromNodeId });
       return;
     }
 

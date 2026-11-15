@@ -257,13 +257,14 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
 const INTERVENTION_ID_MAX = 128;    // interventionId（worker 本地 human_requests.id，UUID 量级）
 const OPTION_STR_MAX = 128;         // options[].id/label（STR_LIST_ITEM_MAX 同量级）
 const OPTION_DESC_MAX = 512;        // options[].description（EXCERPT_MAX 同量级）
+const INTERVENTION_PAYLOAD_MAX_CHARS = 64 * 1024; // payload 序列化总量上限（防滥用，对齐 prompt ≤16KB 量级纪律）
 
 /** kind 合法三枚举（与协议包 InterventionKind 同源）。 */
 const INTERVENTION_KINDS: readonly InterventionKind[] = ['tool_gate', 'question', 'manual_action'];
 
 /** 干预请求校验（spec 2026-11-13 §8.2 载荷表）：interventionId 1..128、runNo 正整数、
- *  kind 三枚举、title 1..128、prompt 字符串 ≤16KB（字节）、payload 纯对象可选、
- *  options 数组可选（每项 id/label 1..128、description? ≤512）、deadlineAt 正整数
+ *  kind 三枚举、title 1..128、prompt 字符串 ≤16KB（字节）、payload 纯对象可选（序列化
+ *  ≤64KB）、options 数组可选（每项 id/label 1..128、description? ≤512）、deadlineAt 正整数
  *  可选；未知字段剥除（白名单重建），任何已知约束不满足返回 null（整包拒）。 */
 function parseIntervention(raw: unknown): InterventionRequest | null {
   if (!isRecord(raw)) return null;
@@ -283,6 +284,10 @@ function parseIntervention(raw: unknown): InterventionRequest | null {
   };
   if (raw.payload !== undefined) {
     if (!isRecord(raw.payload)) return null;
+    // 序列化总量上限（防滥用）：payload 是自由嵌套对象，字段级深度不限，以序列化串长
+    // 封顶——对齐 prompt ≤16KB 的既有量级纪律（options 已有字段级限制，不动）。载荷
+    // 经 JSON wire 反序列化而来，无环引用，stringify 恒安全。
+    if (JSON.stringify(raw.payload).length > INTERVENTION_PAYLOAD_MAX_CHARS) return null;
     out.payload = raw.payload;
   }
   if (raw.options !== undefined) {
@@ -876,7 +881,7 @@ export class DelegationRouter {
     if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
     const intervention = parseIntervention(isRecord(payload) ? payload.intervention : undefined);
     if (!intervention) {
-      return { ok: false, error: err('bad_request', 'intervention 非法（interventionId 1-128 / runNo 正整数 / kind tool_gate|question|manual_action / title 1-128 / prompt 字符串 ≤16KB / payload? 纯对象 / options? 数组〔id/label 1-128、description? ≤512〕/ deadlineAt? 正整数）') };
+      return { ok: false, error: err('bad_request', 'intervention 非法（interventionId 1-128 / runNo 正整数 / kind tool_gate|question|manual_action / title 1-128 / prompt 字符串 ≤16KB / payload? 纯对象且序列化 ≤64KB / options? 数组〔id/label 1-128、description? ≤512〕/ deadlineAt? 正整数）') };
     }
 
     const row = this.getTask(taskId);
@@ -1288,8 +1293,17 @@ export class DelegationRouter {
         });
         return;
       }
-      this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ?")
+      // 自封口守卫（沿 H6 accept/reject 先例）：UPDATE 带 status IN ('running','waiting')
+      // 条件，changes===1 才落审计/发事件——row 读取与写入间现无 await（前置校验即
+      // 真相），防未来插入 await 开 TOCTOU 窗口。changes===0（竞态败者：底层账本已被
+      // 先行迁移，典型为已 submitted）按幂等静默——与 to===row.status 重复上报同口径
+      // （日志 + 账本/事件零动作，零半套态），不炸连接（文件头 wire 约定）。
+      const upd = this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ? AND status IN ('running','waiting')")
         .run(now, runNo, now, row.task_id);
+      if (upd.changes !== 1) {
+        logger.info('委派提交竞态败者，忽略（账本已被先行迁移，等价重复上报）', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });
+        return;
+      }
       logger.info('委派状态迁移', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });
       // deliverable 通道约定（H7 裁定，协议 TaskReportPayload 无 deliverable 字段）：
       // worker（S2 studio 侧）把交付摘要 JSON 塞 report.reason，hub 尝试 JSON.parse

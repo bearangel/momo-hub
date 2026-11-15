@@ -37,6 +37,8 @@ import { ensureHubIdentity } from '../src/identity';
 import { enrollNode } from '../src/auth';
 import { logger } from '../src/logger';
 import { createHubServer, type HubServer } from '../src/server';
+import { DelegationRouter } from '../src/delegations';
+import type { NodeRegistry } from '../src/registry';
 import {
   EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, encodeEnvelope, makeRequest, parseEnvelope,
   type DelegationStatus, type Envelope,
@@ -478,6 +480,26 @@ describe('task.intervene 载荷校验矩阵', () => {
     await settle();
     expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
       .get(taskId) as { n: number }).n).toBe(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('payload 序列化总量上限：恰好 64KB（65536 字符）放行、65537 字符拒 bad_request（不落行不迁账）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivbig');
+    const taskId = await runningTask(leader, target, groupId, 'ivbig');
+    // {"blob":""} 序列化 11 字符（{+"blob"+:+""+}），补 x 至目标串长
+    const mkPayload = (targetLen: number): Record<string, unknown> => ({ blob: 'x'.repeat(targetLen - 11) });
+    const overLen = mkPayload(65537);
+    expect(JSON.stringify(overLen).length).toBe(65537);
+    const bad = await callRpc(target, RPC.task.intervene, { taskId, intervention: intervention({ payload: overLen }) });
+    expect(errOf(bad).code).toBe('bad_request');
+    const atLimit = mkPayload(65536);
+    expect(JSON.stringify(atLimit).length).toBe(65536);
+    const good = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ payload: atLimit, interventionId: 'iv-big-ok' }),
+    });
+    expect(good.kind === 'res' && good.ok).toBe(true);
+    expect(interventionRow('iv-big-ok')?.payload_json).toContain('"payload"');
+    expect(ledgerRow(taskId)?.status).toBe('waiting');
     leader.ws.close(); target.ws.close();
   });
 });
@@ -1338,6 +1360,55 @@ describe('submitted × 发起方版本门：自动验收降级（终审 F2）', 
     expect(ledgerRow(taskId)).toMatchObject({ status: 'done', run_no: 1 });
     expect(ledgerRow(taskId)?.accepted_at).not.toBeNull();
     target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// task.report submitted 自封口（终审票据：UPDATE 状态门 + 竞态败者幂等静默）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.report submitted 自封口（UPDATE 状态门）', () => {
+  it('竞态模拟：内存 row 读到 running 而底层账本已被先行迁 submitted → changes=0 守卫拦下，零事件零落账（零半套态）', async () => {
+    const { leader, target, groupId } = await setupGroup('seal1');
+    const taskId = await runningTask(leader, target, groupId, 'seal1');
+    // SQL 直改底层态 = 竞态败者场景：getTask 旧 row 仍是 running，UPDATE 时账本已 submitted
+    const frozen = Date.now();
+    db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = 1, updated_at = ? WHERE task_id = ?")
+      .run(frozen, frozen, taskId);
+    // 独立 router + 假 registry：origin 在线且 ≥1.11（避开 F2 自动验收降级分支，直击守卫）
+    const sendTo = vi.fn(async () => 'sent' as const);
+    const fakeRegistry = {
+      get: () => ({ nodeId: leader.nodeId, nodeName: 'seal1-leader', ws: null as unknown as WebSocket, alive: true, peerProtoVer: PROTOCOL_VERSION }),
+      sendTo,
+    };
+    const router = new DelegationRouter(db, fakeRegistry as unknown as NodeRegistry);
+    const stale = { ...(db.prepare('SELECT * FROM delegations WHERE task_id = ?').get(taskId) as Record<string, unknown>), status: 'running' };
+    const spy = vi.spyOn(router as unknown as { getTask: (id: string) => unknown }, 'getTask').mockReturnValue(stale);
+    try {
+      router.acceptReport(target.nodeId, {
+        v: 1, kind: 'res', id: taskId, method: TASK_WIRE.report, ok: true, payload: { status: 'submitted', runNo: 1 },
+      } as Parameters<DelegationRouter['acceptReport']>[1]);
+      await settle();
+      expect(sendTo).not.toHaveBeenCalled();
+      expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1, submitted_at: frozen });
+    } finally {
+      spy.mockRestore();
+    }
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('并发两次 report submitted：第二次落 to===row.status 幂等——事件只发一次、账本行零变化', async () => {
+    const { leader, target, groupId } = await setupGroup('seal2');
+    const taskId = await runningTask(leader, target, groupId, 'seal2');
+    report(target.ws, taskId, { status: 'submitted', runNo: 1 });
+    await awaitSubmitted(leader, taskId, 1);
+    const first = ledgerRow(taskId);
+    report(target.ws, taskId, { status: 'submitted', runNo: 1 });
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+      && (e.payload as { taskId: string }).taskId === taskId)).toHaveLength(1);
+    expect(ledgerRow(taskId)).toEqual(first);
+    leader.ws.close(); target.ws.close();
   });
 });
 

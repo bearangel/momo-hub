@@ -1627,6 +1627,7 @@ describe('task.steer lf 全链', () => {
   it('running 态 steer：res {ok:true} + worker 收 task.steered {taskId, message} + 账本仍 running（不迁账本态）+ 发起方自身不收事件', async () => {
     const { leader, target, groupId } = await setupGroup('stlf');
     const taskId = await runningTask(leader, target, groupId, 'stlf');
+    const updatedAtBefore = ledgerRow(taskId)?.updated_at;
 
     const res = await callRpc(leader, RPC.task.steer, { taskId, message: '请同时补充错误路径测试' });
     expect(res.kind === 'res' && res.ok).toBe(true);
@@ -1638,6 +1639,7 @@ describe('task.steer lf 全链', () => {
 
     // 不迁账本态：纯指令非状态事件，status/updated_at 均不动
     expect(ledgerRow(taskId)?.status).toBe('running');
+    expect(ledgerRow(taskId)?.updated_at).toBe(updatedAtBefore);
     await settle();
     expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSteered)).toHaveLength(0);
     leader.ws.close(); target.ws.close();

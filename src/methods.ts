@@ -66,6 +66,11 @@ METHOD_REQUIRED_MINOR[RPC.task.intervene] = 11;
 METHOD_REQUIRED_MINOR[RPC.task.accept] = 11;
 METHOD_REQUIRED_MINOR[RPC.task.reject] = 11;
 METHOD_REQUIRED_MINOR[RPC.task.interventions] = 11;
+// 1.12.0（发起方指令通道）：task.steer 为 minor-12 方法（与常量
+// TASK_STEER_REQUIRED_MINOR 同值）——已发布 1.11.0 的节点没有该 handler，并入 11
+// 会 unknown_method 歧义；独立 12 使 1.11 节点调它得到
+// unsupported_method{requiredMinor:12} 可读降级。既有 task 方法门槛不变。
+METHOD_REQUIRED_MINOR[RPC.task.steer] = 12;
 
 export type RpcMethodName =
   | 'hello'

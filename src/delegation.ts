@@ -14,6 +14,9 @@ export const TASK_RPC = {
   accept: 'task.accept',
   reject: 'task.reject',
   interventions: 'task.interventions',
+  // 1.12.0（发起方指令通道，门槛 minor 12）：在途回合补指令——定向 worker
+  // task.steered，不迁账本态（纯指令非状态事件，spec 2026-11-13 §8.2 steer 槽位）。
+  steer: 'task.steer',
 } as const;
 
 /** 委派账本状态机（§4 delegations.status）：
@@ -232,6 +235,29 @@ export interface TaskRejectReq {
 
 /** task.reject 响应：打回后的新 run 号（与 task.rejected 事件一致）。 */
 export interface TaskRejectRes { runNo: number }
+
+/**
+ * 发起方补充指令（task.steer）所需的最低协议 minor（1.12.0，spec 2026-11-13 §8.2
+ * steer 槽位）：已发布 1.11.0 pin 的节点没有该 handler——并入 11 会让 1.11 节点
+ * 调它得到 unknown_method 歧义；独立 minor 12 使 1.11 节点得到
+ * unsupported_method{requiredMinor:12} 可读降级，无静默不支持歧义。
+ */
+export const TASK_STEER_REQUIRED_MINOR = 12;
+
+/** task.steer 请求（1.12.0，发起方 → hub，门槛 minor 12）：在途回合补指令。
+ *  hub 校验来源 = 委派发起方（by_node_id，身份取自信封鉴权；peer 组发起方
+ *  同样允许——任务指令非人工请求转发，spec §8.6 的「不转发」仅限人工请求内容）
+ *  与账本非终态（pending/running/waiting/submitted/interrupted 放行——submitted
+ *  期间打回前补指令合法且有用；终态 conflict）后定向 worker task.steered。
+ *  message trim 后 1..4000 字。 */
+export interface TaskSteerReq {
+  taskId: string;
+  message: string;
+}
+
+/** task.steer 响应：指令已定向送达执行节点（每次调用都发事件——指令非状态，
+ *  无幂等键，消费侧自行按 taskId+message 去重）。 */
+export interface TaskSteerRes { ok: true }
 
 /** task.answer 请求（M3.1 HITL L2 远程代答，leader-only，门槛 minor 3；1.11.0 扩
  *  为双向结构化答复，门槛 minor 11——TASK_HITL_REQUIRED_MINOR）。

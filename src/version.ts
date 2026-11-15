@@ -1,4 +1,16 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.12.0（task.steer 发起方指令通道，spec moo-studio docs/specs/2026-11-13-task-human-loop-lifecycle-design.md §8.2 steer 槽位）：
+// TASK_RPC 增 task.steer（TaskSteerReq {taskId, message（trim 后 1..4000 字）}/
+// TaskSteerRes {ok:true}）+ 事件 task.steered（TaskSteeredEvent {taskId, message}
+// 定向→执行节点）+ METHOD_REQUIRED_MINOR['task.steer']=12 + 新常量
+// TASK_STEER_REQUIRED_MINOR=12（已发布 1.11.0 pin 的节点没有该 handler，并入 11
+// 会 unknown_method 歧义——独立 minor 12 无歧义可读降级）+ hub 行为三裁定：
+// 来源 = by_node_id 单点权威（peer 组发起方允许 steer——任务指令非人工请求
+// 转发，§8.6「不转发」仅限人工请求内容）；账本非终态放行且含 submitted
+//（打回前补指令合法且有用）但不迁账本态（纯指令非状态事件，无幂等键）；
+// worker 离线即拒 node_offline（指令时效性强，缓存重发语义弱）——除版本门与
+// 新方法门槛外无既有载荷改动（1.11 peer 调任何已登记方法、发任何既有载荷
+// 不受影响），major 不动。
 // 1.11.0（任务生命周期 v2，spec moo-studio docs/specs/2026-11-13-task-human-loop-lifecycle-design.md §8）：
 // 账本状态机增 submitted 态（run 完成提交、发起方验收的中间态——report 上报驱动进入，
 // accept/reject 决定终局）+ 干预类型族（InterventionKind/InterventionStatus/InterventionAnswer/
@@ -66,7 +78,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.11.0';
+export const PROTOCOL_VERSION = '1.12.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

@@ -26,6 +26,11 @@
 // 终审 F2（submitted × 发起方版本门）：worker 报 submitted 时发起方离线/未知/
 // <1.11 → 自动验收降级（账本直落 done + accepted_at，origin 收既有 task.completed，
 // worker 收 task.accepted）——混版本舰队防挂起；origin 1.11 在线两段式照常。
+// task.steer（1.12.0 发起方指令通道，spec 2026-11-13 §8.2 steer 槽位）：lf + peer
+// 全链（发起方 by_node_id 特权，peer 允许 steer 裁定）/ submitted 期间放行（打回前
+// 补指令合法）/ 不迁账本态 / 越权 forbidden / worker 离线 node_offline 拒（指令
+// 时效性强不缓存）/ 终态 conflict / message 空白与 4001 字 bad_request（4000 边界
+// 放行）/ 幂等语义（指令非状态无幂等键——同 message 重发每次都发事件）。
 import { mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -37,6 +42,8 @@ import { ensureHubIdentity } from '../src/identity';
 import { enrollNode } from '../src/auth';
 import { logger } from '../src/logger';
 import { createHubServer, type HubServer } from '../src/server';
+import { DelegationRouter } from '../src/delegations';
+import type { NodeRegistry } from '../src/registry';
 import {
   EVT, PROTOCOL_VERSION, RPC, TASK_WIRE, encodeEnvelope, makeRequest, parseEnvelope,
   type DelegationStatus, type Envelope,
@@ -478,6 +485,26 @@ describe('task.intervene 载荷校验矩阵', () => {
     await settle();
     expect((db.prepare('SELECT COUNT(*) AS n FROM delegation_interventions WHERE delegation_id = ?')
       .get(taskId) as { n: number }).n).toBe(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('payload 序列化总量上限：恰好 64KB（65536 字符）放行、65537 字符拒 bad_request（不落行不迁账）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivbig');
+    const taskId = await runningTask(leader, target, groupId, 'ivbig');
+    // {"blob":""} 序列化 11 字符（{+"blob"+:+""+}），补 x 至目标串长
+    const mkPayload = (targetLen: number): Record<string, unknown> => ({ blob: 'x'.repeat(targetLen - 11) });
+    const overLen = mkPayload(65537);
+    expect(JSON.stringify(overLen).length).toBe(65537);
+    const bad = await callRpc(target, RPC.task.intervene, { taskId, intervention: intervention({ payload: overLen }) });
+    expect(errOf(bad).code).toBe('bad_request');
+    const atLimit = mkPayload(65536);
+    expect(JSON.stringify(atLimit).length).toBe(65536);
+    const good = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ payload: atLimit, interventionId: 'iv-big-ok' }),
+    });
+    expect(good.kind === 'res' && good.ok).toBe(true);
+    expect(interventionRow('iv-big-ok')?.payload_json).toContain('"payload"');
+    expect(ledgerRow(taskId)?.status).toBe('waiting');
     leader.ws.close(); target.ws.close();
   });
 });
@@ -1342,6 +1369,55 @@ describe('submitted × 发起方版本门：自动验收降级（终审 F2）', 
 });
 
 // ────────────────────────────────────────────────────────────────────────────
+// task.report submitted 自封口（终审票据：UPDATE 状态门 + 竞态败者幂等静默）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.report submitted 自封口（UPDATE 状态门）', () => {
+  it('竞态模拟：内存 row 读到 running 而底层账本已被先行迁 submitted → changes=0 守卫拦下，零事件零落账（零半套态）', async () => {
+    const { leader, target, groupId } = await setupGroup('seal1');
+    const taskId = await runningTask(leader, target, groupId, 'seal1');
+    // SQL 直改底层态 = 竞态败者场景：getTask 旧 row 仍是 running，UPDATE 时账本已 submitted
+    const frozen = Date.now();
+    db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = 1, updated_at = ? WHERE task_id = ?")
+      .run(frozen, frozen, taskId);
+    // 独立 router + 假 registry：origin 在线且 ≥1.11（避开 F2 自动验收降级分支，直击守卫）
+    const sendTo = vi.fn(async () => 'sent' as const);
+    const fakeRegistry = {
+      get: () => ({ nodeId: leader.nodeId, nodeName: 'seal1-leader', ws: null as unknown as WebSocket, alive: true, peerProtoVer: PROTOCOL_VERSION }),
+      sendTo,
+    };
+    const router = new DelegationRouter(db, fakeRegistry as unknown as NodeRegistry);
+    const stale = { ...(db.prepare('SELECT * FROM delegations WHERE task_id = ?').get(taskId) as Record<string, unknown>), status: 'running' };
+    const spy = vi.spyOn(router as unknown as { getTask: (id: string) => unknown }, 'getTask').mockReturnValue(stale);
+    try {
+      router.acceptReport(target.nodeId, {
+        v: 1, kind: 'res', id: taskId, method: TASK_WIRE.report, ok: true, payload: { status: 'submitted', runNo: 1 },
+      } as Parameters<DelegationRouter['acceptReport']>[1]);
+      await settle();
+      expect(sendTo).not.toHaveBeenCalled();
+      expect(ledgerRow(taskId)).toMatchObject({ status: 'submitted', run_no: 1, submitted_at: frozen });
+    } finally {
+      spy.mockRestore();
+    }
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('并发两次 report submitted：第二次落 to===row.status 幂等——事件只发一次、账本行零变化', async () => {
+    const { leader, target, groupId } = await setupGroup('seal2');
+    const taskId = await runningTask(leader, target, groupId, 'seal2');
+    report(target.ws, taskId, { status: 'submitted', runNo: 1 });
+    await awaitSubmitted(leader, taskId, 1);
+    const first = ledgerRow(taskId);
+    report(target.ws, taskId, { status: 'submitted', runNo: 1 });
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+      && (e.payload as { taskId: string }).taskId === taskId)).toHaveLength(1);
+    expect(ledgerRow(taskId)).toEqual(first);
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
 // H8：干预链版本门三态矩阵（spec 2026-11-13 §8.5——1.10/1.11 混编降级语义）
 // 三态之三（1.11 双端全通）不另立用例：本文件 lf 全链 / answer / accept /
 // reject / interventions 各 describe 即证（如「task.intervene lf 全链」
@@ -1380,7 +1456,7 @@ describe('干预链版本门：1.10 worker 调四新 RPC（H8）', () => {
       const res = await callRpc(target, c.method, c.payload);
       const error = errOf(res);
       expect(error.code, `用例：${c.name}`).toBe('unsupported_method');
-      expect(error.message, `用例：${c.name}`).toContain('hub=1.11.0');
+      expect(error.message, `用例：${c.name}`).toContain('hub=1.12.0');
       expect(error.message, `用例：${c.name}`).toContain('节点=1.10.0');
       expect(error.message, `用例：${c.name}`).toContain('需要协议 1.11');
       expect(resPayload(res).method, `用例：${c.name}`).toBe(c.name);
@@ -1537,6 +1613,155 @@ describe('等待解除守卫：pending 干预期间无 kind 拍不解除', () =>
     await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskProgress
       && (e.payload as { taskId: string }).taskId === taskId
       && (e.payload as { lastSeq: number }).lastSeq === 0);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// task.steer（1.12.0 发起方指令通道——发起方 by_node_id 特权 + 不迁账本态 +
+// worker 离线拒；peer 组允许 steer，任务指令不受 §8.6 人工请求不转发约束）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('task.steer lf 全链', () => {
+  it('running 态 steer：res {ok:true} + worker 收 task.steered {taskId, message} + 账本仍 running（不迁账本态）+ 发起方自身不收事件', async () => {
+    const { leader, target, groupId } = await setupGroup('stlf');
+    const taskId = await runningTask(leader, target, groupId, 'stlf');
+
+    const res = await callRpc(leader, RPC.task.steer, { taskId, message: '请同时补充错误路径测试' });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    expect(resPayload(res)).toEqual({ ok: true });
+
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, message: '请同时补充错误路径测试' });
+
+    // 不迁账本态：纯指令非状态事件，status/updated_at 均不动
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    await settle();
+    expect(leader.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSteered)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('submitted 期间放行（打回前补指令合法且有用）：steer ok + 事件照达 + 账本保持 submitted', async () => {
+    const { leader, target, groupId } = await setupGroup('stsub');
+    const taskId = await runningTask(leader, target, groupId, 'stsub');
+    await driveToSubmitted(target, taskId);
+    expect(ledgerRow(taskId)?.status).toBe('submitted');
+
+    const res = await callRpc(leader, RPC.task.steer, { taskId, message: '验收前提醒：请核对 CHANGELOG' });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, message: '验收前提醒：请核对 CHANGELOG' });
+    expect(ledgerRow(taskId)?.status).toBe('submitted');
+    leader.ws.close(); target.ws.close();
+  });
+});
+
+describe('task.steer peer 组发起方权威', () => {
+  it('peer 组非组长成员（by_node_id）委派草稿后 steer：正常受理（peer 允许 steer 裁定）+ 承接方收 task.steered', async () => {
+    const { a, b, groupId } = await setupPeerGroup('stpeer');
+    const taskId = await delegateOk(b, delegateReq(groupId, a.nodeId, {
+      workspaceName: 'ws-stpeer', title: '评估迁移方案', prompt: '请评估并给出结论', draft: true,
+    }));
+    expect(ledgerRow(taskId)?.status).toBe('pending');
+
+    const res = await callRpc(b, RPC.task.steer, { taskId, message: '重点关注回滚方案' });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const evt = await a.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(evt.payload).toEqual({ taskId, message: '重点关注回滚方案' });
+    // pending 态账本同样不动
+    expect(ledgerRow(taskId)?.status).toBe('pending');
+    a.ws.close(); b.ws.close();
+  });
+});
+
+describe('task.steer 来源与状态守卫', () => {
+  it('执行节点（target）与第三方成员调 steer → forbidden，账本不动、无事件', async () => {
+    const { leader, target, groupId } = await setupGroup('stsrc');
+    const taskId = await runningTask(leader, target, groupId, 'stsrc');
+    const third = await connect('stsrc-bystander');
+    await callRpc(third, RPC.group.join, { inviteCode: (resPayload(await callRpc(leader, RPC.group.invite, { groupId })) as { inviteCode: string }).inviteCode });
+
+    expect(errOf(await callRpc(target, RPC.task.steer, { taskId, message: 'worker 自 steer' })).code).toBe('forbidden');
+    expect(errOf(await callRpc(third, RPC.task.steer, { taskId, message: '第三方 steer' })).code).toBe('forbidden');
+    await settle();
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSteered)).toHaveLength(0);
+    leader.ws.close(); target.ws.close(); third.ws.close();
+  });
+
+  it('终态（done）后 steer → conflict，无事件', async () => {
+    const { leader, target, groupId } = await setupGroup('stterm');
+    const taskId = await runningTask(leader, target, groupId, 'stterm');
+    report(target.ws, taskId, { status: 'done' });
+    await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskCompleted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(ledgerRow(taskId)?.status).toBe('done');
+
+    const res = await callRpc(leader, RPC.task.steer, { taskId, message: '完成后补指令' });
+    expect(errOf(res).code).toBe('conflict');
+    await settle();
+    expect(target.inbox.filter((e) => e.kind === 'evt' && e.method === EVT.taskSteered)).toHaveLength(0);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('worker 离线 → node_offline 拒（人话「执行节点离线，稍后再试」），无事件无缓冲', async () => {
+    const { leader, target, groupId } = await setupGroup('stoff');
+    const taskId = await runningTask(leader, target, groupId, 'stoff');
+    target.ws.close();
+    // 断线收割：running → interrupted（MC5）——interrupted 仍属 steer 放行态，
+    // 离线拒发生在 sendTo 判定，与账本态无关
+    for (let i = 0; i < 100 && ledgerRow(taskId)?.status !== 'interrupted'; i++) await settle(20);
+    expect(ledgerRow(taskId)?.status).toBe('interrupted');
+
+    const res = await callRpc(leader, RPC.task.steer, { taskId, message: '离线期间的指令' });
+    const e = errOf(res);
+    expect(e.code).toBe('node_offline');
+    expect(e.message).toContain('执行节点离线');
+    leader.ws.close();
+  });
+});
+
+describe('task.steer 载荷校验与幂等语义', () => {
+  it('message 缺失 / 纯空白 / 4001 字 → bad_request；恰 4000 字放行（边界）；ghost taskId → not_found；缺 taskId → bad_request', async () => {
+    const { leader, target, groupId } = await setupGroup('stbad');
+    const taskId = await runningTask(leader, target, groupId, 'stbad');
+
+    expect(errOf(await callRpc(leader, RPC.task.steer, { taskId })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.steer, { taskId, message: '' })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.steer, { taskId, message: '   ' })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.steer, { taskId, message: 'x'.repeat(4001) })).code).toBe('bad_request');
+    expect(errOf(await callRpc(leader, RPC.task.steer, { taskId: 'no-such-task', message: 'ghost' })).code).toBe('not_found');
+    expect(errOf(await callRpc(leader, RPC.task.steer, { message: '缺 taskId' })).code).toBe('bad_request');
+    expect(ledgerRow(taskId)?.status).toBe('running');
+
+    // 边界：恰 4000 字合法送达
+    const edge = 'y'.repeat(4000);
+    const res = await callRpc(leader, RPC.task.steer, { taskId, message: edge });
+    expect(res.kind === 'res' && res.ok).toBe(true);
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((evt.payload as { message: string }).message).toHaveLength(4000);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('幂等语义：同 message 重发 → 每次都 ok 且每次都发事件（指令非状态，无幂等键——消费侧自行去重）', async () => {
+    const { leader, target, groupId } = await setupGroup('stidem');
+    const taskId = await runningTask(leader, target, groupId, 'stidem');
+
+    for (let i = 0; i < 2; i++) {
+      const res = await callRpc(leader, RPC.task.steer, { taskId, message: '同一条指令' });
+      expect(res.kind === 'res' && res.ok).toBe(true);
+    }
+    const first = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    const second = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskSteered
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect(first.payload).toEqual({ taskId, message: '同一条指令' });
+    expect(second.payload).toEqual({ taskId, message: '同一条指令' });
     expect(ledgerRow(taskId)?.status).toBe('running');
     leader.ws.close(); target.ws.close();
   });

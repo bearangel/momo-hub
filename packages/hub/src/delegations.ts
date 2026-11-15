@@ -32,6 +32,7 @@ import {
   type TaskAssignedEvent, type TaskAcceptedEvent, type TaskInterventionAnsweredEvent,
   type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
   type TaskRejectedEvent, type TaskReportPayload, type TaskReportProgress,
+  type TaskSteeredEvent, type TaskSteerRes,
   type TaskSubmittedEvent, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
@@ -95,6 +96,7 @@ const REASON_MAX = 512;
 const EXCERPT_MAX = 512;
 const SLUG_MAX = 64;              // S1 SLUG_MAX
 const ANSWER_MESSAGE_MAX = 512;   // 代答备注（TaskAnswerReq.message 同界）
+const STEER_MESSAGE_MAX = 4000;   // 补充指令正文（TaskSteerReq.message——自然语言补指令，介于 reason 512 与 prompt 16KB 之间）
 const DEPENDS_ON_MAX = 50;        // 依赖 id 清单上限（M4.3，DoS 下限）
 const DEPENDS_ON_ITEM_MAX = 128;  // 依赖 id 单项上限（STR_LIST_ITEM_MAX 同量级）
 const TEAM_MEMBERS_MIN = 2;       // 团队成员下限（M5.3 spec §5.1：单 agent 走 agentSlug/缺省）
@@ -257,13 +259,14 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
 const INTERVENTION_ID_MAX = 128;    // interventionId（worker 本地 human_requests.id，UUID 量级）
 const OPTION_STR_MAX = 128;         // options[].id/label（STR_LIST_ITEM_MAX 同量级）
 const OPTION_DESC_MAX = 512;        // options[].description（EXCERPT_MAX 同量级）
+const INTERVENTION_PAYLOAD_MAX_CHARS = 64 * 1024; // payload 序列化总量上限（防滥用，对齐 prompt ≤16KB 量级纪律）
 
 /** kind 合法三枚举（与协议包 InterventionKind 同源）。 */
 const INTERVENTION_KINDS: readonly InterventionKind[] = ['tool_gate', 'question', 'manual_action'];
 
 /** 干预请求校验（spec 2026-11-13 §8.2 载荷表）：interventionId 1..128、runNo 正整数、
- *  kind 三枚举、title 1..128、prompt 字符串 ≤16KB（字节）、payload 纯对象可选、
- *  options 数组可选（每项 id/label 1..128、description? ≤512）、deadlineAt 正整数
+ *  kind 三枚举、title 1..128、prompt 字符串 ≤16KB（字节）、payload 纯对象可选（序列化
+ *  ≤64KB）、options 数组可选（每项 id/label 1..128、description? ≤512）、deadlineAt 正整数
  *  可选；未知字段剥除（白名单重建），任何已知约束不满足返回 null（整包拒）。 */
 function parseIntervention(raw: unknown): InterventionRequest | null {
   if (!isRecord(raw)) return null;
@@ -283,6 +286,10 @@ function parseIntervention(raw: unknown): InterventionRequest | null {
   };
   if (raw.payload !== undefined) {
     if (!isRecord(raw.payload)) return null;
+    // 序列化总量上限（防滥用）：payload 是自由嵌套对象，字段级深度不限，以序列化串长
+    // 封顶——对齐 prompt ≤16KB 的既有量级纪律（options 已有字段级限制，不动）。载荷
+    // 经 JSON wire 反序列化而来，无环引用，stringify 恒安全。
+    if (JSON.stringify(raw.payload).length > INTERVENTION_PAYLOAD_MAX_CHARS) return null;
     out.payload = raw.payload;
   }
   if (raw.options !== undefined) {
@@ -876,7 +883,7 @@ export class DelegationRouter {
     if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
     const intervention = parseIntervention(isRecord(payload) ? payload.intervention : undefined);
     if (!intervention) {
-      return { ok: false, error: err('bad_request', 'intervention 非法（interventionId 1-128 / runNo 正整数 / kind tool_gate|question|manual_action / title 1-128 / prompt 字符串 ≤16KB / payload? 纯对象 / options? 数组〔id/label 1-128、description? ≤512〕/ deadlineAt? 正整数）') };
+      return { ok: false, error: err('bad_request', 'intervention 非法（interventionId 1-128 / runNo 正整数 / kind tool_gate|question|manual_action / title 1-128 / prompt 字符串 ≤16KB / payload? 纯对象且序列化 ≤64KB / options? 数组〔id/label 1-128、description? ≤512〕/ deadlineAt? 正整数）') };
     }
 
     const row = this.getTask(taskId);
@@ -1059,6 +1066,55 @@ export class DelegationRouter {
     });
     if (sent === 'offline') logger.info('打回通知未送达（目标离线，重连对账收敛）', { taskId });
     return { ok: true, payload: { runNo: newRunNo } };
+  }
+
+  /**
+   * task.steer RPC（1.12.0 发起方在途回合补指令，spec 2026-11-13 §8.2 steer 槽位——
+   * 刻意不入 LEADER_ONLY_METHODS，沿 accept/reject 先例：权威关系是「委派发起方」
+   * 而非「现任组长」（by_node_id 单点——peer 组发起方未必是组长，入表会被
+   * checkGroupRole 拦死；lf 组 transfer 后旧发起方仍可 steer，防 leader 转移孤儿）。
+   * peer 组允许 steer（裁定：任务指令非人工请求转发，草稿承接方收指令合理——
+   * spec §8.6 的「不转发」仅限人工请求内容）。
+   * 流程：载荷校验（message trim 后 1..4000 字，沿 reject reason 先例）→
+   * getTask/not_found → 来源 forbidden → 账本非终态放行（pending/running/waiting/
+   * submitted/interrupted——submitted 期间打回前补指令合法且有用；终态 conflict）
+   * → 定向 task.steered 给 worker → 离线即拒（裁定：指令时效性强，缓存重发语义
+   * 弱——不落任何待发缓冲，人话提示稍后再试）→ res {ok}。
+   * 不迁账本态：纯指令非状态事件（与 task.answer 刻意不迁移状态同取向，状态
+   * 单源铁律——账本状态机不感知 steer）；重复 steer 同 message 每次都发事件
+   * （指令非状态，无幂等键，消费侧自行按 taskId+message 去重）。
+   */
+  async handleSteer(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
+    const taskId = reqStr(payload, 'taskId');
+    if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+    const messageRaw = isRecord(payload) ? payload.message : undefined;
+    const message = typeof messageRaw === 'string' && messageRaw.trim().length >= 1 && messageRaw.length <= STEER_MESSAGE_MAX
+      ? messageRaw
+      : null;
+    if (message === null) {
+      return { ok: false, error: err('bad_request', `message 非法（非空白 1-${STEER_MESSAGE_MAX} 字符）`) };
+    }
+
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (ctx.nodeId !== row.by_node_id) {
+      return { ok: false, error: err('forbidden', '仅委派发起方可补充指令') };
+    }
+    if (row.status !== 'pending' && row.status !== 'running' && row.status !== 'waiting'
+      && row.status !== 'submitted' && row.status !== 'interrupted') {
+      return { ok: false, error: err('conflict', `任务当前状态为 ${row.status}，不可补充指令`) };
+    }
+
+    const sent = await this.registry.sendTo(row.target_node_id, {
+      v: 1, kind: 'evt', method: EVT.taskSteered,
+      payload: { taskId, message } satisfies TaskSteeredEvent,
+    });
+    if (sent === 'offline') {
+      logger.info('补充指令被拒：执行节点离线', { taskId, byNode: ctx.nodeId });
+      return { ok: false, error: err('node_offline', '执行节点离线，稍后再试') };
+    }
+    logger.info('补充指令已定向', { taskId, byNode: ctx.nodeId });
+    return { ok: true, payload: { ok: true } satisfies TaskSteerRes };
   }
 
   /**
@@ -1288,8 +1344,17 @@ export class DelegationRouter {
         });
         return;
       }
-      this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ?")
+      // 自封口守卫（沿 H6 accept/reject 先例）：UPDATE 带 status IN ('running','waiting')
+      // 条件，changes===1 才落审计/发事件——row 读取与写入间现无 await（前置校验即
+      // 真相），防未来插入 await 开 TOCTOU 窗口。changes===0（竞态败者：底层账本已被
+      // 先行迁移，典型为已 submitted）按幂等静默——与 to===row.status 重复上报同口径
+      // （日志 + 账本/事件零动作，零半套态），不炸连接（文件头 wire 约定）。
+      const upd = this.db.prepare("UPDATE delegations SET status = 'submitted', submitted_at = ?, run_no = ?, updated_at = ? WHERE task_id = ? AND status IN ('running','waiting')")
         .run(now, runNo, now, row.task_id);
+      if (upd.changes !== 1) {
+        logger.info('委派提交竞态败者，忽略（账本已被先行迁移，等价重复上报）', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });
+        return;
+      }
       logger.info('委派状态迁移', { taskId: row.task_id, from: row.status, to, byNode: fromNodeId, runNo });
       // deliverable 通道约定（H7 裁定，协议 TaskReportPayload 无 deliverable 字段）：
       // worker（S2 studio 侧）把交付摘要 JSON 塞 report.reason，hub 尝试 JSON.parse

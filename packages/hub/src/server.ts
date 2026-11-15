@@ -125,6 +125,10 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     // leader-only，不入守卫表（权限锚在 handler 两端判定，
     // delegations.handleListInterventions）
     [RPC.task.interventions]: (ctx, payload) => delegationRouter.handleListInterventions(ctx, payload),
+    // 1.12.0 发起方补充指令：发起方（by_node_id）特权——非 leader-only，不入
+    // 守卫表（沿 accept/reject 先例——peer 组发起方未必是组长；权限锚在
+    // handler 来源校验 ctx.nodeId === by_node_id，delegations.handleSteer）
+    [RPC.task.steer]: (ctx, payload) => delegationRouter.handleSteer(ctx, payload),
     [RPC.view.workspace]: viewHandler(RPC.view.workspace),
     [RPC.view.sessions]: viewHandler(RPC.view.sessions),
     [RPC.view.messages]: viewHandler(RPC.view.messages),

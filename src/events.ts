@@ -28,6 +28,10 @@ export const EVT = {
   taskSubmitted: 'task.submitted',
   taskAccepted: 'task.accepted',
   taskRejected: 'task.rejected',
+  // 1.12.0（发起方指令通道）新增：发起方在途回合补指令——定向→执行节点（纯指令
+  // 非状态事件，账本不迁移；peer 组发起方同样允许 steer，任务指令不受 §8.6
+  // 人工请求内容不转发约束）。
+  taskSteered: 'task.steered',
   viewAppended: 'view.appended',
   workspaceMirrored: 'workspace.mirrored',
 } as const;
@@ -164,4 +168,12 @@ export interface TaskRejectedEvent {
   taskId: string;
   runNo: number;
   reason: string;
+}
+
+/** task.steered（1.12.0）：定向→执行节点——发起方在途回合补指令（worker 按回合
+ *  边界注入 agent 上下文，不撕裂在途流）；纯指令非状态事件，hub 不落账本、
+ *  无幂等键（同 message 重发每次都发，消费侧自行去重）。 */
+export interface TaskSteeredEvent {
+  taskId: string;
+  message: string;
 }

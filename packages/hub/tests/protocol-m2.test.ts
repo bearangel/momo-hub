@@ -1,9 +1,9 @@
-// protocol 1.2.0-1.11.0 工作组与远程代答/远端可见性/
-// 资源生命周期/多组终态/委派依赖/资源归属/外派团队/任务生命周期 v2 契约测试
+// protocol 1.2.0-1.12.0 工作组与远程代答/远端可见性/
+// 资源生命周期/多组终态/委派依赖/资源归属/外派团队/任务生命周期 v2/发起方指令通道契约测试
 // （spec 2026-10-24 M2 §3.1/§3.2/§3.3 + 裁定 MC1-MC7 + 2026-10-28 M3.1 §3.1 +
 // 2026-10-29 M3.2 §2.1 + 2026-10-29 M3.4 §2.1 + 2026-10-29 M4.2 §2.1/§2.2 +
 // 2026-10-29 M4.3 §2.1/§2.2 + 2026-10-30 M5.0 §6 + 2026-10-30 M5.3 §5.1 +
-// 2026-11-13 任务生命周期 v2 §8.1/§8.2）：
+// 2026-11-13 任务生命周期 v2 §8.1/§8.2 + 2026-11-13 §8.2 steer 槽位〔1.12.0〕）：
 // RPC 目录常量 wire 稳定锁 / 载荷与响应类型 round-trip / 错误码只增 /
 // validateSnapshotManifest 好-坏矩阵（S1 同款纪律）/ 1.1.0 目录零回退兼容。
 import { describe, expect, it } from 'vitest';
@@ -15,6 +15,7 @@ import {
   RPC,
   RPC_ERROR_CODES,
   TASK_HITL_REQUIRED_MINOR,
+  TASK_STEER_REQUIRED_MINOR,
   TASK_WIRE,
   TEAM_DELEGATION_REQUIRED_MINOR,
   VIEW_FILES_ENTRIES_MAX,
@@ -55,6 +56,9 @@ import {
   type TaskRecord,
   type TaskRejectedEvent,
   type TaskReportPayload,
+  type TaskSteeredEvent,
+  type TaskSteerReq,
+  type TaskSteerRes,
   type TaskSubmittedEvent,
   type TaskTerminalEvent,
   type ViewAppendedEvent,
@@ -77,23 +81,24 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.11.0 与 1.1.0-1.10.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.11.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.11.0');
+describe('版本 1.12.0 与 1.1.0-1.11.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.12.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.12.0');
   });
 
-  it('1.1.0 ↔ 1.11.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.1.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.2.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.3.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.4.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.5.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.6.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.7.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.8.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.9.0', '1.11.0')).toBe(true);
-    expect(isCompatible('1.10.0', '1.11.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.11.0')).toBe(false);
+  it('1.1.0 ↔ 1.12.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.1.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.2.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.3.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.4.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.5.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.6.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.7.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.8.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.9.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.10.0', '1.12.0')).toBe(true);
+    expect(isCompatible('1.11.0', '1.12.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.12.0')).toBe(false);
   });
 
   it('1.1.0 既有目录与校验器零回退（M1 测试零改动全绿的协议侧锚点）', () => {
@@ -165,6 +170,7 @@ describe('minorOf / protocolSupports 矩阵', () => {
       [RPC.task.accept]: 11,
       [RPC.task.reject]: 11,
       [RPC.task.interventions]: 11,
+      [RPC.task.steer]: 12,
     };
     const entries = Object.entries(METHOD_REQUIRED_MINOR);
     expect(entries.length).toBeGreaterThan(0);
@@ -187,40 +193,40 @@ describe('minorOf / protocolSupports 矩阵', () => {
   });
 
   it('METHOD_REQUIRED_MINOR 无 M4.2 门槛登记：全表无 minor 5..9 区间条目（1.6.0 全部为可选字段——view 订阅组锚定 / view.appended groupId? / TaskRecord.groupId，无新方法；1.5 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
-    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）、1.11.0 干预/验收四方法（minor 11）与 1.12.0
+    // task.steer（minor 12）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11 || minor === 12, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.5.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.5.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M4.3 门槛登记：全表无 minor 5..9 区间条目（1.7.0 全部为可选字段——DelegationTask.dependsOn 依赖元数据透传，无新方法；1.6 peer 调任何已登记方法〔含带新可选字段〕不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
-    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）、1.11.0 干预/验收四方法（minor 11）与 1.12.0
+    // task.steer（minor 12）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11 || minor === 12, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.6.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.6.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M5.0 门槛登记：全表无 minor 5..9 区间条目（1.8.0 全部为可选字段——ownerNodeId 归属投影 / hello nodeName 改名载荷，无新方法；1.7 peer 调任何已登记方法不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
-    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）、1.11.0 干预/验收四方法（minor 11）与 1.12.0
+    // task.steer（minor 12）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11 || minor === 12, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.7.0 peer 恒通过——新能力纯可选字段，无需能力协商
     expect(protocolSupports('1.7.0', 4)).toBe(true);
   });
 
   it('METHOD_REQUIRED_MINOR 无 M5.3 门槛登记：全表无 minor 5..9 区间条目（1.9.0 team 段为载荷能力——门槛在 hub handleDelegate 按目标节点 protoVer 权威门禁，非方法级；1.8 peer 调任何已登记方法不受影响）', () => {
-    // 1.10.0 绑定三方法（minor 10）与 1.11.0 干预/验收四方法（minor 11）为后来登记——
-    // M4.2-M5.3 各版未登记 5..9 区间方法门槛
+    // 1.10.0 绑定三方法（minor 10）、1.11.0 干预/验收四方法（minor 11）与 1.12.0
+    // task.steer（minor 12）为后来登记——M4.2-M5.3 各版未登记 5..9 区间方法门槛
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11 || minor === 12, `方法 ${method}`).toBe(true);
     }
     // 全表最大门槛 4 对 1.8.0 peer 恒通过——team 段无方法级协商
     expect(protocolSupports('1.8.0', 4)).toBe(true);
@@ -251,6 +257,17 @@ describe('minorOf / protocolSupports 矩阵', () => {
     expect(protocolSupports('1.11.0', TASK_HITL_REQUIRED_MINOR)).toBe(true);
     expect(protocolSupports('1.10.0', TASK_HITL_REQUIRED_MINOR)).toBe(false);
   });
+
+  it('METHOD_REQUIRED_MINOR 1.12.0 门槛登记：task.steer = 12（1.11 peer 调它 → unsupported_method 可读降级〔非 unknown_method 歧义〕；1.12 peer 全通过）', () => {
+    expect(METHOD_REQUIRED_MINOR[RPC.task.steer]).toBe(12);
+    expect(protocolSupports('1.12.0', 12)).toBe(true);
+    expect(protocolSupports('1.11.0', 12)).toBe(false);
+    // 常量单源锁（沿 TASK_HITL_REQUIRED_MINOR 先例——已发布 1.11.0 pin 的节点
+    // 没有该 handler，并入 11 会 unknown_method 歧义，独立 12 无歧义可读降级）
+    expect(TASK_STEER_REQUIRED_MINOR).toBe(12);
+    expect(protocolSupports('1.12.0', TASK_STEER_REQUIRED_MINOR)).toBe(true);
+    expect(protocolSupports('1.11.0', TASK_STEER_REQUIRED_MINOR)).toBe(false);
+  });
 });
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -276,7 +293,7 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
     expect(RPC.workspace).toEqual({ mirror: 'workspace.mirror', snapshots: 'workspace.snapshots' });
   });
 
-  it('RPC.task 八方法（M3.1 增 answer；1.11.0 增干预/验收四方法）', () => {
+  it('RPC.task 九方法（M3.1 增 answer；1.11.0 增干预/验收四方法；1.12.0 增 steer）', () => {
     expect(RPC.task).toEqual({
       delegate: 'task.delegate',
       cancel: 'task.cancel',
@@ -286,6 +303,7 @@ describe('RPC 目录常量（spec §3.1 表逐项）', () => {
       accept: 'task.accept',
       reject: 'task.reject',
       interventions: 'task.interventions',
+      steer: 'task.steer',
     });
   });
 
@@ -357,7 +375,6 @@ describe('RpcErrorCode 扩充', () => {
     }
   });
 });
-
 // ────────────────────────────────────────────────────────────────────────────
 // 事件目录与载荷（§3.2 逐字段）
 // ────────────────────────────────────────────────────────────────────────────
@@ -382,6 +399,27 @@ describe('EVT 新增九事件目录', () => {
     expect(EVT.taskSubmitted).toBe('task.submitted');
     expect(EVT.taskAccepted).toBe('task.accepted');
     expect(EVT.taskRejected).toBe('task.rejected');
+  });
+
+  it('1.12.0 一事件常量（wire 锁）', () => {
+    expect(EVT.taskSteered).toBe('task.steered');
+  });
+});
+
+describe('1.12.0 steer 载荷 round-trip', () => {
+  it('TaskSteeredEvent：{taskId, message}（定向→执行节点；纯指令非状态事件）', () => {
+    const evt: TaskSteeredEvent = { taskId: 't1', message: '请补充单元测试后再提交' };
+    expect(JSON.parse(JSON.stringify(evt))).toEqual(evt);
+    expect(Object.keys(evt).sort()).toEqual(['message', 'taskId']);
+  });
+
+  it('TaskSteerReq：{taskId, message}；TaskSteerRes：{ok:true}', () => {
+    const req: TaskSteerReq = { taskId: 't1', message: '优先修复认证分支' };
+    expect(JSON.parse(JSON.stringify(req))).toEqual(req);
+    expect(Object.keys(req).sort()).toEqual(['message', 'taskId']);
+    const res: TaskSteerRes = { ok: true };
+    expect(JSON.parse(JSON.stringify(res))).toEqual(res);
+    expect(Object.keys(res)).toEqual(['ok']);
   });
 });
 
@@ -979,7 +1017,7 @@ describe('validateSnapshotManifest resources[].version?（1.5.0 M3.4 B13）', ()
 
   it('METHOD_REQUIRED_MINOR 无 M3.4 门槛登记：全表无 5..9 区间条目（本组全部为可选字段/事件，无需能力协商；1.10.0 绑定三方法 = 10 与 1.11.0 干预/验收四方法 = 11 为后来登记）', () => {
     for (const [method, minor] of Object.entries(METHOD_REQUIRED_MINOR)) {
-      expect(minor < 5 || minor === 10 || minor === 11, `方法 ${method}`).toBe(true);
+      expect(minor < 5 || minor === 10 || minor === 11 || minor === 12, `方法 ${method}`).toBe(true);
     }
   });
 });

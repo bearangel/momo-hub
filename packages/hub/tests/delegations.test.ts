@@ -1,7 +1,7 @@
 // hub 委派账本与 task.* RPC 契约锁（M2d spec §3.1/§3.2/§4/§6 + T9 + MC1/MC5；
 // M3.1 waiting 态与 task.answer 远程代答，spec 2026-10-28 §3.1/§3.2）——
 // 真 socket 双客户端（leader + 目标节点）全真 wire 语义：
-// canTransition 状态机全迁移矩阵（49 对，Review Focus #3）/ delegate 全链
+// canTransition 状态机全迁移矩阵（合法 23 对 + 非法 41 对 = 8×8 全覆盖，Review Focus #3）/ delegate 全链
 // （task.assigned 六字段定向 + 账本 pending）/ 离线拒派（裁定①）/ cancel 三态
 // + 终态 conflict（裁定②）/ task.report 状态机 wire 矩阵（合法迁移 + 全非法拒
 // ——账本不动、连接不炸）/ interrupted 自动迁移（断连）与续传（MC5）/ declined

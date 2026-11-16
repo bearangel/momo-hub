@@ -9,6 +9,9 @@ import { mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { WebSocket } from 'ws';
+
+/** ws 单消息尺寸上限（字节）——信封级 DoS 防线（见 register(websocket) 处注释） */
+const HUB_WS_MAX_PAYLOAD_BYTES = 1_048_576;
 import {
   EVT, METHOD_REQUIRED_MINOR, PROTOCOL_VERSION, RPC, TASK_WIRE, VIEW_WIRE, encodeEnvelope,
   isCompatible, minorOf, parseEnvelope,
@@ -94,7 +97,10 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
   // 会以未捕获异常炸进程（index.ts 关停序 server.close()→db.close() 同暴露）。
   const liveSockets = new Set<WebSocket>();
   const app = fastify({ logger: false });
-  void app.register(websocket);
+  // 信封级尺寸上限（2026-11-16 审查 MEDIUM 修复）：ws 默认 maxPayload 100MiB——
+  // 已认证节点可单条巨包打 CPU/内存（parseEnvelope 整包 JSON.parse）。协议最大
+  // 合法载荷 = prompt 16KB + payload+options 64KB 字符，1MB 绰绰有余。
+  void app.register(websocket, { options: { maxPayload: HUB_WS_MAX_PAYLOAD_BYTES } });
   // ws RPC 分发表 = 组管理六方法 + M2c 镜像域两方法 + M2d 委派域四方法（M3.1 增
   // task.answer）+ M2e 查看域十方法（八公开 view.*〔M3.2 增 workspaces/files〕+
   // 私有上行 view.consent/view.tail）。

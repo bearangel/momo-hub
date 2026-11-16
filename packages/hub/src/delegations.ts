@@ -259,7 +259,8 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
 const INTERVENTION_ID_MAX = 128;    // interventionId（worker 本地 human_requests.id，UUID 量级）
 const OPTION_STR_MAX = 128;         // options[].id/label（STR_LIST_ITEM_MAX 同量级）
 const OPTION_DESC_MAX = 512;        // options[].description（EXCERPT_MAX 同量级）
-const INTERVENTION_PAYLOAD_MAX_CHARS = 64 * 1024; // payload 序列化总量上限（防滥用，对齐 prompt ≤16KB 量级纪律）
+const INTERVENTION_PAYLOAD_MAX_CHARS = 64 * 1024; // payload+options 合并序列化总量上限（防滥用，对齐 prompt ≤16KB 量级纪律）
+const OPTIONS_COUNT_MAX = 32;       // options 数组长度上限（2026-11-16 审查修复：字段级限制拦不住数百万小项的 CPU/落库膨胀）
 
 /** kind 合法三枚举（与协议包 InterventionKind 同源）。 */
 const INTERVENTION_KINDS: readonly InterventionKind[] = ['tool_gate', 'question', 'manual_action'];
@@ -286,14 +287,13 @@ function parseIntervention(raw: unknown): InterventionRequest | null {
   };
   if (raw.payload !== undefined) {
     if (!isRecord(raw.payload)) return null;
-    // 序列化总量上限（防滥用）：payload 是自由嵌套对象，字段级深度不限，以序列化串长
-    // 封顶——对齐 prompt ≤16KB 的既有量级纪律（options 已有字段级限制，不动）。载荷
-    // 经 JSON wire 反序列化而来，无环引用，stringify 恒安全。
-    if (JSON.stringify(raw.payload).length > INTERVENTION_PAYLOAD_MAX_CHARS) return null;
     out.payload = raw.payload;
   }
   if (raw.options !== undefined) {
     if (!Array.isArray(raw.options)) return null;
+    // 数组长度封顶（2026-11-16 审查修复）：无此闸时每项全合规的数百万小 options
+    // 可绕过字段级限制——contentJson 单行数十 MB 落库且可无限重复。
+    if (raw.options.length > OPTIONS_COUNT_MAX) return null;
     const options: NonNullable<InterventionRequest['options']> = [];
     for (const o of raw.options) {
       if (!isRecord(o)) return null;
@@ -310,6 +310,13 @@ function parseIntervention(raw: unknown): InterventionRequest | null {
     }
     out.options = options;
   }
+  // payload + options 合并封顶（2026-11-16 审查修复收口：原 64KB 只套 payload，
+  // options 数组在封顶面之外）：分别序列化求和，payload 单独恰好 64KB 的既有
+  // 语义不变，options 计入同一预算。载荷经 JSON wire 反序列化而来，无环引用，
+  // stringify 恒安全。
+  const payloadLen = out.payload !== undefined ? JSON.stringify(out.payload).length : 0;
+  const optionsLen = out.options !== undefined ? JSON.stringify(out.options).length : 0;
+  if (payloadLen + optionsLen > INTERVENTION_PAYLOAD_MAX_CHARS) return null;
   if (raw.deadlineAt !== undefined) {
     if (typeof raw.deadlineAt !== 'number' || !Number.isInteger(raw.deadlineAt) || raw.deadlineAt < 1) return null;
     out.deadlineAt = raw.deadlineAt;

@@ -499,12 +499,43 @@ describe('task.intervene 载荷校验矩阵', () => {
     expect(errOf(bad).code).toBe('bad_request');
     const atLimit = mkPayload(65536);
     expect(JSON.stringify(atLimit).length).toBe(65536);
+    // 2026-11-16 审查修复后 options 与 payload 共享 64KB 预算——本用例锁 payload
+    // 单独边界，显式置空 options
     const good = await callRpc(target, RPC.task.intervene, {
-      taskId, intervention: intervention({ payload: atLimit, interventionId: 'iv-big-ok' }),
+      taskId, intervention: intervention({ payload: atLimit, interventionId: 'iv-big-ok', options: undefined }),
     });
     expect(good.kind === 'res' && good.ok).toBe(true);
     expect(interventionRow('iv-big-ok')?.payload_json).toContain('"payload"');
     expect(ledgerRow(taskId)?.status).toBe('waiting');
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('options 数组长度上限：33 项拒 bad_request、恰好 32 项放行（2026-11-16 审查修复——无此闸时数百万全合规小项可绕过字段级限制）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivopt');
+    const taskId = await runningTask(leader, target, groupId, 'ivopt');
+    const mkOpts = (n: number): Array<{ id: string; label: string }> =>
+      Array.from({ length: n }, (_, i) => ({ id: `opt-${i}`, label: `选项${i}` }));
+    const bad = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ options: mkOpts(33), interventionId: 'iv-opt-bad' }),
+    });
+    expect(errOf(bad).code).toBe('bad_request');
+    expect(interventionRow('iv-opt-bad')).toBeUndefined();
+    const good = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ options: mkOpts(32), interventionId: 'iv-opt-ok' }),
+    });
+    expect(good.kind === 'res' && good.ok).toBe(true);
+    leader.ws.close(); target.ws.close();
+  });
+
+  it('payload+options 合并封顶：payload 65KB + 合规 options → bad_request（options 计入同一 64KB 预算）', async () => {
+    const { leader, target, groupId } = await setupGroup('ivmix');
+    const taskId = await runningTask(leader, target, groupId, 'ivmix');
+    const bigPayload = { blob: 'x'.repeat(65 * 1024 - 11) };
+    expect(JSON.stringify(bigPayload).length).toBe(65 * 1024);
+    const res = await callRpc(target, RPC.task.intervene, {
+      taskId, intervention: intervention({ payload: bigPayload, options: [{ id: 'a', label: 'A' }] }),
+    });
+    expect(errOf(res).code).toBe('bad_request');
     leader.ws.close(); target.ws.close();
   });
 });

@@ -1,5 +1,17 @@
 # 更新日志
 
+## 0.7.4（2026-11-16）
+
+安全收口（studio 仓 2026-11-16 全面审查 MEDIUM 项）：①**ws 信封级尺寸上限**——`/ws` 注册 `maxPayload: 1MB`（原 ws 默认 100MiB：已认证节点可单条巨包打 parseEnvelope 整包 JSON.parse 的 CPU/内存，协议最大合法载荷 prompt 16KB + payload/options 64KB 字符，1MB 绰绰有余）；②**`task.intervene` options 数组长度上限 32**（原仅有字段级限制——每项全合规的数百万小 options 可绕过上限，contentJson 单行数十 MB 落库且换 interventionId 可无限重复）；③**64KB 序列化封顶从 payload 单字段扩为 payload+options 合并预算**（分别序列化求和，payload 单独恰好 64KB 的既有语义不变）。测试：444 绿（+3 用例：33 项拒/32 项放行、payload 65KB+合规 options 合并拒、64KB 边界用例显式置空 options）。后续票：TaskRecord 投影 session_id（issues/1）。
+
+## 0.7.2（2026-11-14，补账 2026-11-16）
+
+终审 F2——submitted × 发起方 <1.11 **自动验收降级**：worker 报 submitted 而发起方协议 <1.11（或不在线）时，hub 直接把账本推 done + accepted_at 落列，发起方收 `task.completed`（非 task.submitted）、worker 收 `task.accepted`——混版本舰队不因旧发起方不识 submitted 态而永久挂起（防挂起优先：降级后重连也无法验收，两段式语义让位于可用性）。cc596fa。
+
+## 0.7.1（2026-11-14，补账 2026-11-16）
+
+P2 双实例 E2E 实测双守卫：①**等待解除守卫**（26ff66f）——存在 pending 干预期间的 `waiting` 态只允许结构化答复解除（waiting→running），普通进度拍不得越权迁出（防 worker 心跳拍把等待人工的账本拍回 running 掩盖等待）；②**submitted 态运行拍守卫**（a1444f8）——`submitted→running` 是打回专用边，仅 `task.reject` 可走，worker 运行拍不得把已提交待验收的账本拍回 running。
+
 ## 0.7.3（2026-11-15）
 
 任务生命周期 v2 P3 打磨期 hub 侧（协议 1.11.0→1.12.0）+ 终审票据清偿。①**协议 1.12.0——`task.steer` 发起方指令通道**：TASK_RPC 新方法（`TaskSteerReq{taskId, message 1..4000}`）+ `task.steered` 定向事件（worker 回合边界注入，不撕裂在途流）；门槛独立 minor=12（`TASK_STEER_REQUIRED_MINOR`）——1.11 节点在 1.12 hub 上得 `unsupported_method{requiredMinor:12}` 可读降级、1.12 节点对 1.11 hub 的 unknown_method 无歧义；权威=发起方 by_node_id 单点（不入 LEADER_ONLY——防 leader 转移孤儿，沿 accept/reject 裁定）；peer 组允许（任务指令非人工请求转发）；账本态零迁移（纯指令非状态事件）；worker 离线拒（指令时效性强不缓存——人话「执行节点离线，稍后再试」）。②**终审票据**：acceptReport submitted 分支 UPDATE 自封口（`AND status IN (running,waiting)` + changes===1 才发事件——防未来 await 插入开 TOCTOU 半套态窗口）；handleIntervene payload 序列化总量上限 64KB（防滥用，对齐 prompt ≤16KB 量级纪律）+ 载荷校验人话同步。测试：442 绿（基线 421〔P2 终态〕+12 steer 用例 +3 票据用例 +4 A1 用例 +2 D3/D4 期修）；protocol-m2 版本线/九方法键集/五处 minor 区间守卫/EVT wire 锁全同步。

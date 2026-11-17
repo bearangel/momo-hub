@@ -50,7 +50,12 @@ export interface ViewSessionSummary { sessionId: string; title: string; lastSeq:
 /** 会话列表页（beforeSeq/limit 分页）。 */
 export interface ViewSessionPage { sessions: ViewSessionSummary[] }
 
-export interface ViewMessagesReq extends ViewGroupIdOpt { targetNodeId: string; sessionId: string; fromSeq: number; limit: number }
+/**
+ * view.messages 请求。wire:2 帧形态下的两种翻页（互斥使用）：
+ * - fromSeq>0：取 seq < fromSeq 中最新 limit 帧（加载更早，向后翻）
+ * - afterSeq>0：取 seq > afterSeq 升序前 limit 帧（断线补拉，向前追——1.13.1）
+ */
+export interface ViewMessagesReq extends ViewGroupIdOpt { targetNodeId: string; sessionId: string; fromSeq: number; limit: number; afterSeq?: number }
 
 /** 消息条目：目标节点 message_events 的 wire 投影（seq 天然全序单调；富形态由目标节点序列化进 content）。 */
 export interface ViewMessage {

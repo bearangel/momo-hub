@@ -88,7 +88,9 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.13.0';
+// 1.13.1（终审 C3b）：ViewMessagesReq 增可选 afterSeq?（wire:2 帧形态断线补拉
+// 方向——fromSeq 向后翻页无法表达「取 seq 之后」；hub 对 view 载荷透传零改动）。
+export const PROTOCOL_VERSION = '1.13.1';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

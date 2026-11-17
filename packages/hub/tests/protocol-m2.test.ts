@@ -69,6 +69,7 @@ import {
   type ViewFrame,
   type ViewFramePage,
   type ViewMessagePage,
+  type ViewMessagesReq,
   type ViewOverview,
   type ViewSessionPage,
   type ViewSessionSummary,
@@ -88,8 +89,8 @@ import {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('版本 1.13.0 与 1.1.0-1.12.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.13.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.13.0');
+  it('PROTOCOL_VERSION === 1.13.1', () => {
+    expect(PROTOCOL_VERSION).toBe('1.13.1');
   });
 
   it('1.1.0 ↔ 1.12.0 major 相等即兼容；跨 major 不兼容', () => {
@@ -1223,13 +1224,13 @@ describe('镜像私有 wire', () => {
 // ────────────────────────────────────────────────────────────────────────────
 
 describe('版本 1.13.0 与 1.1.0-1.12.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.13.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.13.0');
+  it('PROTOCOL_VERSION === 1.13.1', () => {
+    expect(PROTOCOL_VERSION).toBe('1.13.1');
   });
 
-  it('1.12.0 ↔ 1.13.0 major 相等即兼容；跨 major 不兼容', () => {
-    expect(isCompatible('1.12.0', '1.13.0')).toBe(true);
-    expect(isCompatible('2.0.0', '1.13.0')).toBe(false);
+  it('1.12.0 ↔ 1.13.1 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.12.0', '1.13.1')).toBe(true);
+    expect(isCompatible('2.0.0', '1.13.1')).toBe(false);
   });
 
   it('1.12.0 节点仍支持既有能力（steer 门槛不受 bump 影响）', () => {
@@ -1291,6 +1292,13 @@ describe('1.13.0 ViewFrame 键集锁', () => {
     const v2: ViewAppendedEvent = { sessionId: 's1', events: [], frames: [{ frameId: 'f1', seq: 2, at: 1, role: 'assistant', kind: 'text', content: 'y' }] };
     expect(v2.frames?.length).toBe(1);
     expect(v2.events).toEqual([]);
+  });
+
+  it('ViewMessagesReq 增可选 afterSeq（1.13.1 断线补拉方向；缺省不带键零变化）', () => {
+    const legacy = { targetNodeId: 'n1', sessionId: 's1', fromSeq: 0, limit: 50 } as ViewMessagesReq;
+    expect('afterSeq' in legacy).toBe(false);
+    const backfill = { targetNodeId: 'n1', sessionId: 's1', fromSeq: 0, limit: 50, afterSeq: 42 } as ViewMessagesReq;
+    expect(backfill.afterSeq).toBe(42);
   });
 
   it('ViewSubscribeReq/Res 增可选 wire（协商声明 + 回显）', () => {

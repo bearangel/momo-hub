@@ -1,4 +1,14 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.13.0（远端会话帧投影，spec moo-studio docs/specs/2026-11-17-remote-session-view-redesign-design.md §4/§6）：
+// view 会话查看新增「帧」投影形态——ViewFrame 类型族（frameId/seq/at/role/kind 五必键，
+// kind ∈ text|tool|user|steer；text 帧带可选 streaming 标志，tool 帧带 ViewToolFrame 结构化
+// 载荷）+ ViewFramePage（view.messages 的帧页响应形态）+ ViewTailFramesPayload（view.tail
+// 上行的帧形态，与既有 events 形态并存）+ ViewSessionSummary 增可选 delegationId?（执行方
+// sessions→tasks 联表回带——发起方定位链从标题猜改为精确匹配）+ ViewSubscribeReq/Res 增可选
+// wire?: 2（逐订阅协商：请求声明 + 响应回显，leader 以回显为渲染路径判据）+ 新常量
+// VIEW_FRAME_REQUIRED_MINOR=13（载荷能力门，沿 TASK_STEER 先例不入 METHOD_REQUIRED_MINOR
+// ——无新 RPC 方法，旧节点对未知字段剥除、旧投影逐字节不变），hub 对 view 载荷透传零改动，
+// major 不动。
 // 1.12.0（task.steer 发起方指令通道，spec moo-studio docs/specs/2026-11-13-task-human-loop-lifecycle-design.md §8.2 steer 槽位）：
 // TASK_RPC 增 task.steer（TaskSteerReq {taskId, message（trim 后 1..4000 字）}/
 // TaskSteerRes {ok:true}）+ 事件 task.steered（TaskSteeredEvent {taskId, message}
@@ -78,7 +88,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.2.0（M2 工作组）：组/镜像/委派/查看 RPC 与事件、四错误码、快照 manifest 校验——
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
-export const PROTOCOL_VERSION = '1.12.0';
+export const PROTOCOL_VERSION = '1.13.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

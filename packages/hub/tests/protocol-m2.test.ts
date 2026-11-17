@@ -21,6 +21,7 @@ import {
   VIEW_FILES_ENTRIES_MAX,
   VIEW_FILES_PATH_MAX,
   VIEW_FILES_READ_MAX,
+  VIEW_FRAME_REQUIRED_MINOR,
   isCompatible,
   minorOf,
   protocolSupports,
@@ -65,11 +66,16 @@ import {
   type ViewFileEntry,
   type ViewFilesReq,
   type ViewFilesRes,
+  type ViewFrame,
+  type ViewFramePage,
   type ViewMessagePage,
   type ViewOverview,
   type ViewSessionPage,
+  type ViewSessionSummary,
   type ViewSubscribeReq,
   type ViewSubscribeRes,
+  type ViewTailFramesPayload,
+  type ViewToolFrame,
   type ViewWorkspaceSummary,
   type ViewWorkspacesReq,
   type ViewWorkspacesRes,
@@ -81,9 +87,9 @@ import {
 // 版本与兼容（MC7：1.2.0 向后兼容，major 不变）
 // ────────────────────────────────────────────────────────────────────────────
 
-describe('版本 1.12.0 与 1.1.0-1.11.0 兼容线', () => {
-  it('PROTOCOL_VERSION === 1.12.0', () => {
-    expect(PROTOCOL_VERSION).toBe('1.12.0');
+describe('版本 1.13.0 与 1.1.0-1.12.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.13.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.13.0');
   });
 
   it('1.1.0 ↔ 1.12.0 major 相等即兼容；跨 major 不兼容', () => {
@@ -1209,5 +1215,92 @@ describe('镜像私有 wire', () => {
 
     const receiptOk: MirrorReceiptOk = { appliedResources: ['coder-pro'] };
     expect(receiptOk.appliedResources).toEqual(['coder-pro']);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1.13.0 远端会话帧投影（spec moo-studio docs/specs/2026-11-17-remote-session-view-redesign-design.md §4/§6）
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('版本 1.13.0 与 1.1.0-1.12.0 兼容线', () => {
+  it('PROTOCOL_VERSION === 1.13.0', () => {
+    expect(PROTOCOL_VERSION).toBe('1.13.0');
+  });
+
+  it('1.12.0 ↔ 1.13.0 major 相等即兼容；跨 major 不兼容', () => {
+    expect(isCompatible('1.12.0', '1.13.0')).toBe(true);
+    expect(isCompatible('2.0.0', '1.13.0')).toBe(false);
+  });
+
+  it('1.12.0 节点仍支持既有能力（steer 门槛不受 bump 影响）', () => {
+    expect(protocolSupports('1.12.0', TASK_STEER_REQUIRED_MINOR)).toBe(true);
+    expect(protocolSupports('1.13.0', TASK_STEER_REQUIRED_MINOR)).toBe(true);
+  });
+});
+
+describe('1.13.0 VIEW_FRAME_REQUIRED_MINOR 门槛', () => {
+  it('常量 = 13 且不入 METHOD_REQUIRED_MINOR（载荷能力门，沿 TASK_STEER 先例）', () => {
+    expect(VIEW_FRAME_REQUIRED_MINOR).toBe(13);
+    // view.* 既有方法（minor 2/4）照旧登记；帧投影未新增任何方法门槛
+    expect(Object.values(METHOD_REQUIRED_MINOR)).not.toContain(13);
+  });
+});
+
+describe('1.13.0 ViewFrame 键集锁', () => {
+  it('ViewFrame：五必键 + content/streaming/tool 可选（kind 分族）', () => {
+    const text: ViewFrame = { frameId: 'm1', seq: 9, at: 1, role: 'assistant', kind: 'text', content: '正文', streaming: true };
+    expect(JSON.parse(JSON.stringify(text))).toEqual(text);
+    expect(Object.keys(text).sort()).toEqual(['at', 'content', 'frameId', 'kind', 'role', 'seq', 'streaming']);
+    const minimal: ViewFrame = { frameId: 'm2', seq: 10, at: 2, role: 'assistant', kind: 'text', content: '定稿' };
+    expect(Object.keys(minimal).sort()).toEqual(['at', 'content', 'frameId', 'kind', 'role', 'seq']);
+  });
+
+  it('ViewToolFrame：name 必选四可选', () => {
+    const tool: ViewToolFrame = { name: 'bash' };
+    expect(Object.keys(tool)).toEqual(['name']);
+    const full: ViewToolFrame = { name: 'bash', argsExcerpt: 'ls -la', result: 'ok', success: true, truncated: false };
+    expect(Object.keys(full).sort()).toEqual(['argsExcerpt', 'name', 'result', 'success', 'truncated']);
+  });
+
+  it('ViewFrame kind 四值 + steer 帧 role=user 形状', () => {
+    const steer: ViewFrame = { frameId: 'e1', seq: 11, at: 3, role: 'user', kind: 'steer', content: '补充指令' };
+    expect(Object.keys(steer).sort()).toEqual(['at', 'content', 'frameId', 'kind', 'role', 'seq']);
+  });
+
+  it('ViewFramePage：{frames, hasMore}', () => {
+    const page: ViewFramePage = { frames: [], hasMore: false };
+    expect(Object.keys(page).sort()).toEqual(['frames', 'hasMore']);
+  });
+
+  it('ViewSessionSummary.delegationId 缺省不带键（存量摘要零变化）', () => {
+    const legacy: ViewSessionSummary = { sessionId: 's1', title: 't', lastSeq: 5, updatedAt: 1 };
+    expect(JSON.parse(JSON.stringify(legacy))).toEqual(legacy);
+    expect('delegationId' in legacy).toBe(false);
+    const linked: ViewSessionSummary = { ...legacy, delegationId: 'd1' };
+    expect(Object.keys(linked).sort()).toEqual(['delegationId', 'lastSeq', 'sessionId', 'title', 'updatedAt']);
+  });
+
+  it('ViewTailFramesPayload：{sessionId, frames}（与既有 events 形态并存，hub 透传）', () => {
+    const tail: ViewTailFramesPayload = { sessionId: 's1', frames: [] };
+    expect(Object.keys(tail).sort()).toEqual(['frames', 'sessionId']);
+  });
+
+  it('ViewAppendedEvent 增可选 frames（events 保持必选——legacy 订阅者恒收转码行）', () => {
+    const legacy: ViewAppendedEvent = { sessionId: 's1', events: [{ seq: 1, at: 1, role: 'assistant', content: 'x' }] };
+    expect('frames' in legacy).toBe(false);
+    const v2: ViewAppendedEvent = { sessionId: 's1', events: [], frames: [{ frameId: 'f1', seq: 2, at: 1, role: 'assistant', kind: 'text', content: 'y' }] };
+    expect(v2.frames?.length).toBe(1);
+    expect(v2.events).toEqual([]);
+  });
+
+  it('ViewSubscribeReq/Res 增可选 wire（协商声明 + 回显）', () => {
+    const legacyReq: ViewSubscribeReq = { targetNodeId: 'n1', sessionId: 's1' };
+    expect('wire' in legacyReq).toBe(false);
+    const v2Req: ViewSubscribeReq = { targetNodeId: 'n1', sessionId: 's1', wire: 2 };
+    expect(v2Req.wire).toBe(2);
+    const legacyRes: ViewSubscribeRes = { ok: true };
+    expect('wire' in legacyRes).toBe(false);
+    const echoed: ViewSubscribeRes = { ok: true, wire: 2 };
+    expect(echoed.wire).toBe(2);
   });
 });

@@ -1,7 +1,7 @@
 // 服务端推送事件目录（ws 控制面，evt 信封）。
 import type { DelegationTask, InterventionAnswer, InterventionRequest } from './delegation';
 import type { HubResourceType } from './resources';
-import type { ViewMessage } from './remote-view';
+import type { ViewFrame, ViewMessage } from './remote-view';
 
 export const EVT = {
   nodeOnline: 'node.online',
@@ -113,6 +113,9 @@ export interface ViewAppendedEvent {
    *  带出（订阅端据此判定该增量归属哪个组的查看面板）；缺省不带键（旧订阅
    *  形状载荷逐字节零变化）。 */
   groupId?: string;
+  /** 帧形态增量（1.13.0）：帧形态订阅者（wire:2）收到时 events 为空数组、
+   *  增量在本字段；legacy 订阅者恒不携带该键（hub 转码进 events）。 */
+  frames?: ViewFrame[];
 }
 
 /** workspace.mirrored：组内广播——组内皆可见谁被镜像到什么版本。 */

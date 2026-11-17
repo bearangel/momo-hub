@@ -32,7 +32,7 @@ import type Database from 'better-sqlite3';
 import {
   EVT, RPC, RPC_ERROR_CODES,
   type ResponseEnvelope, type RpcErrorCode, type RpcErrorPayload,
-  type ViewAppendedEvent, type ViewMessage, type ViewTailPayload,
+  type ViewAppendedEvent, type ViewFrame, type ViewMessage, type ViewTailFramesPayload, type ViewTailPayload,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import { commonGroupId, isLeaderOf, isMember, type GroupHandlerContext, type RpcOutcome } from './groups';
@@ -48,6 +48,10 @@ const SESSION_ID_MAX = 128;
 const TAIL_EVENTS_MAX = 200;
 const TAIL_ROLE_MAX = 128;
 const TAIL_CONTENT_MAX = 256 * 1024;
+/** 帧字段边界（1.13.0 帧形态 tail 校验——量级沿委派串上界）。 */
+const FRAME_ID_MAX = 128;
+const FRAME_KINDS: ReadonlySet<string> = new Set(['text', 'tool', 'user', 'steer']);
+const FRAME_ROLES: ReadonlySet<string> = new Set(['user', 'assistant']);
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === 'object' && x !== null && !Array.isArray(x);
@@ -62,7 +66,7 @@ function optBoundedStr(raw: unknown, max: number): string | null {
   return typeof raw === 'string' && raw.length > 0 && raw.length <= max ? raw : null;
 }
 
-/** view.tail 载荷校验：sessionId 有界 + events 数组（≤200 条，每条 seq 非负整数 /
+/** view.tail 载荷校验（legacy 形态）：sessionId 有界 + events 数组（≤200 条，每条 seq 非负整数 /
  *  at 非负数 / role 有界 / content 封顶——中转方 DoS 下限，深语义由订阅端消费方定）。 */
 function parseTailPayload(raw: unknown): ViewTailPayload | null {
   if (!isRecord(raw)) return null;
@@ -79,6 +83,69 @@ function parseTailPayload(raw: unknown): ViewTailPayload | null {
     events.push({ seq: e.seq, at: e.at, role: e.role, content: e.content });
   }
   return { sessionId, events };
+}
+
+/** view.tail 载荷校验（1.13.0 帧形态）：frames 数组与 events 形态互斥——frames 在场即帧形态。 */
+function parseTailFramesPayload(raw: unknown): ViewTailFramesPayload | null {
+  if (!isRecord(raw)) return null;
+  const sessionId = optBoundedStr(raw.sessionId, SESSION_ID_MAX);
+  if (!sessionId) return null;
+  if (raw.events !== undefined) return null; // 混装两形态 → 异形
+  if (!Array.isArray(raw.frames) || raw.frames.length === 0 || raw.frames.length > TAIL_EVENTS_MAX) return null;
+  const frames: ViewFrame[] = [];
+  for (const f of raw.frames) {
+    if (!isRecord(f)) return null;
+    if (typeof f.frameId !== 'string' || f.frameId.length === 0 || f.frameId.length > FRAME_ID_MAX) return null;
+    if (typeof f.seq !== 'number' || !Number.isInteger(f.seq) || f.seq < 0) return null;
+    if (typeof f.at !== 'number' || !Number.isFinite(f.at) || f.at < 0) return null;
+    if (typeof f.role !== 'string' || !FRAME_ROLES.has(f.role)) return null;
+    if (typeof f.kind !== 'string' || !FRAME_KINDS.has(f.kind)) return null;
+    if (f.content !== undefined && (typeof f.content !== 'string' || f.content.length > TAIL_CONTENT_MAX)) return null;
+    if (f.streaming !== undefined && typeof f.streaming !== 'boolean') return null;
+    if (f.tool !== undefined) {
+      if (!isRecord(f.tool)) return null;
+      if (typeof f.tool.name !== 'string' || f.tool.name.length === 0 || f.tool.name.length > FRAME_ID_MAX) return null;
+      for (const k of ['argsExcerpt', 'result'] as const) {
+        const v = f.tool[k];
+        if (v !== undefined && (typeof v !== 'string' || v.length > TAIL_CONTENT_MAX)) return null;
+      }
+      for (const k of ['success', 'truncated'] as const) {
+        const v = f.tool[k];
+        if (v !== undefined && typeof v !== 'boolean') return null;
+      }
+    }
+    const frame: ViewFrame = {
+      frameId: f.frameId, seq: f.seq, at: f.at,
+      role: f.role as ViewFrame['role'], kind: f.kind as ViewFrame['kind'],
+    };
+    if (typeof f.content === 'string') frame.content = f.content;
+    if (f.streaming === true) frame.streaming = true;
+    if (isRecord(f.tool) && typeof f.tool.name === 'string') {
+      const tool: ViewFrame['tool'] = { name: f.tool.name };
+      if (typeof f.tool.argsExcerpt === 'string') tool.argsExcerpt = f.tool.argsExcerpt;
+      if (typeof f.tool.result === 'string') tool.result = f.tool.result;
+      if (f.tool.success === true) tool.success = true;
+      if (f.tool.truncated === true) tool.truncated = true;
+      frame.tool = tool;
+    }
+    frames.push(frame);
+  }
+  return { sessionId, frames };
+}
+
+/** 帧形态 → legacy 事件行转码（混合订阅扇出：legacy 订阅者无帧渲染能力，
+ *  投影形态对齐目标端旧 projectEventContent 约定）。 */
+function framesToLegacyEvents(frames: ViewFrame[]): ViewMessage[] {
+  return frames.map((f) => ({
+    seq: f.seq,
+    at: f.at,
+    role: f.role,
+    content: f.content ?? (f.tool
+      ? (f.tool.result !== undefined
+        ? `工具 ${f.tool.name} 完成: ${f.tool.result.slice(0, 2000)}`
+        : `调用工具 ${f.tool.name}`)
+      : `（帧 ${f.kind}）`),
+  }));
 }
 
 /** 目标 res → leader 透传结果（错误码保序：枚举内原码原文，未知/异形回 internal）。 */
@@ -115,6 +182,9 @@ interface SubEntry {
   /** 订阅组锚定（M4.2 §2.2）：仅显式 payload.groupId 落值；缺省不落——
    *  handleTail 复检与推送回落 commonGroupId 旧路径（旧订阅形状逐字节零变化）。 */
   groupId?: string;
+  /** 帧形态订阅（1.13.0）：仅订阅请求显式 wire:2 落值；tail 扇出按此分流——
+   *  wire2 订阅者收帧形态，legacy 订阅者收 framesToLegacyEvents 转码行。 */
+  wire?: 2;
 }
 
 /** 构造选项（转发超时测试注入——server.ts viewForwardTimeoutMs 透传）。 */
@@ -190,8 +260,9 @@ export class RemoteViewRouter {
         // 无记录值 → handleTail 回落 commonGroupId 动态推导，旧订阅者零变化
         const entry: SubEntry = { leaderNodeId: ctx.nodeId, targetNodeId, sessionId };
         if (groupId !== null) entry.groupId = groupId;
+        if (isRecord(payload) && payload.wire === 2) entry.wire = 2;
         this.subs.set(subKey(ctx.nodeId, targetNodeId, sessionId), entry);
-        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId, groupId: entry.groupId });
+        logger.info('订阅已登记', { leaderNodeId: ctx.nodeId, targetNodeId, sessionId, groupId: entry.groupId, wire: entry.wire });
       }
     }
     return outcome;
@@ -210,35 +281,44 @@ export class RemoteViewRouter {
     return { ok: true, payload: { ok: true } };
   }
 
-  /** view.tail 上行：载荷校验 → 匹配订阅（targetNodeId=上报者 + sessionId）→
-   *  组装 view.appended 定向逐 leader；无订阅丢弃 + 日志（对目标恒回 ok）。 */
+  /** view.tail 上行：载荷校验（legacy / 帧形态）→ 匹配订阅（targetNodeId=上报者 + sessionId）→
+   *  组装 view.appended 定向逐 leader（帧形态按订阅者 wire 分流：wire2 推帧、legacy 推转码行）；
+   *  无订阅丢弃 + 日志（对目标恒回 ok）。 */
   handleTail(ctx: GroupHandlerContext, payload: unknown): RpcOutcome {
-    const tail = parseTailPayload(payload);
-    if (!tail) {
-      return { ok: false, error: err('bad_request', `tail 载荷异形（sessionId + events[{seq,at,role,content}] ≤${TAIL_EVENTS_MAX} 条）`) };
+    const framesTail = parseTailFramesPayload(payload);
+    const tail = framesTail === null ? parseTailPayload(payload) : null;
+    if (!framesTail && !tail) {
+      return { ok: false, error: err('bad_request', `tail 载荷异形（sessionId + events[{seq,at,role,content}] ≤${TAIL_EVENTS_MAX} 条 或 frames[ViewFrame] 非空 ≤${TAIL_EVENTS_MAX} 帧）`) };
     }
-    if (tail.events.length === 0) {
+    const sessionId = framesTail?.sessionId ?? tail!.sessionId;
+    if (tail && tail.events.length === 0) {
       // 空批零信息量——不扇出（防订阅端噪音），对目标仍 ok
       logger.info('尾部事件为空批，忽略', { from: ctx.nodeId, sessionId: tail.sessionId });
       return { ok: true, payload: { ok: true } };
     }
     const subscribers = [...this.subs.values()]
-      .filter((s) => s.targetNodeId === ctx.nodeId && s.sessionId === tail.sessionId
+      .filter((s) => s.targetNodeId === ctx.nodeId && s.sessionId === sessionId
         // 订阅存续期复检同组（T13 评审 Important① 的 M4.2 组锚定版，见 subSameGroup）
         && this.subSameGroup(s));
     if (subscribers.length === 0) {
-      logger.info('尾部事件无订阅，丢弃', { from: ctx.nodeId, sessionId: tail.sessionId, count: tail.events.length });
+      logger.info('尾部事件无订阅，丢弃', { from: ctx.nodeId, sessionId, count: framesTail?.frames.length ?? tail!.events.length });
       return { ok: true, payload: { ok: true } };
     }
     for (const s of subscribers) {
       // 推送组锚定（M4.2）：记录带显式 groupId 时透传（订阅时锚定、推送时带出）；
       // 无记录值 → 旧形状载荷（不带键——旧订阅者逐字节零变化）
-      const payload: ViewAppendedEvent = s.groupId !== undefined
-        ? { sessionId: tail.sessionId, events: tail.events, groupId: s.groupId }
-        : { sessionId: tail.sessionId, events: tail.events };
-      void this.registry.sendTo(s.leaderNodeId, { v: 1, kind: 'evt', method: EVT.viewAppended, payload });
+      const anchor = s.groupId !== undefined ? { groupId: s.groupId } : {};
+      let payloadOut: ViewAppendedEvent;
+      if (framesTail !== null) {
+        payloadOut = s.wire === 2
+          ? { sessionId, events: [], frames: framesTail.frames, ...anchor }
+          : { sessionId, events: framesToLegacyEvents(framesTail.frames), ...anchor };
+      } else {
+        payloadOut = { sessionId, events: tail!.events, ...anchor };
+      }
+      void this.registry.sendTo(s.leaderNodeId, { v: 1, kind: 'evt', method: EVT.viewAppended, payload: payloadOut });
     }
-    logger.info('尾部事件定向推送', { from: ctx.nodeId, sessionId: tail.sessionId, count: tail.events.length, subscribers: subscribers.length });
+    logger.info('尾部事件定向推送', { from: ctx.nodeId, sessionId, count: framesTail?.frames.length ?? tail!.events.length, subscribers: subscribers.length });
     return { ok: true, payload: { ok: true } };
   }
 

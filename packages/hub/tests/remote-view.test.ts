@@ -24,7 +24,7 @@ import { RemoteViewRouter } from '../src/remote-view';
 import { logger } from '../src/logger';
 import {
   EVT, PROTOCOL_VERSION, RPC, VIEW_WIRE, encodeEnvelope, makeRequest, parseEnvelope,
-  type Envelope, type RequestEnvelope, type ViewMessage,
+  type Envelope, type RequestEnvelope, type ViewAppendedEvent, type ViewFrame, type ViewMessage,
 } from 'momo-hub-protocol';
 
 const dataDir = mkdtempSync(join(tmpdir(), 'momo-hub-view-'));
@@ -873,5 +873,102 @@ describe('M4.2 订阅组锚定', () => {
     expect(r.kind === 'res' && r.ok).toBe(true);
     expect(resPayload(r)).toEqual({ ok: true });
     leader15.ws.close(); target.ws.close();
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1.13.0 帧形态 tail → view.appended 按订阅者 wire 模式分流
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1.13.0 帧形态 tail → view.appended 按订阅者 wire 模式分流
+// ────────────────────────────────────────────────────────────────────────────
+
+describe('1.13.0 帧形态 tail 分流', () => {
+  const frame = (seq: number, over: Partial<ViewFrame> = {}): ViewFrame => ({
+    frameId: `f${seq}`, seq, at: 1_700_000_000_000 + seq, role: 'assistant', kind: 'text',
+    content: `正文${seq}`, ...over,
+  });
+
+  function sendFramesTail(client: Client, sessionId: string, frames: ViewFrame[]) {
+    return callRpcEnv(client, VIEW_WIRE.tail, { sessionId, frames });
+  }
+
+  /** wire2 订阅全链：leader 发订 → 接转发 → 目标回显 → 收 leader res {ok, wire:2}
+   *  excludeIds：同方法多次转发去重（inbox 只增不减）。 */
+  async function subscribeWire2(leader: Client, target: Client, sessionId: string, groupId: string, excludeIds: string[] = []) {
+    const { res } = callRpcEnv(leader, RPC.view.subscribe, { targetNodeId: target.nodeId, sessionId, groupId, wire: 2 });
+    const fwd = await awaitForwarded(target, RPC.view.subscribe, excludeIds);
+    replyTarget(target, fwd, true, { ok: true, wire: 2 });
+    return res;
+  }
+
+  it('wire2 订阅回显透传；frames tail → appended {events:[], frames} 定向', async () => {
+    const { leader, target, groupId } = await setupGroup('fr2');
+    const res = await subscribeWire2(leader, target, 's1', groupId);
+    expect(resPayload(await res)).toEqual({ ok: true, wire: 2 });
+    const frames = [
+      frame(1),
+      frame(2, { kind: 'tool', tool: { name: 'bash', argsExcerpt: 'ls' } }),
+      frame(3, { kind: 'steer', role: 'user', frameId: 'e1', content: '补充' }),
+    ];
+    const tail = sendFramesTail(target, 's1', frames);
+    expect(resPayload(await tail.res)).toEqual({ ok: true });
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    const payload = (evt as { payload: ViewAppendedEvent }).payload;
+    expect(payload.events).toEqual([]);
+    expect(payload.frames).toEqual(frames);
+    expect(payload.groupId).toBe(groupId);
+  });
+
+  it('混合订阅：wire2 订阅者收帧形态，legacy 订阅者收转码行（无 frames 键）', async () => {
+    const { leader, target, groupId } = await setupGroup('frm');
+    // legacy 订阅者 = 另一组的 leader 订阅同一 (target, session)
+    const legacy = await connect('frm-legacy');
+    const created = await callRpc(legacy, RPC.group.create, { groupName: 'Team-frm-2' });
+    const g2 = (resPayload(created) as { groupId: string }).groupId;
+    const invited = await callRpc(legacy, RPC.group.invite, { groupId: g2 });
+    const code = (resPayload(invited) as { inviteCode: string }).inviteCode;
+    await callRpc(target, RPC.group.join, { inviteCode: code });
+    await legacy.next((e) => e.kind === 'evt' && e.method === EVT.groupChanged
+      && (e.payload as { nodeId: string; kind: string }).nodeId === target.nodeId);
+    // legacy 订阅（无 wire 字段）
+    const legacySub = callRpcEnv(legacy, RPC.view.subscribe, { targetNodeId: target.nodeId, sessionId: 's2', groupId: g2 });
+    const fwdLegacy = await awaitForwarded(target, RPC.view.subscribe);
+    replyTarget(target, fwdLegacy, true, { ok: true });
+    expect(resPayload(await legacySub.res)).toEqual({ ok: true });
+    // wire2 订阅（同 target 同 session，另一组；排除 legacy 那次已消费的转发 id）
+    const res2 = await subscribeWire2(leader, target, 's2', groupId, [fwdLegacy.id]);
+    expect(resPayload(await res2)).toEqual({ ok: true, wire: 2 });
+    // frames tail：一分形态一分转码
+    const toolFrame: ViewFrame = {
+      frameId: 'f8', seq: 8, at: 1_700_000_000_008, role: 'assistant', kind: 'tool',
+      tool: { name: 'edit', result: 'done', success: true },
+    };
+    const frames = [frame(7), toolFrame];
+    const tail = sendFramesTail(target, 's2', frames);
+    expect(resPayload(await tail.res)).toEqual({ ok: true });
+    const evtV2 = await leader.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    const p2 = (evtV2 as { payload: ViewAppendedEvent }).payload;
+    expect(p2.frames).toEqual(frames);
+    expect(p2.events).toEqual([]);
+    const evtLegacy = await legacy.next((e) => e.kind === 'evt' && e.method === EVT.viewAppended);
+    const pl = (evtLegacy as { payload: ViewAppendedEvent }).payload;
+    expect('frames' in pl).toBe(false);
+    expect(pl.events).toEqual([
+      { seq: 7, at: 1_700_000_000_007, role: 'assistant', content: '正文7' },
+      { seq: 8, at: 1_700_000_000_008, role: 'assistant', content: '工具 edit 完成: done' },
+    ]);
+  });
+
+  it('frames tail 异形拒 bad_request', async () => {
+    const { leader, target, groupId } = await setupGroup('frx');
+    const res = await subscribeWire2(leader, target, 's3', groupId);
+    expect(resPayload(await res)).toEqual({ ok: true, wire: 2 });
+    const bad1 = await callRpc(target, VIEW_WIRE.tail, { sessionId: 's3', frames: 'nope' });
+    expect(errOf(bad1).code).toBe('bad_request');
+    const bad2 = await callRpc(target, VIEW_WIRE.tail, { frames: [frame(1)] });
+    expect(errOf(bad2).code).toBe('bad_request');
+    const bad3 = await callRpc(target, VIEW_WIRE.tail, { sessionId: 's3', frames: [{ seq: 1, at: 1, role: 'assistant', kind: 'text' }] });
+    expect(errOf(bad3).code).toBe('bad_request'); // 缺 frameId
   });
 });

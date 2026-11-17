@@ -45,7 +45,8 @@ export interface ViewOverview {
 }
 
 export interface ViewSessionsReq extends ViewGroupIdOpt { targetNodeId: string; workspaceName: string; beforeSeq?: number; limit: number }
-export interface ViewSessionSummary { sessionId: string; title: string; lastSeq: number; updatedAt: number }
+/** delegationId?：执行方 sessions→tasks 联表回带（1.13.0）——发起方定位链精确匹配；非委派会话缺省不带键。 */
+export interface ViewSessionSummary { sessionId: string; title: string; lastSeq: number; updatedAt: number; delegationId?: string }
 /** 会话列表页（beforeSeq/limit 分页）。 */
 export interface ViewSessionPage { sessions: ViewSessionSummary[] }
 
@@ -62,14 +63,49 @@ export interface ViewMessage {
 /** 消息回放页（按 seq 分页，hasMore 指示还有更早/更多）。 */
 export interface ViewMessagePage { messages: ViewMessage[]; hasMore: boolean }
 
+// ────────────────────────────────────────────────────────────────────────────
+// 1.13.0 帧投影（wire v2）：目标节点按消息聚合的帧形态——发起方全宽会话渲染输入。
+// 协商：view.subscribe 请求带 wire:2 声明、响应回显 wire:2；未回显 = 旧节点降级旧投影。
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 帧投影载荷能力门（不入 METHOD_REQUIRED_MINOR——无新 RPC 方法，沿 TASK_STEER 先例）。 */
+export const VIEW_FRAME_REQUIRED_MINOR = 13;
+
+/** 工具帧载荷：一调用一帧（start+result 配对）；result 超长由目标节点截断并置 truncated。 */
+export interface ViewToolFrame { name: string; argsExcerpt?: string; result?: string; success?: boolean; truncated?: boolean }
+
+/**
+ * 聚合帧（目标端单点聚合，spec 2026-11-17 §4）：
+ * - frameId 帧稳定身份（text/user=消息 id；tool=callId；steer=事件 id）——同 id 重发=整帧替换
+ * - seq 帧末事件 rowid（全序单调：游标 / 排序 / 去重键）
+ * - streaming 仅 text 帧：未终态时每拍重发最新快照，终态后游标才推进过帧末 seq
+ */
+export interface ViewFrame {
+  frameId: string;
+  seq: number;
+  at: number;
+  role: 'user' | 'assistant';
+  kind: 'text' | 'tool' | 'user' | 'steer';
+  content?: string;
+  streaming?: boolean;
+  tool?: ViewToolFrame;
+}
+
+/** view.messages 的帧页响应（wire:2 协商成立时；与 ViewMessagePage 并存）。 */
+export interface ViewFramePage { frames: ViewFrame[]; hasMore: boolean }
+
+/** view.tail 上行的帧形态（与既有 events 形态并存，hub 透传）。 */
+export interface ViewTailFramesPayload { sessionId: string; frames: ViewFrame[] }
+
 export interface ViewTasksReq extends ViewGroupIdOpt { targetNodeId: string; workspaceName: string }
 /** 目标节点本地任务条目（#T 任务）。 */
 export interface ViewLocalTask { taskId: string; title: string; status: string; updatedAt: number }
 export interface ViewTasksRes { tasks: ViewLocalTask[] }
 
 /** 尾部订阅：目标节点持续转发该会话新 message_events → hub 定向推 → 订阅端收 view.appended。 */
-export interface ViewSubscribeReq extends ViewGroupIdOpt { targetNodeId: string; sessionId: string }
-export interface ViewSubscribeRes { ok: boolean }
+export interface ViewSubscribeReq extends ViewGroupIdOpt { targetNodeId: string; sessionId: string; wire?: 2 }
+/** wire 回显（1.13.0）：请求声明 wire:2 且目标节点支持帧投影时回显；缺省 = 旧投影降级。 */
+export interface ViewSubscribeRes { ok: boolean; wire?: 2 }
 
 export interface ViewUnsubscribeReq extends ViewGroupIdOpt { targetNodeId: string; sessionId: string }
 export interface ViewUnsubscribeRes { ok: boolean }

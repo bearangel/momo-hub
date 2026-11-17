@@ -1,0 +1,17 @@
+{
+  "name": "momo-hub",
+  "version": "__VERSION__",
+  "private": true,
+  "description": "momo-hub 中心服务 Windows 便携运行包（app 子目录依赖清单，由 scripts/build-portable.mjs 生成）",
+  "license": "AGPL-3.0-only",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "dependencies": {
+    "@fastify/multipart": "9.4.0",
+    "@fastify/websocket": "11.3.4",
+    "better-sqlite3": "12.11.1",
+    "fastify": "5.12.7",
+    "momo-hub-protocol": "file:./momo-hub-protocol",
+    "ws": "8.22.0"
+  }
+}

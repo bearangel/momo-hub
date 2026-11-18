@@ -1,4 +1,8 @@
 // 协议版本纪律：semver；不兼容变更 bump major（重打 tag、studio 跟进 pin）。
+// 1.14.0（验收继续 + 结构化交付物，spec moo-studio docs/specs/2026-11-18-acceptance-decision-ux-design.md §7）：
+// TASK_RPC 增 task.continue（TaskContinueReq {taskId, requirement 1..4000}/TaskContinueRes {runNo}）、
+// EVT 增 task.continued {taskId, runNo, requirement}；TaskReportPayload 增可选 deliverable（16 KiB 上限，
+// hub 优先消费、缺省回落 reason-JSON 通道）。全部向后兼容新增（旧节点对未知字段/事件容忍，major 不动）。
 // 1.13.0（远端会话帧投影，spec moo-studio docs/specs/2026-11-17-remote-session-view-redesign-design.md §4/§6）：
 // view 会话查看新增「帧」投影形态——ViewFrame 类型族（frameId/seq/at/role/kind 五必键，
 // kind ∈ text|tool|user|steer；text 帧带可选 streaming 标志，tool 帧带 ViewToolFrame 结构化
@@ -90,7 +94,7 @@
 //  全部向后兼容新增（MC7：未知 method/字段容忍已验，major 不动）。
 // 1.13.1（终审 C3b）：ViewMessagesReq 增可选 afterSeq?（wire:2 帧形态断线补拉
 // 方向——fromSeq 向后翻页无法表达「取 seq 之后」；hub 对 view 载荷透传零改动）。
-export const PROTOCOL_VERSION = '1.13.1';
+export const PROTOCOL_VERSION = '1.14.0';
 
 export function majorOf(v: string): number | null {
   const m = /^(\d+)\./.exec(v);

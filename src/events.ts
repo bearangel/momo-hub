@@ -32,6 +32,8 @@ export const EVT = {
   // 非状态事件，账本不迁移；peer 组发起方同样允许 steer，任务指令不受 §8.6
   // 人工请求内容不转发约束）。
   taskSteered: 'task.steered',
+  // 1.14.0（验收继续）：发起方「通过并继续」——定向→执行节点，账本已回 running。
+  taskContinued: 'task.continued',
   viewAppended: 'view.appended',
   workspaceMirrored: 'workspace.mirrored',
 } as const;
@@ -179,4 +181,12 @@ export interface TaskRejectedEvent {
 export interface TaskSteeredEvent {
   taskId: string;
   message: string;
+}
+
+/** task.continued（1.14.0）：定向→worker——run #(runNo-1) 已验收通过，请开
+ *  run #runNo 并按 requirement 继续；worker 复用 acceptAndContinue 单点写路径。 */
+export interface TaskContinuedEvent {
+  taskId: string;
+  runNo: number;
+  requirement: string;
 }

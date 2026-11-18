@@ -1487,7 +1487,7 @@ describe('干预链版本门：1.10 worker 调四新 RPC（H8）', () => {
       const res = await callRpc(target, c.method, c.payload);
       const error = errOf(res);
       expect(error.code, `用例：${c.name}`).toBe('unsupported_method');
-      expect(error.message, `用例：${c.name}`).toContain('hub=1.13.1');
+      expect(error.message, `用例：${c.name}`).toContain(`hub=${PROTOCOL_VERSION}`);
       expect(error.message, `用例：${c.name}`).toContain('节点=1.10.0');
       expect(error.message, `用例：${c.name}`).toContain('需要协议 1.11');
       expect(resPayload(res).method, `用例：${c.name}`).toBe(c.name);

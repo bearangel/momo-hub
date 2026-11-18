@@ -127,6 +127,9 @@ export function createHubServer(opts: CreateHubServerOpts): HubServer {
     // ctx.nodeId === by_node_id，delegations.handleAccept/handleReject）
     [RPC.task.accept]: (ctx, payload) => delegationRouter.handleAccept(ctx, payload),
     [RPC.task.reject]: (ctx, payload) => delegationRouter.handleReject(ctx, payload),
+    // 1.14.0 验收继续：发起方（by_node_id）特权——非 leader-only，权限锚在
+    // handler 来源校验（delegations.handleContinue）
+    [RPC.task.continue]: (ctx, payload) => delegationRouter.handleContinue(ctx, payload),
     // 1.11.0 重连对账：委派两端（by_node_id/target_node_id）均可查——非
     // leader-only，不入守卫表（权限锚在 handler 两端判定，
     // delegations.handleListInterventions）

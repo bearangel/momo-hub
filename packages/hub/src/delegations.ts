@@ -25,6 +25,7 @@ import { randomUUID } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import {
   EVT, METHOD_REQUIRED_MINOR, PEER_DELEGATION_REQUIRED_MINOR, RPC, RPC_ERROR_CODES,
+  CONTINUE_REQUIREMENT_MAX, TASK_CONTINUE_REQUIRED_MINOR,
   TASK_HITL_REQUIRED_MINOR, TEAM_DELEGATION_REQUIRED_MINOR, minorOf,
   type DelegationStatus, type DelegationTask, type DelegationTeamMember, type EventEnvelope,
   type InterventionAnswer, type InterventionKind, type InterventionRecord, type InterventionRequest, type InterventionStatus,
@@ -32,12 +33,16 @@ import {
   type TaskAssignedEvent, type TaskAcceptedEvent, type TaskInterventionAnsweredEvent,
   type TaskInterventionEvent, type TaskProgressEvent, type TaskRecord,
   type TaskRejectedEvent, type TaskReportPayload, type TaskReportProgress,
+  type TaskContinuedEvent, type TaskContinueRes,
   type TaskSteeredEvent, type TaskSteerRes,
   type TaskSubmittedEvent, type TaskTerminalEvent,
 } from 'momo-hub-protocol';
 import type { NodeRegistry } from './registry';
 import type { GroupHandlerContext, RpcOutcome } from './groups';
 import { logger } from './logger';
+
+/** 结构化交付物体积上限（spec moo-studio 2026-11-18 §7.3） */
+const DELIVERABLE_MAX_BYTES = 16 * 1024;
 
 // ────────────────────────────────────────────────────────────────────────────
 // 状态机（hub 单点校验——Review Focus #3）
@@ -235,6 +240,9 @@ function parseReportPayload(raw: unknown): TaskReportPayload | null {
     if (reason === null) return null;
     out.reason = reason;
   }
+  // 1.14.0 结构化交付物：非法形状剥除不抛（沿 kind 白名单先例）——体积上限在
+  // acceptReport 消费点判定（超限丢键回落 reason 通道）
+  if (isRecord(raw.deliverable)) out.deliverable = raw.deliverable;
   if (raw.progress !== undefined) {
     const p = raw.progress;
     if (!isRecord(p)) return null;
@@ -1125,6 +1133,57 @@ export class DelegationRouter {
   }
 
   /**
+   * task.continue RPC（1.14.0 验收继续，spec moo-studio 2026-11-18 §7.1）：发起方
+   * （by_node_id）在 submitted 态要求「通过并继续」——账本 submitted→running +
+   * run_no+1，定向 worker task.continued { taskId, runNo: 新, requirement }。
+   * 执行节点协议 minor <14 时返回 peer_version_unsupported（旧节点无该事件消费者，
+   * 静默丢事件会让发起方误以为已继续——必须显式拒）。accepted_at 不写（任务未结束）。
+   */
+  async handleContinue(ctx: GroupHandlerContext, payload: unknown): Promise<RpcOutcome> {
+    const taskId = reqStr(payload, 'taskId');
+    if (!taskId) return { ok: false, error: err('bad_request', 'taskId 缺失') };
+    const reqRaw = isRecord(payload) ? payload.requirement : undefined;
+    const requirement =
+      typeof reqRaw === 'string' && reqRaw.trim().length >= 1 && reqRaw.length <= CONTINUE_REQUIREMENT_MAX
+        ? reqRaw
+        : null;
+    if (requirement === null) {
+      return { ok: false, error: err('bad_request', `requirement 非法（非空白 1-${CONTINUE_REQUIREMENT_MAX} 字符）`) };
+    }
+    const row = this.getTask(taskId);
+    if (!row) return { ok: false, error: err('not_found', '任务不存在') };
+    if (ctx.nodeId !== row.by_node_id) {
+      return { ok: false, error: err('forbidden', '仅委派发起方可要求继续') };
+    }
+    if (row.status !== 'submitted') {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可继续`) };
+    }
+    const workerConn = this.registry.get(row.target_node_id);
+    const workerMinor = workerConn !== undefined ? minorOf(workerConn.peerProtoVer) : null;
+    if (workerMinor === null || workerMinor < TASK_CONTINUE_REQUIRED_MINOR) {
+      return {
+        ok: false,
+        error: err('peer_version_unsupported', `执行节点协议版本不足（需 1.${TASK_CONTINUE_REQUIRED_MINOR}）`),
+      };
+    }
+    const newRunNo = (row.run_no ?? 1) + 1;
+    const now = Date.now();
+    const upd = this.db
+      .prepare("UPDATE delegations SET status = 'running', run_no = ?, updated_at = ? WHERE task_id = ? AND status = 'submitted'")
+      .run(newRunNo, now, taskId);
+    if (upd.changes !== 1) {
+      return { ok: false, error: err('not_submitted', `任务当前状态为 ${row.status}，非待验收态不可继续`) };
+    }
+    logger.info('委派继续', { taskId, newRunNo, byNode: ctx.nodeId });
+    const sent = await this.registry.sendTo(row.target_node_id, {
+      v: 1, kind: 'evt', method: EVT.taskContinued,
+      payload: { taskId, runNo: newRunNo, requirement } satisfies TaskContinuedEvent,
+    });
+    if (sent === 'offline') logger.info('继续通知未送达（目标离线，重连对账收敛）', { taskId });
+    return { ok: true, payload: { runNo: newRunNo } satisfies TaskContinueRes };
+  }
+
+  /**
    * task.list RPC（组过滤 + status 过滤；leader 或成员均可——不在 §6 leader-only
    * 清单）。指定 groupId 时要求本组成员身份（§9 组间可见性不做）；缺省 groupId
    * 返回调用方所在全部组的任务。
@@ -1367,12 +1426,19 @@ export class DelegationRouter {
       // worker（S2 studio 侧）把交付摘要 JSON 塞 report.reason，hub 尝试 JSON.parse
       // ——成纯对象则作 deliverable 透传（TaskSubmittedEvent.deliverable?，spec §8.2），
       // 失败/缺席/非对象不带键。
+      // 1.14.0：结构化 deliverable 优先（上限 16 KiB），缺省回落 1.11 的
+      // reason-JSON 通道（旧节点零破坏）。
       let deliverable: Record<string, unknown> | undefined;
-      if (report.reason !== undefined) {
+      if (isRecord(report.deliverable)) {
+        const size = Buffer.byteLength(JSON.stringify(report.deliverable), 'utf8');
+        if (size <= DELIVERABLE_MAX_BYTES) deliverable = report.deliverable;
+        else logger.warn('deliverable 超限被丢弃（回落 reason 通道）', { taskId: row.task_id, size });
+      }
+      if (deliverable === undefined && report.reason !== undefined) {
         try {
           const parsed: unknown = JSON.parse(report.reason);
           if (isRecord(parsed)) deliverable = parsed;
-        } catch { /* 非 JSON 串——不带 deliverable 键（通道约定见上） */ }
+        } catch { /* 非 JSON 串——不带 deliverable 键 */ }
       }
       void this.registry.sendTo(row.by_node_id, {
         v: 1, kind: 'evt', method: EVT.taskSubmitted,

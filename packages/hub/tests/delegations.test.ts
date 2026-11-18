@@ -1560,3 +1560,67 @@ describe('db v10 schema（任务生命周期 v2）', () => {
     second.close();
   });
 });
+
+// ────────────────────────────────────────────────────────────────────────────
+// 1.14.0 验收继续 + 结构化交付物（spec moo-studio 2026-11-18 §7）
+// ────────────────────────────────────────────────────────────────────────────
+
+/** 驱入 submitted（1.11 两段式：running → submitted 上报） */
+async function driveToSubmitted(leader: Client, target: Client, groupId: string, pref: string): Promise<string> {
+  const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: `ws-${pref}` }));
+  report(target.ws, taskId, { status: 'running', sessionId: `sess-${pref}` });
+  await settle(100);
+  report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: JSON.stringify({ summary: '摘要' }) });
+  await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+    && (e.payload as { taskId: string }).taskId === taskId);
+  expect(ledgerRow(taskId)?.status).toBe('submitted');
+  return taskId;
+}
+
+describe('1.14.0 task.continue（验收继续）', () => {
+  it('发起方继续 → 账本 submitted→running + run_no+1 + 定向 task.continued', async () => {
+    const { leader, target, groupId } = await setupGroup('cont1');
+    const taskId = await driveToSubmitted(leader, target, groupId, 'cont1');
+    const res = await callRpc(leader, RPC.task.continue, { taskId, requirement: '按主题一写正文' });
+    expect((resPayload(res) as { runNo: number }).runNo).toBe(2);
+    expect(ledgerRow(taskId)?.status).toBe('running');
+    const runNoRow = db.prepare('SELECT run_no FROM delegations WHERE task_id = ?').get(taskId) as { run_no: number };
+    expect(runNoRow.run_no).toBe(2);
+    const evt = await target.next((e) => e.kind === 'evt' && e.method === EVT.taskContinued);
+    expect(evt.payload).toEqual({ taskId, runNo: 2, requirement: '按主题一写正文' });
+  });
+
+  it('非发起方 / 空白 requirement / 非 submitted → forbidden / bad_request / not_submitted', async () => {
+    const { leader, target, outsider, groupId } = await setupGroup('cont2');
+    const taskId = await driveToSubmitted(leader, target, groupId, 'cont2');
+    expect(errOf(await callRpc(outsider, RPC.task.continue, { taskId, requirement: 'x' })).code).toBe('forbidden');
+    expect(errOf(await callRpc(leader, RPC.task.continue, { taskId, requirement: '  ' })).code).toBe('bad_request');
+    await callRpc(leader, RPC.task.continue, { taskId, requirement: '继续' });
+    expect(errOf(await callRpc(leader, RPC.task.continue, { taskId, requirement: '再继续' })).code).toBe('not_submitted');
+  });
+
+  it('执行节点协议 <1.14 → peer_version_unsupported 且账本不动', async () => {
+    const leader = await connect('cont3-leader');
+    const target = await connect('cont3-target', '1.13.1');
+    const created = await callRpc(leader, RPC.group.create, { groupName: 'Team-cont3' });
+    const { groupId } = resPayload(created) as { groupId: string };
+    const { inviteCode } = resPayload(await callRpc(leader, RPC.group.invite, { groupId })) as { inviteCode: string };
+    await callRpc(target, RPC.group.join, { inviteCode });
+    const taskId = await driveToSubmitted(leader, target, groupId, 'cont3');
+    const res = await callRpc(leader, RPC.task.continue, { taskId, requirement: '继续' });
+    expect(errOf(res).code).toBe('peer_version_unsupported');
+    expect(ledgerRow(taskId)?.status).toBe('submitted');
+  });
+
+  it('task.report 携带 deliverable → task.submitted 事件原样透传（优先于 reason JSON）', async () => {
+    const { leader, target, groupId } = await setupGroup('cont4');
+    const taskId = await delegateOk(leader, delegateReq(groupId, target.nodeId, { workspaceName: 'ws-cont4' }));
+    report(target.ws, taskId, { status: 'running' });
+    await settle(100);
+    const deliverable = { summary: '完整摘要', files: ['a.md'], artifacts: [{ label: 'x', value: 'y' }] };
+    report(target.ws, taskId, { status: 'submitted', runNo: 1, reason: '{"summary":"截断"}', deliverable });
+    const evt = await leader.next((e) => e.kind === 'evt' && e.method === EVT.taskSubmitted
+      && (e.payload as { taskId: string }).taskId === taskId);
+    expect((evt.payload as { deliverable: unknown }).deliverable).toEqual(deliverable);
+  });
+});

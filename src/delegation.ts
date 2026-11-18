@@ -17,6 +17,9 @@ export const TASK_RPC = {
   // 1.12.0（发起方指令通道，门槛 minor 12）：在途回合补指令——定向 worker
   // task.steered，不迁账本态（纯指令非状态事件，spec 2026-11-13 §8.2 steer 槽位）。
   steer: 'task.steer',
+  // 1.14.0（验收继续，门槛 minor 14）：账本 submitted→running + run_no+1，
+  // 定向 task.continued 携带 requirement。
+  continue: 'task.continue',
 } as const;
 
 /** 委派账本状态机（§4 delegations.status）：
@@ -259,6 +262,25 @@ export interface TaskSteerReq {
  *  无幂等键，消费侧自行按 taskId+message 去重）。 */
 export interface TaskSteerRes { ok: true }
 
+/** task.continue 请求（1.14.0，发起方 → hub，门槛 minor 14）：submitted 态
+ *  「验收通过并要求继续」——账本 submitted→running + run_no+1（accepted_at 不写，
+ *  submitted_at 保留历史），定向 worker task.continued。requirement 为追加要求，
+ *  trim 后 1..4000 字。 */
+export interface TaskContinueReq {
+  taskId: string;
+  requirement: string;
+}
+
+/** task.continue 响应：新 run 号（与 task.continued 事件一致）。 */
+export interface TaskContinueRes { runNo: number }
+
+/** 继续要求长度上限（与 steer message 同界） */
+export const CONTINUE_REQUIREMENT_MAX = 4000;
+
+/** task.continue 所需最低 minor（1.14.0）——沿 TASK_STEER 先例：已发布 1.13
+ *  的节点没有该 handler，独立 minor 使旧节点得到 unsupported_method 可读降级。 */
+export const TASK_CONTINUE_REQUIRED_MINOR = 14;
+
 /** task.answer 请求（M3.1 HITL L2 远程代答，leader-only，门槛 minor 3；1.11.0 扩
  *  为双向结构化答复，门槛 minor 11——TASK_HITL_REQUIRED_MINOR）。
  *  旧形态（interventionId 缺席）：decision 写授权语义原样保留（1.10 兼容，不触
@@ -330,6 +352,10 @@ export interface TaskReportPayload {
   /** 执行尝试号（1.11.0，仅 submitted 上报携带）：打回后新 run 提交时必带；
    *  缺省沿用账本行 run_no（1.10 上报零变化）。 */
   runNo?: number;
+  /** 结构化交付物（1.14.0，仅 status='submitted' 消费）：hub 优先透传
+   *  task.submitted.deliverable；缺省回落 reason-JSON 通道（1.11 兼容）。
+   *  JSON.stringify 后 ≤16 KiB，超限 hub 丢弃该键并记录 warn。 */
+  deliverable?: Record<string, unknown>;
 }
 
 /** 进度拍：委派会话 message_events 尾部摘要（excerpt 为截断文本）。

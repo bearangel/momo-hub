@@ -71,6 +71,9 @@ METHOD_REQUIRED_MINOR[RPC.task.interventions] = 11;
 // 会 unknown_method 歧义；独立 12 使 1.11 节点调它得到
 // unsupported_method{requiredMinor:12} 可读降级。既有 task 方法门槛不变。
 METHOD_REQUIRED_MINOR[RPC.task.steer] = 12;
+// 1.14.0（验收继续）：task.continue 为 minor-14 方法——1.13 节点调它得到
+// unsupported_method{requiredMinor:14} 可读降级；既有 task 方法门槛不变。
+METHOD_REQUIRED_MINOR[RPC.task.continue] = 14;
 
 export type RpcMethodName =
   | 'hello'

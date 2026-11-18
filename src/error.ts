@@ -30,7 +30,8 @@ export type RpcErrorCode =
   | 'not_submitted'
   | 'intervention_not_found'
   | 'intervention_stale'
-  | 'forbidden_responder';
+  | 'forbidden_responder'
+  | 'peer_version_unsupported';
 
 export interface RpcErrorPayload {
   code: RpcErrorCode;
@@ -61,4 +62,5 @@ export const RPC_ERROR_CODES: readonly RpcErrorCode[] = [
   'intervention_not_found',
   'intervention_stale',
   'forbidden_responder',
+  'peer_version_unsupported',
 ];

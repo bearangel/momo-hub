@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.7.7（2026-11-18，协议 1.13.1 → 1.14.0）
+
+验收继续 + 结构化交付物（spec momo-studio `docs/specs/2026-11-18-acceptance-decision-ux-design.md` §7）。①**`task.continue`**：发起方（by_node_id）在 submitted 态「验收通过并要求继续」——账本 `submitted→running` + `run_no+1`（`accepted_at` 不写，`submitted_at` 保留历史），定向 worker `task.continued{taskId, runNo, requirement}`；`requirement` trim 后 1..4000 字；门槛独立 minor=14（`TASK_CONTINUE_REQUIRED_MINOR`）；新增错误码 `peer_version_unsupported`——执行节点连接 minor <14 时显式拒（旧节点无该事件消费者，静默丢事件会让发起方误以为已继续）。②**`TaskReportPayload.deliverable`**：submitted 上报的结构化交付物（≤16 KiB），hub 优先透传 `task.submitted.deliverable`，缺省回落 1.11 的 reason-JSON 通道（旧节点零破坏）；超限丢键 + warn。校验：`parseReportPayload` 对 deliverable 形状非对象剥除不抛（沿 kind 白名单先例）。测试：464 绿（+4 用例：继续全链/权限与状态矩阵/执行节点版本门/交付物优先；protocol-m2 版本线·十方法键集·门槛区间·错误码总长同步）。
+
 ## 0.7.4（2026-11-16）
 
 安全收口（studio 仓 2026-11-16 全面审查 MEDIUM 项）：①**ws 信封级尺寸上限**——`/ws` 注册 `maxPayload: 1MB`（原 ws 默认 100MiB：已认证节点可单条巨包打 parseEnvelope 整包 JSON.parse 的 CPU/内存，协议最大合法载荷 prompt 16KB + payload/options 64KB 字符，1MB 绰绰有余）；②**`task.intervene` options 数组长度上限 32**（原仅有字段级限制——每项全合规的数百万小 options 可绕过上限，contentJson 单行数十 MB 落库且换 interventionId 可无限重复）；③**64KB 序列化封顶从 payload 单字段扩为 payload+options 合并预算**（分别序列化求和，payload 单独恰好 64KB 的既有语义不变）。测试：444 绿（+3 用例：33 项拒/32 项放行、payload 65KB+合规 options 合并拒、64KB 边界用例显式置空 options）。后续票：TaskRecord 投影 session_id（issues/1）。
